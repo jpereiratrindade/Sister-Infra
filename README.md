@@ -1,3 +1,36 @@
+
+<!-- SISTER-INFRA-AUTHORITY:BEGIN -->
+## Fronteira de responsabilidade
+
+`Sister-Infra` é o **harness operacional do ecossistema**. Ele coordena a
+execução conjunta dos componentes e é a autoridade operacional para:
+
+- HAProxy e fronteira HTTPS;
+- TLS/certificados de borda;
+- exposição LAN e preparação de acesso;
+- perfis `dev`, `lan` e `production`;
+- verificação agregada de SisTer e Nexo;
+- gates operacionais antes de qualquer promoção.
+
+Os componentes permanecem autônomos em suas responsabilidades internas:
+
+- **SisTer:** núcleo, contratos, governança, persistência, qualidade e
+  reflexividade;
+- **Nexo:** domínio Nexo, PostgreSQL próprio, backup, migrações, build, testes,
+  API/UI e autenticação própria.
+
+O harness chama interfaces internas estáveis dos componentes; atualmente:
+
+```text
+SisTer  -> ./scripts/run_all.sh --profile dev-core -> 127.0.0.1:8000
+Nexo    -> ./scripts/run.sh                       -> 127.0.0.1:8015
+Infra   -> HAProxy/TLS                            -> :8443
+```
+
+Produção nunca é inferida a partir de uma execução de desenvolvimento ou LAN:
+ela exige perfil e autorização explícitos.
+<!-- SISTER-INFRA-AUTHORITY:END -->
+
 # sister-infra
 
 Harness operacional externo aos repositórios SisTer e sister-nexo.
