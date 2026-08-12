@@ -1,0 +1,7 @@
+.run/
+secrets/*
+!secrets/.gitkeep
+config/production.env
+*.pem
+*.key
+*.crt
