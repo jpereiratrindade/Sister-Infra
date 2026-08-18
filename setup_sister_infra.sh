@@ -44,20 +44,25 @@ cat > "$ROOT/config/common.env" <<'EOF'
 # Diretórios dos projetos. Por padrão, são irmãos de sister-infra.
 SISTER_DIR="${SISTER_DIR:-$WORKSPACE_DIR/SisTer}"
 NEXO_DIR="${NEXO_DIR:-$WORKSPACE_DIR/sister-nexo}"
+PRAXIS_DIR="${PRAXIS_DIR:-$WORKSPACE_DIR/sister-praxis}"
 
 # Serviços internos — nunca devem ser expostos diretamente na LAN/Internet.
 SISTER_ADDRESS="127.0.0.1"
 SISTER_PORT="8000"
 NEXO_ADDRESS="127.0.0.1"
 NEXO_PORT="8015"
+PRAXIS_ADDRESS="127.0.0.1"
+PRAXIS_PORT="8093"
 
 SISTER_HEALTH_PATH="/api/health"
 NEXO_HEALTH_PATH="/api/health"
+PRAXIS_HEALTH_PATH="/health"
 
 # Gateway
 GATEWAY_LISTEN_PORT="8443"
 SISTER_HOST="sister-gateway.test"
 NEXO_HOST="nexo-gateway.test"
+PRAXIS_HOST="praxis-gateway.test"
 
 # HAProxy validado no laboratório. Pode ser sobrescrito por variável de ambiente.
 HAPROXY_BIN="${HAPROXY_BIN:-/usr/local/sbin/haproxy-3.2.22}"
@@ -95,6 +100,7 @@ GATEWAY_LISTEN_PORT="443"
 # DNS reais de produção.
 SISTER_HOST="sister.exemplo.org"
 NEXO_HOST="nexo.exemplo.org"
+PRAXIS_HOST="praxis.exemplo.org"
 
 # Produção nunca gera certificado automaticamente.
 TLS_MODE="external"
@@ -104,8 +110,10 @@ TLS_PEM="/etc/sister-infra/tls/ecosystem.pem"
 # produtiva estiver materializada. Não reutilizamos dev-core silenciosamente.
 SISTER_PRODUCTION_START_CMD=""
 NEXO_PRODUCTION_START_CMD=""
+PRAXIS_PRODUCTION_START_CMD=""
 SISTER_PRODUCTION_STOP_CMD=""
 NEXO_PRODUCTION_STOP_CMD=""
+PRAXIS_PRODUCTION_STOP_CMD=""
 
 # Gate opcional/esperado. Exemplo:
 # PRODUCTION_GATE_CMD='cd "$SISTER_DIR" && python3 scripts/prod01_readiness.py'
@@ -151,11 +159,13 @@ frontend ecosystem_https
 
     acl host_sister hdr(host),lower -i __SISTER_HOST__ __SISTER_HOST__:__LISTEN_PORT__
     acl host_nexo   hdr(host),lower -i __NEXO_HOST__ __NEXO_HOST__:__LISTEN_PORT__
+    acl host_praxis hdr(host),lower -i __PRAXIS_HOST__ __PRAXIS_HOST__:__LISTEN_PORT__
 
     # Host desconhecido falha fechado.
-    http-request deny deny_status 421 unless host_sister or host_nexo
+    http-request deny deny_status 421 unless host_sister or host_nexo or host_praxis
 
     use_backend nexo_backend if host_nexo
+    use_backend praxis_backend if host_praxis
     use_backend sister_backend if host_sister
 
 backend sister_backend
@@ -167,6 +177,11 @@ backend nexo_backend
     option httpchk GET __NEXO_HEALTH_PATH__
     http-check expect status 200
     server nexo __NEXO_ADDRESS__:__NEXO_PORT__ check inter 2s fall 3 rise 2
+
+backend praxis_backend
+    option httpchk GET __PRAXIS_HEALTH_PATH__
+    http-check expect status 200
+    server praxis __PRAXIS_ADDRESS__:__PRAXIS_PORT__ check inter 2s fall 3 rise 2
 EOF
 
 cat > "$ROOT/bin/sister-infra" <<'EOF'
@@ -301,21 +316,35 @@ generate_lab_tls() {
   [[ "${TLS_MODE:-lab}" == "lab" ]] || return 0
 
   migrate_existing_lab_tls
-  [[ -f "$TLS_PEM" && -f "$CA_CERT" ]] && return 0
 
-  log "Gerando CA e certificado TLS próprios do sister-infra..."
+  if [[ -f "$TLS_PEM" && -f "$CA_CERT" ]]; then
+    if openssl x509 -in "$TLS_PEM" -noout -ext subjectAltName 2>/dev/null \
+         | grep -Fq "DNS:${PRAXIS_HOST}"; then
+      return 0
+    fi
+    log "TLS existente não cobre $PRAXIS_HOST; reemitindo certificado."
+  fi
+
+  if [[ -f "$CA_CERT" && ! -f "$CA_KEY" ]]; then
+    die "CA existente sem chave privada; não é seguro rotacionar confiança silenciosamente: $CA_KEY"
+  fi
+
+  log "Preparando certificado TLS próprio do sister-infra..."
   local tmp="$GATEWAY_RUN/tls"
   rm -rf "$tmp"
   mkdir -p "$tmp"
   chmod 700 "$tmp"
 
-  openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
-  chmod 600 "$CA_KEY"
-  openssl req -x509 -new -nodes \
-    -key "$CA_KEY" \
-    -sha256 -days 3650 \
-    -subj "/CN=SisTer Infra Lab CA" \
-    -out "$CA_CERT" >/dev/null 2>&1
+  if [[ ! -f "$CA_CERT" || ! -f "$CA_KEY" ]]; then
+    log "Gerando nova CA de laboratório..."
+    openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
+    chmod 600 "$CA_KEY"
+    openssl req -x509 -new -nodes \
+      -key "$CA_KEY" \
+      -sha256 -days 3650 \
+      -subj "/CN=SisTer Infra Lab CA" \
+      -out "$CA_CERT" >/dev/null 2>&1
+  fi
 
   openssl genrsa -out "$tmp/gateway.key" 3072 >/dev/null 2>&1
   cat > "$tmp/openssl.cnf" <<CFG
@@ -333,6 +362,7 @@ subjectAltName = @alt_names
 [alt_names]
 DNS.1 = ${SISTER_HOST}
 DNS.2 = ${NEXO_HOST}
+DNS.3 = ${PRAXIS_HOST}
 CFG
 
   openssl req -new \
@@ -341,7 +371,7 @@ CFG
     -config "$tmp/openssl.cnf" >/dev/null 2>&1
 
   cat > "$tmp/ext.cnf" <<CFG
-subjectAltName=DNS:${SISTER_HOST},DNS:${NEXO_HOST}
+subjectAltName=DNS:${SISTER_HOST},DNS:${NEXO_HOST},DNS:${PRAXIS_HOST}
 extendedKeyUsage=serverAuth
 keyUsage=digitalSignature,keyEncipherment
 CFG
@@ -357,7 +387,7 @@ CFG
   chmod 600 "$TLS_PEM"
   chmod 644 "$CA_CERT"
   rm -rf "$tmp"
-  pass "TLS lab gerado para $SISTER_HOST e $NEXO_HOST"
+  pass "TLS lab gerado para $SISTER_HOST, $NEXO_HOST e $PRAXIS_HOST"
 }
 
 render_gateway() {
@@ -369,12 +399,16 @@ render_gateway() {
     -e "s|__TLS_PEM__|$TLS_PEM|g" \
     -e "s|__SISTER_HOST__|$SISTER_HOST|g" \
     -e "s|__NEXO_HOST__|$NEXO_HOST|g" \
+    -e "s|__PRAXIS_HOST__|$PRAXIS_HOST|g" \
     -e "s|__SISTER_ADDRESS__|$SISTER_ADDRESS|g" \
     -e "s|__SISTER_PORT__|$SISTER_PORT|g" \
     -e "s|__NEXO_ADDRESS__|$NEXO_ADDRESS|g" \
     -e "s|__NEXO_PORT__|$NEXO_PORT|g" \
+    -e "s|__PRAXIS_ADDRESS__|$PRAXIS_ADDRESS|g" \
+    -e "s|__PRAXIS_PORT__|$PRAXIS_PORT|g" \
     -e "s|__SISTER_HEALTH_PATH__|$SISTER_HEALTH_PATH|g" \
     -e "s|__NEXO_HEALTH_PATH__|$NEXO_HEALTH_PATH|g" \
+    -e "s|__PRAXIS_HEALTH_PATH__|$PRAXIS_HEALTH_PATH|g" \
     "$INFRA_ROOT/gateway/haproxy.cfg.in" > "$GATEWAY_CFG"
 
   "$HAPROXY_BIN" -c -f "$GATEWAY_CFG" >/dev/null || die "configuração HAProxy inválida"
@@ -436,6 +470,41 @@ wait_health() {
   die "$name não respondeu em ${address}:${port}${path} após ${STARTUP_TIMEOUT_SECONDS}s"
 }
 
+start_praxis() {
+  if health_ok "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"; then
+    pass "SisTer-Praxis já estava ativo"
+    return 0
+  fi
+
+  [[ -d "$PRAXIS_DIR" ]] || die "SisTer-Praxis ausente: $PRAXIS_DIR"
+
+  if [[ "$PROFILE" == "production" ]]; then
+    [[ -n "${PRAXIS_PRODUCTION_START_CMD:-}" ]] ||
+      die "PRAXIS_PRODUCTION_START_CMD não definido"
+    log "Subindo SisTer-Praxis (produção)..."
+    (cd "$PRAXIS_DIR" && bash -lc "$PRAXIS_PRODUCTION_START_CMD")
+  else
+    [[ -f "$PRAXIS_DIR/scripts/http_service.sh" ]] ||
+      die "SisTer-Praxis sem scripts/http_service.sh"
+
+    if [[ ! -x "$PRAXIS_DIR/build/sister-praxis-http" ]]; then
+      log "Build HTTP do SisTer-Praxis ausente; verificando/construindo..."
+      (cd "$PRAXIS_DIR" && bash scripts/verify.sh)
+    fi
+
+    log "Subindo SisTer-Praxis..."
+    (
+      cd "$PRAXIS_DIR"
+      SISTER_PRAXIS_HTTP_BIND="$PRAXIS_ADDRESS" \
+      SISTER_PRAXIS_HTTP_PORT="$PRAXIS_PORT" \
+        bash scripts/http_service.sh start
+    )
+  fi
+
+  wait_health "SisTer-Praxis" \
+    "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"
+}
+
 start_nexo() {
   if health_ok "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"; then
     pass "Nexo já estava ativo"
@@ -448,7 +517,11 @@ start_nexo() {
   else
     [[ -x "$NEXO_DIR/scripts/run.sh" ]] || die "Nexo sem scripts/run.sh executável"
     log "Subindo Nexo..."
-    (cd "$NEXO_DIR" && ./scripts/run.sh)
+    (
+      cd "$NEXO_DIR"
+      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
+      ./scripts/run.sh
+    )
   fi
   wait_health "Nexo" "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"
 }
@@ -469,10 +542,32 @@ start_sister() {
       cd "$SISTER_DIR"
       export SISTER_NEXO_PORT="$NEXO_PORT"
       export SISTER_NEXO_PUBLIC_URL="https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
+      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
       ./scripts/run_all.sh --profile "${SISTER_RUN_PROFILE:-dev-core}"
     )
   fi
   wait_health "SisTer" "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"
+}
+
+stop_praxis() {
+  if [[ "$PROFILE" == "production" ]]; then
+    if [[ -n "${PRAXIS_PRODUCTION_STOP_CMD:-}" ]]; then
+      (cd "$PRAXIS_DIR" && bash -lc "$PRAXIS_PRODUCTION_STOP_CMD") ||
+        warn "falha ao parar SisTer-Praxis de produção"
+    else
+      warn "PRAXIS_PRODUCTION_STOP_CMD não definido; Praxis não foi parado"
+    fi
+    return
+  fi
+
+  if [[ -f "$PRAXIS_DIR/scripts/http_service.sh" ]]; then
+    (
+      cd "$PRAXIS_DIR"
+      SISTER_PRAXIS_HTTP_BIND="$PRAXIS_ADDRESS" \
+      SISTER_PRAXIS_HTTP_PORT="$PRAXIS_PORT" \
+        bash scripts/http_service.sh stop
+    ) || warn "SisTer-Praxis reportou erro ao parar"
+  fi
 }
 
 stop_sister() {
@@ -562,6 +657,13 @@ verify_gateway_urls() {
     "https://$NEXO_HOST:$GATEWAY_LISTEN_PORT$NEXO_HEALTH_PATH" >/dev/null \
       && pass "Nexo via gateway" \
       || die "Nexo não respondeu via gateway"
+
+  curl --noproxy '*' -fsS --max-time 5 \
+    "${cacert_args[@]}" \
+    --resolve "$PRAXIS_HOST:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
+    "https://$PRAXIS_HOST:$GATEWAY_LISTEN_PORT$PRAXIS_HEALTH_PATH" >/dev/null \
+      && pass "SisTer-Praxis via gateway" \
+      || die "SisTer-Praxis não respondeu via gateway"
 }
 
 cmd_up() {
@@ -569,7 +671,10 @@ cmd_up() {
   production_preflight
   [[ "$PROFILE" == "production" ]] || generate_lab_tls
 
-  # O Nexo sobe primeiro porque o SisTer observa sua saúde no catálogo.
+  # Praxis é independente dos domínios e fornece a borda computacional comum.
+  start_praxis
+
+  # O Nexo sobe antes do SisTer porque o SisTer observa sua saúde no catálogo.
   start_nexo
   start_sister
   start_gateway
@@ -579,6 +684,7 @@ cmd_up() {
   echo "Ecossistema ativo ($PROFILE)"
   echo "  SisTer: https://${SISTER_HOST}:${GATEWAY_LISTEN_PORT}"
   echo "  Nexo:   https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
+  echo "  Praxis: https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
   if [[ "$PROFILE" == "lan" ]]; then
     echo "  Gateway LAN: ${GATEWAY_LISTEN_ADDRESS}:${GATEWAY_LISTEN_PORT}"
   fi
@@ -588,6 +694,7 @@ cmd_down() {
   preflight_common
   stop_gateway
   stop_sister
+  stop_praxis
   stop_nexo
   pass "encerramento solicitado; dados persistentes preservados"
 }
@@ -599,6 +706,7 @@ cmd_status() {
   echo "Infra:  $INFRA_ROOT"
   echo "SisTer: $SISTER_DIR"
   echo "Nexo:   $NEXO_DIR"
+  echo "Praxis: $PRAXIS_DIR"
   echo
 
   if health_ok "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"; then
@@ -613,6 +721,12 @@ cmd_status() {
     warn "Nexo interno OFFLINE"
   fi
 
+  if health_ok "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"; then
+    pass "SisTer-Praxis interno http://${PRAXIS_ADDRESS}:${PRAXIS_PORT}"
+  else
+    warn "SisTer-Praxis interno OFFLINE"
+  fi
+
   if pid_alive "$GATEWAY_PID"; then
     pass "Gateway HAProxy PID $(cat "$GATEWAY_PID")"
   else
@@ -623,6 +737,7 @@ cmd_status() {
   echo "URLs esperadas:"
   echo "  https://${SISTER_HOST}:${GATEWAY_LISTEN_PORT}"
   echo "  https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
+  echo "  https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
 }
 
 cmd_verify() {
@@ -632,6 +747,7 @@ cmd_verify() {
   render_gateway
   wait_health "SisTer" "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"
   wait_health "Nexo" "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"
+  wait_health "SisTer-Praxis" "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"
   pid_alive "$GATEWAY_PID" || die "gateway não está ativo"
   verify_gateway_urls
   pass "ecossistema verificado"
