@@ -928,6 +928,13 @@ main() {
   esac
 }
 
+# SISTER-INFRA-WORKSTATION-DISPATCH
+# Plano de controle instalado: mantém a interface pública sob sister-infra.
+if [[ "${1:-}" == "workstation" ]]; then
+  shift
+  exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-workstation" "$@"
+fi
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

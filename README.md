@@ -97,3 +97,67 @@ Teste de regressão:
 ./tests/tls_lifecycle_test.sh
 ```
 <!-- SISTER-INFRA-TLS-LIFECYCLE:END -->
+
+<!-- SISTER-INFRA-OPS001-WORKSTATION:BEGIN -->
+## Workstation deployment — OPS-001
+
+O perfil operacional `workstation` separa a árvore de desenvolvimento da
+instalação usada diariamente. A interface pública permanece sob `sister-infra`:
+
+```bash
+./bin/sister-infra workstation doctor
+./bin/sister-infra workstation plan
+./bin/sister-infra workstation release-create
+./bin/sister-infra workstation install
+./bin/sister-infra workstation activate
+./bin/sister-infra workstation status
+./bin/sister-infra workstation verify
+./bin/sister-infra workstation update
+./bin/sister-infra workstation rollback
+./bin/sister-infra workstation logs
+```
+
+Layout user-scope:
+
+```text
+~/.local/share/sister/
+├── releases/<release-id>/
+├── current  -> releases/<release-id>
+└── previous -> releases/<release-id>
+
+~/.config/sister/workstation/
+├── runtime.env
+├── source-workspace
+├── tls/
+├── nexo.env
+└── sister.env
+
+~/.local/state/sister/workstation/
+~/.config/systemd/user/sister-workstation.service
+~/.local/bin/sister-infra
+```
+
+Cada release contém clones locais independentes e destacados nos commits
+qualificados de `sister-infra`, `SisTer`, `sister-nexo` e `sister-praxis`.
+O manifesto registra esses commits. A verificação recusa uma release se o HEAD
+de qualquer componente divergir do manifesto ou se um arquivo rastreado tiver
+sido modificado.
+
+`update` cria uma nova release, para o serviço antes da troca de `current`,
+promove a nova versão, reinicia e verifica. Falha de saúde provoca rollback
+automático. `rollback` oferece a mesma verificação no sentido inverso.
+
+`activate` realiza o primeiro handover: para a execução LAN conhecida na árvore
+de desenvolvimento e passa o runtime para `systemd --user`; se a ativação não
+ficar saudável, tenta restaurar o runtime anterior.
+
+### Limite explícito do OPS-001
+
+OPS-001 isola **código, configuração de implantação e lifecycle da release**.
+O plano de dados ainda segue os contratos atuais dos componentes. Em especial,
+os entrypoints existentes podem manter nomes de containers/volumes herdados de
+desenvolvimento. A separação física e migração governada de bancos/volumes será
+um incremento próprio antes de considerar este modelo candidato a produção.
+
+Produção continua proibida por inferência: `workstation` não é `production`.
+<!-- SISTER-INFRA-OPS001-WORKSTATION:END -->

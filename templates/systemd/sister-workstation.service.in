@@ -1,0 +1,17 @@
+# Template documental. A unidade instalada é renderizada por bin/sister-workstation.
+[Unit]
+Description=SisTer Workstation Ecosystem
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-%h/.config/sister/workstation/runtime.env
+ExecStart=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra up --profile lan
+ExecStop=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra down --profile lan
+TimeoutStartSec=1200
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target

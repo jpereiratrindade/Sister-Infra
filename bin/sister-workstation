@@ -1,0 +1,826 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+INFRA_ROOT="$(cd "$SELF_DIR/.." && pwd -P)"
+
+HOME_DIR="${HOME:?HOME não definido}"
+INSTALL_ROOT="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME_DIR/.local/share/sister}"
+RELEASES_ROOT="$INSTALL_ROOT/releases"
+CURRENT_LINK="$INSTALL_ROOT/current"
+PREVIOUS_LINK="$INSTALL_ROOT/previous"
+
+CONFIG_ROOT="${SISTER_WORKSTATION_CONFIG_ROOT:-$HOME_DIR/.config/sister/workstation}"
+STATE_ROOT="${SISTER_WORKSTATION_STATE_ROOT:-$HOME_DIR/.local/state/sister/workstation}"
+SYSTEMD_USER_ROOT="${SISTER_WORKSTATION_SYSTEMD_ROOT:-$HOME_DIR/.config/systemd/user}"
+UNIT_NAME="${SISTER_WORKSTATION_UNIT_NAME:-sister-workstation.service}"
+UNIT_FILE="$SYSTEMD_USER_ROOT/$UNIT_NAME"
+BIN_ROOT="${SISTER_WORKSTATION_BIN_ROOT:-$HOME_DIR/.local/bin}"
+CLI_LINK="$BIN_ROOT/sister-infra"
+
+SOURCE_WORKSPACE_FILE="$CONFIG_ROOT/source-workspace"
+RUNTIME_ENV="$CONFIG_ROOT/runtime.env"
+TLS_CONFIG="$CONFIG_ROOT/tls"
+NEXO_ENV="$CONFIG_ROOT/nexo.env"
+SISTER_ENV="$CONFIG_ROOT/sister.env"
+
+TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
+
+pass() { printf '[PASS] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+info() { printf '[INFO] %s\n' "$*"; }
+die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+SisTer Infra — workstation deployment control plane
+
+Uso:
+  sister-infra workstation <comando>
+
+Comandos:
+  doctor          valida host, fontes, Git, systemd e layout
+  plan            mostra diferença entre release atual e fontes, sem mutar
+  release-create  cria release local independente dos repositórios de dev
+  release-list    lista releases instaladas
+  install [id]    seleciona release e instala unidade systemd (não inicia)
+  activate        migra o runtime atual para o serviço workstation
+  start           inicia a instalação workstation
+  stop            para a instalação workstation
+  restart         reinicia a instalação workstation
+  status          mostra release, serviço e saúde agregada
+  verify          verifica integridade da release e endpoints
+  update          cria release das fontes, promove e verifica; rollback em falha
+  rollback        retorna para previous e verifica
+  logs            mostra journal do serviço
+  current         mostra release current/previous
+  help            esta ajuda
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p \
+    "$RELEASES_ROOT" \
+    "$CONFIG_ROOT" \
+    "$STATE_ROOT" \
+    "$SYSTEMD_USER_ROOT" \
+    "$BIN_ROOT"
+}
+
+source_workspace_guess() {
+  if [[ -n "${SISTER_SOURCE_WORKSPACE:-}" ]]; then
+    printf '%s\n' "$SISTER_SOURCE_WORKSPACE"
+    return 0
+  fi
+
+  if [[ -f "$SOURCE_WORKSPACE_FILE" ]]; then
+    cat "$SOURCE_WORKSPACE_FILE"
+    return 0
+  fi
+
+  local parent
+  parent="$(dirname "$INFRA_ROOT")"
+
+  if [[ -d "$parent/SisTer/.git" &&
+        -d "$parent/sister-nexo/.git" &&
+        -d "$parent/sister-praxis/.git" &&
+        -d "$parent/sister-infra/.git" ]]; then
+    printf '%s\n' "$parent"
+    return 0
+  fi
+
+  return 1
+}
+
+repo_path() {
+  local workspace="$1"
+  local kind="$2"
+
+  case "$kind" in
+    infra)  printf '%s\n' "$workspace/sister-infra" ;;
+    sister) printf '%s\n' "$workspace/SisTer" ;;
+    nexo)   printf '%s\n' "$workspace/sister-nexo" ;;
+    praxis) printf '%s\n' "$workspace/sister-praxis" ;;
+    *) die "componente desconhecido: $kind" ;;
+  esac
+}
+
+require_repo_clean() {
+  local repo="$1"
+  local name="$2"
+
+  [[ -d "$repo/.git" ]] || die "$name não localizado: $repo"
+
+  local dirty
+  dirty="$(git -C "$repo" status --porcelain)"
+  [[ -z "$dirty" ]] || {
+    printf '%s\n' "$dirty" >&2
+    die "$name possui alterações locais; release recusada"
+  }
+}
+
+repo_head() {
+  git -C "$1" rev-parse HEAD
+}
+
+repo_short() {
+  git -C "$1" rev-parse --short=7 HEAD
+}
+
+release_path_by_id() {
+  printf '%s\n' "$RELEASES_ROOT/$1"
+}
+
+link_target_id() {
+  local link="$1"
+  if [[ -L "$link" ]]; then
+    basename "$(readlink -f "$link")"
+  else
+    printf '%s\n' "-"
+  fi
+}
+
+current_release_path() {
+  [[ -L "$CURRENT_LINK" ]] || return 1
+  readlink -f "$CURRENT_LINK"
+}
+
+current_release_id() {
+  link_target_id "$CURRENT_LINK"
+}
+
+previous_release_id() {
+  link_target_id "$PREVIOUS_LINK"
+}
+
+manifest_path() {
+  printf '%s\n' "$1/manifest.json"
+}
+
+manifest_value() {
+  local release="$1"
+  local jq_expr="$2"
+  jq -r "$jq_expr" "$(manifest_path "$release")"
+}
+
+release_integrity() {
+  local release="$1"
+
+  [[ -d "$release" ]] || die "release ausente: $release"
+  [[ -f "$(manifest_path "$release")" ]] || die "manifest ausente em $release"
+
+  local component repo expected actual tracked
+
+  for component in infra sister nexo praxis; do
+    case "$component" in
+      infra) repo="$release/components/sister-infra" ;;
+      sister) repo="$release/components/SisTer" ;;
+      nexo) repo="$release/components/sister-nexo" ;;
+      praxis) repo="$release/components/sister-praxis" ;;
+    esac
+
+    [[ -d "$repo/.git" ]] || die "release corrompida: $component sem .git"
+
+    expected="$(manifest_value "$release" ".components.$component.commit")"
+    actual="$(git -C "$repo" rev-parse HEAD)"
+
+    [[ "$expected" == "$actual" ]] || \
+      die "release corrompida: $component HEAD divergiu do manifesto"
+
+    tracked="$(git -C "$repo" status --porcelain --untracked-files=no)"
+    [[ -z "$tracked" ]] || {
+      printf '%s\n' "$tracked" >&2
+      die "release corrompida: arquivos rastreados de $component foram alterados"
+    }
+  done
+
+  pass "integridade da release $(basename "$release")"
+}
+
+write_source_workspace() {
+  local workspace="$1"
+
+  ensure_dirs
+  printf '%s\n' "$(cd "$workspace" && pwd -P)" > "$SOURCE_WORKSPACE_FILE"
+  chmod 600 "$SOURCE_WORKSPACE_FILE"
+}
+
+ensure_runtime_env() {
+  ensure_dirs
+
+  if [[ ! -f "$RUNTIME_ENV" ]]; then
+    cat > "$RUNTIME_ENV" <<'EOF'
+NO_PROXY=localhost,127.0.0.1,::1,10.163.80.176,sister-gateway.test,nexo-gateway.test,praxis-gateway.test
+no_proxy=localhost,127.0.0.1,::1,10.163.80.176,sister-gateway.test,nexo-gateway.test,praxis-gateway.test
+EOF
+    chmod 600 "$RUNTIME_ENV"
+  fi
+}
+
+copy_operational_config() {
+  local workspace="$1"
+  local release="$2"
+
+  ensure_runtime_env
+
+  local source_infra source_nexo source_sister
+  source_infra="$(repo_path "$workspace" infra)"
+  source_nexo="$(repo_path "$workspace" nexo)"
+  source_sister="$(repo_path "$workspace" sister)"
+
+  mkdir -p "$TLS_CONFIG"
+  chmod 700 "$TLS_CONFIG"
+
+  if [[ -d "$source_infra/secrets" ]]; then
+    if [[ -z "$(find "$TLS_CONFIG" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      cp -a "$source_infra/secrets/." "$TLS_CONFIG/"
+      chmod 700 "$TLS_CONFIG"
+      find "$TLS_CONFIG" -type f -name '*.key' -exec chmod 600 {} +
+      find "$TLS_CONFIG" -type f -name '*.pem' -exec chmod 600 {} +
+    fi
+  fi
+
+  rm -rf "$release/components/sister-infra/secrets"
+  ln -s "$TLS_CONFIG" "$release/components/sister-infra/secrets"
+
+  if [[ ! -f "$NEXO_ENV" ]]; then
+    if [[ -f "$source_nexo/.env" ]]; then
+      cp -p "$source_nexo/.env" "$NEXO_ENV"
+      chmod 600 "$NEXO_ENV"
+    elif [[ -f "$source_nexo/.env.example" ]]; then
+      cp -p "$source_nexo/.env.example" "$NEXO_ENV"
+      chmod 600 "$NEXO_ENV"
+      warn "Nexo não possuía .env; copiado .env.example para $NEXO_ENV"
+    fi
+  fi
+
+  if [[ -f "$NEXO_ENV" ]]; then
+    rm -f "$release/components/sister-nexo/.env"
+    ln -s "$NEXO_ENV" "$release/components/sister-nexo/.env"
+  fi
+
+  if [[ ! -f "$SISTER_ENV" && -f "$source_sister/.env" ]]; then
+    cp -p "$source_sister/.env" "$SISTER_ENV"
+    chmod 600 "$SISTER_ENV"
+  fi
+
+  if [[ -f "$SISTER_ENV" ]]; then
+    rm -f "$release/components/SisTer/.env"
+    ln -s "$SISTER_ENV" "$release/components/SisTer/.env"
+  fi
+}
+
+clone_component() {
+  local source="$1"
+  local dest="$2"
+  local commit="$3"
+
+  git clone --no-hardlinks --quiet "$source" "$dest"
+  git -C "$dest" checkout --quiet --detach "$commit"
+
+  if git -C "$dest" remote get-url origin >/dev/null 2>&1; then
+    git -C "$dest" remote remove origin
+  fi
+
+  [[ "$(git -C "$dest" rev-parse HEAD)" == "$commit" ]] || \
+    die "clone não materializou commit esperado em $dest"
+}
+
+release_create() {
+  ensure_dirs
+
+  local workspace
+  workspace="$(source_workspace_guess)" || \
+    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
+
+  workspace="$(cd "$workspace" && pwd -P)"
+  write_source_workspace "$workspace"
+
+  local infra sister nexo praxis
+  infra="$(repo_path "$workspace" infra)"
+  sister="$(repo_path "$workspace" sister)"
+  nexo="$(repo_path "$workspace" nexo)"
+  praxis="$(repo_path "$workspace" praxis)"
+
+  require_repo_clean "$infra" "sister-infra"
+  require_repo_clean "$sister" "SisTer"
+  require_repo_clean "$nexo" "Nexo"
+  require_repo_clean "$praxis" "Praxis"
+
+  local infra_commit sister_commit nexo_commit praxis_commit
+  local infra_short sister_short nexo_short praxis_short
+
+  infra_commit="$(repo_head "$infra")"
+  sister_commit="$(repo_head "$sister")"
+  nexo_commit="$(repo_head "$nexo")"
+  praxis_commit="$(repo_head "$praxis")"
+
+  infra_short="$(repo_short "$infra")"
+  sister_short="$(repo_short "$sister")"
+  nexo_short="$(repo_short "$nexo")"
+  praxis_short="$(repo_short "$praxis")"
+
+  local timestamp id release tmp
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  id="ws-${timestamp}-${infra_short}-${sister_short}-${nexo_short}-${praxis_short}"
+  release="$RELEASES_ROOT/$id"
+  tmp="$RELEASES_ROOT/.creating-$id-$$"
+
+  [[ ! -e "$release" ]] || die "release já existe: $id"
+
+  rm -rf "$tmp"
+  mkdir -p "$tmp/components"
+
+  info "materializando release $id"
+
+  clone_component "$infra" "$tmp/components/sister-infra" "$infra_commit"
+  clone_component "$sister" "$tmp/components/SisTer" "$sister_commit"
+  clone_component "$nexo" "$tmp/components/sister-nexo" "$nexo_commit"
+  clone_component "$praxis" "$tmp/components/sister-praxis" "$praxis_commit"
+
+  copy_operational_config "$workspace" "$tmp"
+
+  python3 - "$tmp/manifest.json" \
+    "$id" "$timestamp" "$workspace" \
+    "$infra_commit" "$sister_commit" "$nexo_commit" "$praxis_commit" <<'PY'
+import json, sys
+from pathlib import Path
+
+(
+    out, rid, created, workspace,
+    infra, sister, nexo, praxis
+) = sys.argv[1:]
+
+payload = {
+    "schema": "sister.infra.workstation.release/1",
+    "release_id": rid,
+    "created_at_utc": created,
+    "source_workspace": workspace,
+    "deployment_class": "workstation",
+    "isolation": {
+        "source_code": "independent-local-clone",
+        "configuration": "persistent-outside-release",
+        "data_plane": "component-entrypoints-current-contracts"
+    },
+    "components": {
+        "infra": {"commit": infra},
+        "sister": {"commit": sister},
+        "nexo": {"commit": nexo},
+        "praxis": {"commit": praxis}
+    }
+}
+
+Path(out).write_text(json.dumps(payload, indent=2) + "\n")
+PY
+
+  printf '%s\n' "$id" > "$tmp/RELEASE_ID"
+  printf '%s\n' "SISTER-INFRA-OPS-001" > "$tmp/QUALIFICATION"
+
+  mv "$tmp" "$release"
+  release_integrity "$release"
+
+  printf '%s\n' "$id" > "$STATE_ROOT/last-created-release"
+  pass "release criada: $id"
+  printf '%s\n' "$id"
+}
+
+render_unit() {
+  ensure_dirs
+
+  cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=SisTer Workstation Ecosystem
+Documentation=file://${CURRENT_LINK}/manifest.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-${RUNTIME_ENV}
+ExecStart=${CURRENT_LINK}/components/sister-infra/bin/sister-infra up --profile lan
+ExecStop=${CURRENT_LINK}/components/sister-infra/bin/sister-infra down --profile lan
+TimeoutStartSec=1200
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target
+EOF
+
+  chmod 644 "$UNIT_FILE"
+}
+
+systemctl_user() {
+  if [[ "$TEST_MODE" == "1" ]]; then
+    info "TEST_MODE systemctl --user $*"
+    return 0
+  fi
+
+  systemctl --user "$@"
+}
+
+install_release() {
+  ensure_dirs
+
+  local id="${1:-}"
+
+  if [[ -z "$id" ]]; then
+    [[ -f "$STATE_ROOT/last-created-release" ]] || \
+      die "nenhuma release indicada nem last-created-release"
+    id="$(cat "$STATE_ROOT/last-created-release")"
+  fi
+
+  local release
+  release="$(release_path_by_id "$id")"
+  release_integrity "$release"
+
+  local old_current=""
+
+  if [[ -L "$CURRENT_LINK" ]]; then
+    old_current="$(readlink -f "$CURRENT_LINK")"
+  fi
+
+  if [[ -n "$old_current" && "$old_current" != "$release" ]]; then
+    ln -sfn "$old_current" "$PREVIOUS_LINK"
+  fi
+
+  ln -sfn "$release" "$CURRENT_LINK"
+
+  render_unit
+  ensure_runtime_env
+
+  ln -sfn "$CURRENT_LINK/components/sister-infra/bin/sister-infra" "$CLI_LINK"
+
+  systemctl_user daemon-reload
+  systemctl_user enable "$UNIT_NAME" >/dev/null
+
+  pass "release instalada como current: $id"
+  info "serviço habilitado, mas não iniciado"
+}
+
+verify_installed() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release current"
+
+  release_integrity "$release"
+
+  "$release/components/sister-infra/bin/sister-infra" verify --profile lan
+  pass "workstation verificado"
+}
+
+service_active() {
+  if [[ "$TEST_MODE" == "1" ]]; then
+    return 1
+  fi
+
+  systemctl --user is-active --quiet "$UNIT_NAME"
+}
+
+start_service() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release instalada"
+
+  release_integrity "$release"
+  systemctl_user start "$UNIT_NAME"
+}
+
+stop_service() {
+  systemctl_user stop "$UNIT_NAME"
+}
+
+restart_service() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release instalada"
+
+  release_integrity "$release"
+  systemctl_user restart "$UNIT_NAME"
+}
+
+activate_workstation() {
+  local release
+  release="$(current_release_path)" || die "instale uma release antes de activate"
+
+  release_integrity "$release"
+
+  if service_active; then
+    info "workstation já está ativo"
+    verify_installed
+    return 0
+  fi
+
+  local workspace=""
+  workspace="$(source_workspace_guess || true)"
+  local source_infra=""
+
+  if [[ -n "$workspace" && -x "$workspace/sister-infra/bin/sister-infra" ]]; then
+    source_infra="$workspace/sister-infra/bin/sister-infra"
+  fi
+
+  if [[ -n "$source_infra" ]]; then
+    info "handover: parando runtime LAN da árvore de desenvolvimento"
+    "$source_infra" down --profile lan || \
+      warn "runtime de desenvolvimento reportou falha ao parar"
+  fi
+
+  if systemctl_user start "$UNIT_NAME"; then
+    if verify_installed; then
+      pass "workstation assumiu o runtime"
+      return 0
+    fi
+  fi
+
+  warn "ativação workstation falhou; tentando restaurar runtime anterior"
+  systemctl_user stop "$UNIT_NAME" >/dev/null 2>&1 || true
+
+  if [[ -n "$source_infra" ]]; then
+    "$source_infra" up --profile lan || \
+      warn "não foi possível restaurar runtime de desenvolvimento automaticamente"
+  fi
+
+  die "handover falhou"
+}
+
+promote_release() {
+  local new_id="$1"
+  local new_release
+  new_release="$(release_path_by_id "$new_id")"
+
+  release_integrity "$new_release"
+
+  local old_release=""
+
+  if [[ -L "$CURRENT_LINK" ]]; then
+    old_release="$(readlink -f "$CURRENT_LINK")"
+  fi
+
+  local was_active=0
+
+  if service_active; then
+    was_active=1
+    systemctl_user stop "$UNIT_NAME"
+  fi
+
+  if [[ -n "$old_release" && "$old_release" != "$new_release" ]]; then
+    ln -sfn "$old_release" "$PREVIOUS_LINK"
+  fi
+
+  ln -sfn "$new_release" "$CURRENT_LINK"
+
+  render_unit
+  ln -sfn "$CURRENT_LINK/components/sister-infra/bin/sister-infra" "$CLI_LINK"
+  systemctl_user daemon-reload
+
+  if [[ "$was_active" -eq 1 ]]; then
+    if systemctl_user start "$UNIT_NAME" && verify_installed; then
+      pass "release promovida: $new_id"
+      return 0
+    fi
+
+    warn "nova release falhou; executando rollback automático"
+    systemctl_user stop "$UNIT_NAME" >/dev/null 2>&1 || true
+
+    if [[ -n "$old_release" ]]; then
+      ln -sfn "$old_release" "$CURRENT_LINK"
+      ln -sfn "$new_release" "$PREVIOUS_LINK"
+      render_unit
+      systemctl_user daemon-reload
+
+      if systemctl_user start "$UNIT_NAME" && verify_installed; then
+        warn "rollback automático concluído para $(basename "$old_release")"
+      else
+        die "nova release falhou e rollback automático também falhou"
+      fi
+    fi
+
+    die "promoção recusada; release anterior restaurada"
+  fi
+
+  pass "release selecionada: $new_id"
+  info "serviço estava parado e permaneceu parado"
+}
+
+update_workstation() {
+  local output id
+  output="$(release_create)"
+  printf '%s\n' "$output"
+  id="$(printf '%s\n' "$output" | tail -n1)"
+
+  promote_release "$id"
+}
+
+rollback_workstation() {
+  [[ -L "$PREVIOUS_LINK" ]] || die "nenhuma release previous"
+
+  local target current
+  target="$(readlink -f "$PREVIOUS_LINK")"
+  current="$(current_release_path)" || die "nenhuma release current"
+
+  release_integrity "$target"
+
+  local was_active=0
+
+  if service_active; then
+    was_active=1
+    systemctl_user stop "$UNIT_NAME"
+  fi
+
+  ln -sfn "$target" "$CURRENT_LINK"
+  ln -sfn "$current" "$PREVIOUS_LINK"
+
+  render_unit
+  systemctl_user daemon-reload
+
+  if [[ "$was_active" -eq 1 ]]; then
+    if systemctl_user start "$UNIT_NAME" && verify_installed; then
+      pass "rollback concluído: $(basename "$target")"
+      return 0
+    fi
+
+    warn "rollback não ficou saudável; restaurando release que estava ativa"
+    systemctl_user stop "$UNIT_NAME" >/dev/null 2>&1 || true
+
+    ln -sfn "$current" "$CURRENT_LINK"
+    ln -sfn "$target" "$PREVIOUS_LINK"
+
+    render_unit
+    systemctl_user daemon-reload
+    systemctl_user start "$UNIT_NAME" || true
+
+    die "rollback recusado"
+  fi
+
+  pass "current alterado para $(basename "$target"); serviço permanece parado"
+}
+
+doctor() {
+  ensure_dirs
+
+  local failures=0
+  local cmd
+
+  for cmd in bash git python3 jq systemctl podman openssl curl; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      pass "$cmd"
+    else
+      printf '[FAIL] dependência ausente: %s\n' "$cmd" >&2
+      failures=$((failures + 1))
+    fi
+  done
+
+  local workspace=""
+  workspace="$(source_workspace_guess || true)"
+
+  if [[ -z "$workspace" ]]; then
+    warn "source workspace ainda não registrado"
+  else
+    pass "source workspace: $workspace"
+
+    local kind repo
+
+    for kind in infra sister nexo praxis; do
+      repo="$(repo_path "$workspace" "$kind")"
+
+      if [[ -d "$repo/.git" ]]; then
+        if [[ -z "$(git -C "$repo" status --porcelain)" ]]; then
+          pass "$kind clean @ $(git -C "$repo" rev-parse --short HEAD)"
+        else
+          warn "$kind possui alterações; release-create será bloqueado"
+        fi
+      else
+        printf '[FAIL] %s ausente: %s\n' "$kind" "$repo" >&2
+        failures=$((failures + 1))
+      fi
+    done
+  fi
+
+  if [[ "$TEST_MODE" == "1" ]] || systemctl --user show-environment >/dev/null 2>&1; then
+    pass "systemd --user"
+  else
+    printf '[FAIL] systemd --user indisponível\n' >&2
+    failures=$((failures + 1))
+  fi
+
+  printf '\nInstall root: %s\n' "$INSTALL_ROOT"
+  printf 'Config root:  %s\n' "$CONFIG_ROOT"
+  printf 'State root:   %s\n' "$STATE_ROOT"
+
+  [[ "$failures" -eq 0 ]] || die "doctor encontrou $failures falha(s)"
+  pass "doctor READY"
+}
+
+plan() {
+  local workspace
+  workspace="$(source_workspace_guess)" || die "source workspace desconhecido"
+
+  printf 'Source workspace: %s\n' "$workspace"
+  printf 'Current release:  %s\n' "$(current_release_id)"
+  printf 'Previous release: %s\n' "$(previous_release_id)"
+  printf '\n%-10s %-12s %-12s %s\n' "component" "source" "current" "change"
+
+  local release=""
+  release="$(current_release_path || true)"
+
+  local kind repo source_short current_short change
+
+  for kind in infra sister nexo praxis; do
+    repo="$(repo_path "$workspace" "$kind")"
+    source_short="$(git -C "$repo" rev-parse --short=12 HEAD)"
+    current_short="-"
+    change="NEW"
+
+    if [[ -n "$release" && -f "$release/manifest.json" ]]; then
+      current_short="$(jq -r ".components.$kind.commit" "$release/manifest.json" | cut -c1-12)"
+
+      if [[ "$source_short" == "$current_short" ]]; then
+        change="SAME"
+      else
+        change="UPDATE"
+      fi
+    fi
+
+    printf '%-10s %-12s %-12s %s\n' "$kind" "$source_short" "$current_short" "$change"
+  done
+
+  printf '\nNo changes performed.\n'
+}
+
+status() {
+  printf 'Current:  %s\n' "$(current_release_id)"
+  printf 'Previous: %s\n' "$(previous_release_id)"
+  printf 'Unit:     %s\n' "$UNIT_NAME"
+
+  if [[ "$TEST_MODE" == "1" ]]; then
+    printf 'Service:  TEST_MODE\n'
+  else
+    printf 'Service:  %s\n' "$(systemctl --user is-active "$UNIT_NAME" 2>/dev/null || true)"
+  fi
+
+  local release=""
+  release="$(current_release_path || true)"
+
+  if [[ -n "$release" ]]; then
+    printf 'Path:     %s\n' "$release"
+    release_integrity "$release"
+
+    printf '\n--- ecosystem status ---\n'
+    "$release/components/sister-infra/bin/sister-infra" status --profile lan || true
+  fi
+}
+
+release_list() {
+  ensure_dirs
+
+  local d
+
+  for d in "$RELEASES_ROOT"/ws-*; do
+    [[ -d "$d" ]] || continue
+
+    local id marker=""
+    id="$(basename "$d")"
+
+    [[ "$(current_release_id)" == "$id" ]] && marker="${marker} current"
+    [[ "$(previous_release_id)" == "$id" ]] && marker="${marker} previous"
+
+    printf '%s%s\n' "$id" "$marker"
+  done
+}
+
+logs_cmd() {
+  if [[ "$TEST_MODE" == "1" ]]; then
+    info "TEST_MODE: logs indisponíveis"
+    return 0
+  fi
+
+  journalctl --user -u "$UNIT_NAME" -n "${SISTER_WORKSTATION_LOG_LINES:-120}" --no-pager
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    doctor) doctor ;;
+    plan) plan ;;
+    release-create) release_create ;;
+    release-list) release_list ;;
+    install) install_release "${1:-}" ;;
+    activate) activate_workstation ;;
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) restart_service ;;
+    status) status ;;
+    verify) verify_installed ;;
+    update) update_workstation ;;
+    rollback) rollback_workstation ;;
+    logs) logs_cmd ;;
+    current)
+      printf 'current=%s\n' "$(current_release_id)"
+      printf 'previous=%s\n' "$(previous_release_id)"
+      ;;
+    help|-h|--help) usage ;;
+    *) die "comando workstation desconhecido: $command" ;;
+  esac
+}
+
+main "$@"
