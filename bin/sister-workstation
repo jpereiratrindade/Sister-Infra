@@ -229,21 +229,66 @@ copy_operational_config() {
   source_nexo="$(repo_path "$workspace" nexo)"
   source_sister="$(repo_path "$workspace" sister)"
 
+  # TLS é configuração persistente de implantação.
+  #
+  # Preserve o diretório Git-tracked secrets/ da release, inclusive
+  # secrets/.gitkeep. Material TLS entra arquivo a arquivo por symlink.
   mkdir -p "$TLS_CONFIG"
   chmod 700 "$TLS_CONFIG"
 
   if [[ -d "$source_infra/secrets" ]]; then
-    if [[ -z "$(find "$TLS_CONFIG" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-      cp -a "$source_infra/secrets/." "$TLS_CONFIG/"
+    if [[ -z "$(find "$TLS_CONFIG" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -print -quit 2>/dev/null)" ]]; then
+      local source_secret
+      local secret_name
+
+      while IFS= read -r -d '' source_secret; do
+        secret_name="$(basename "$source_secret")"
+        [[ "$secret_name" != ".gitkeep" ]] || continue
+        cp -p "$source_secret" "$TLS_CONFIG/$secret_name"
+      done < <(
+        find "$source_infra/secrets" \
+          -mindepth 1 \
+          -maxdepth 1 \
+          -type f \
+          -print0
+      )
+
       chmod 700 "$TLS_CONFIG"
       find "$TLS_CONFIG" -type f -name '*.key' -exec chmod 600 {} +
       find "$TLS_CONFIG" -type f -name '*.pem' -exec chmod 600 {} +
     fi
   fi
 
-  rm -rf "$release/components/sister-infra/secrets"
-  ln -s "$TLS_CONFIG" "$release/components/sister-infra/secrets"
+  local release_secrets="$release/components/sister-infra/secrets"
+  mkdir -p "$release_secrets"
 
+  local persisted_secret
+  local persisted_name
+  local tracked_path
+
+  while IFS= read -r -d '' persisted_secret; do
+    persisted_name="$(basename "$persisted_secret")"
+    [[ "$persisted_name" != ".gitkeep" ]] || continue
+
+    tracked_path="secrets/$persisted_name"
+
+    if git -C "$release/components/sister-infra" \
+        ls-files --error-unmatch "$tracked_path" >/dev/null 2>&1; then
+      die "configuração TLS colide com arquivo rastreado: $tracked_path"
+    fi
+
+    rm -f "$release_secrets/$persisted_name"
+    ln -s "$persisted_secret" "$release_secrets/$persisted_name"
+  done < <(
+    find "$TLS_CONFIG" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      -type f \
+      ! -name '.gitkeep' \
+      -print0
+  )
+
+  # Nexo exige .env atualmente. Persista-o fora da release.
   if [[ ! -f "$NEXO_ENV" ]]; then
     if [[ -f "$source_nexo/.env" ]]; then
       cp -p "$source_nexo/.env" "$NEXO_ENV"
@@ -260,6 +305,7 @@ copy_operational_config() {
     ln -s "$NEXO_ENV" "$release/components/sister-nexo/.env"
   fi
 
+  # SisTer segue a mesma política se existir .env local.
   if [[ ! -f "$SISTER_ENV" && -f "$source_sister/.env" ]]; then
     cp -p "$source_sister/.env" "$SISTER_ENV"
     chmod 600 "$SISTER_ENV"
@@ -376,6 +422,13 @@ PY
 
   printf '%s\n' "$id" > "$tmp/RELEASE_ID"
   printf '%s\n' "SISTER-INFRA-OPS-001" > "$tmp/QUALIFICATION"
+
+  # Valide a candidata ainda no staging. Uma candidata inválida
+  # nunca deve aparecer como release publicada.
+  if ! ( release_integrity "$tmp" ); then
+    rm -rf "$tmp"
+    die "candidata de release falhou na validação de integridade"
+  fi
 
   mv "$tmp" "$release"
   release_integrity "$release"

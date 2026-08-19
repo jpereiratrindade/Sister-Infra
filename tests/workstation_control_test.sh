@@ -33,12 +33,20 @@ make_repo() {
   case "$name" in
     sister-infra)
       mkdir -p "$path/bin" "$path/secrets"
+
       cp "$ROOT/bin/sister-infra" "$path/bin/sister-infra"
       cp "$ROOT/bin/sister-workstation" "$path/bin/sister-workstation"
       chmod +x "$path/bin/"*
-      printf 'secrets/\n' > "$path/.gitignore"
-      printf 'dummy\n' > "$path/secrets/ecosystem-lab-ca.crt"
+
+      # Reproduz a política real:
+      # .gitkeep rastreado; material TLS operacional ignorado.
+      cat > "$path/.gitignore" <<'EOF'
+secrets/*
+!secrets/.gitkeep
+EOF
+      : > "$path/secrets/.gitkeep"
       ;;
+
     sister-nexo)
       cat > "$path/.env.example" <<'EOF'
 NEXO_HOST=127.0.0.1
@@ -57,6 +65,18 @@ make_repo "$WORKSPACE/SisTer" SisTer
 make_repo "$WORKSPACE/sister-nexo" sister-nexo
 make_repo "$WORKSPACE/sister-praxis" sister-praxis
 
+# TLS sintético: presente no filesystem, ignorado pelo Git.
+printf 'test-ca\n'  > "$WORKSPACE/sister-infra/secrets/ecosystem-lab-ca.crt"
+printf 'test-pem\n' > "$WORKSPACE/sister-infra/secrets/ecosystem-lab.pem"
+printf 'test-key\n' > "$WORKSPACE/sister-infra/secrets/ecosystem-lab-ca.key"
+
+source_status="$(git -C "$WORKSPACE/sister-infra" status --porcelain)"
+[[ -z "$source_status" ]] || {
+  printf '[FAIL] fixture sister-infra deveria estar clean, mas está:\n%s\n' \
+    "$source_status" >&2
+  exit 1
+}
+
 export SISTER_SOURCE_WORKSPACE="$WORKSPACE"
 
 echo "=== doctor ==="
@@ -64,19 +84,37 @@ echo "=== doctor ==="
 
 echo
 echo "=== plan sem current ==="
-PLAN_OUT="$("$CLI" plan)"
-printf '%s\n' "$PLAN_OUT"
-grep -q 'NEW' <<<"$PLAN_OUT"
+plan_output="$("$CLI" plan)"
+printf '%s\n' "$plan_output"
+[[ "$plan_output" == *"NEW"* ]]
 
 echo
 echo "=== release 1 ==="
 OUT1="$("$CLI" release-create)"
+printf '%s\n' "$OUT1"
 ID1="$(printf '%s\n' "$OUT1" | tail -n1)"
 
-[[ -d "$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1" ]]
+RELEASE1="$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1"
+
+[[ -d "$RELEASE1" ]]
+[[ -f "$RELEASE1/components/sister-infra/secrets/.gitkeep" ]]
+[[ -L "$RELEASE1/components/sister-infra/secrets/ecosystem-lab-ca.crt" ]]
+[[ -L "$RELEASE1/components/sister-infra/secrets/ecosystem-lab.pem" ]]
+[[ -L "$RELEASE1/components/sister-infra/secrets/ecosystem-lab-ca.key" ]]
+
+infra_status="$(
+  git -C "$RELEASE1/components/sister-infra" \
+    status --porcelain --untracked-files=no
+)"
+
+[[ -z "$infra_status" ]] || {
+  printf '[FAIL] sister-infra da release nasceu dirty:\n%s\n' \
+    "$infra_status" >&2
+  exit 1
+}
 
 jq -e '.schema == "sister.infra.workstation.release/1"' \
-  "$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1/manifest.json" >/dev/null
+  "$RELEASE1/manifest.json" >/dev/null
 
 echo
 echo "=== install 1 ==="
@@ -92,6 +130,7 @@ git -C "$WORKSPACE/SisTer" add README.md
 git -C "$WORKSPACE/SisTer" commit -q -m second
 
 OUT2="$("$CLI" release-create)"
+printf '%s\n' "$OUT2"
 ID2="$(printf '%s\n' "$OUT2" | tail -n1)"
 
 [[ "$ID1" != "$ID2" ]]
@@ -112,7 +151,6 @@ echo "=== rollback com serviço parado ==="
 
 echo
 echo "=== integridade detecta mutação rastreada ==="
-RELEASE1="$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1"
 printf 'tamper\n' >> "$RELEASE1/components/SisTer/README.md"
 
 if "$CLI" status >/dev/null 2>&1; then
