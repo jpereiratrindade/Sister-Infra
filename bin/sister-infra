@@ -109,19 +109,317 @@ production_preflight() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Lifecycle TLS de laboratório
+# ---------------------------------------------------------------------------
+#
+# A existência dos arquivos NÃO constitui evidência de validade.
+#
+# Invariantes:
+#   TLS-001: CA existe e é parseável.
+#   TLS-002: CA possui validade residual mínima.
+#   TLS-003: certificado existe e é parseável.
+#   TLS-004: certificado possui validade residual mínima.
+#   TLS-005: certificado valida contra a CA corrente.
+#   TLS-006: certificado cobre todos os hosts configurados.
+#
+# Política:
+#   - CA saudável + certificado saudável -> preservar bytes.
+#   - CA saudável + certificado inadequado -> renovar apenas certificado.
+#   - CA inadequada -> rotacionar CA + certificado.
+#   - CA saudável sem chave correspondente, quando o certificado precisa
+#     ser renovado -> rotacionar CA + certificado.
+#
+# Janela preventiva padrão: 30 dias.
+TLS_RENEW_BEFORE_SECONDS="${TLS_RENEW_BEFORE_SECONDS:-2592000}"
+CA_RENEW_BEFORE_SECONDS="${CA_RENEW_BEFORE_SECONDS:-2592000}"
+
+lab_tls_expected_hosts() {
+  local seen="|"
+  local host
+
+  for host in \
+    "${SISTER_HOST:-}" \
+    "${NEXO_HOST:-}" \
+    "${PRAXIS_HOST:-}"
+  do
+    [[ -n "$host" ]] || continue
+
+    case "$seen" in
+      *"|${host}|"*) ;;
+      *)
+        printf '%s\n' "$host"
+        seen="${seen}${host}|"
+        ;;
+    esac
+  done
+}
+
+lab_tls_ca_parseable() {
+  [[ -f "$CA_CERT" ]] || return 1
+  openssl x509 -in "$CA_CERT" -noout >/dev/null 2>&1
+}
+
+lab_tls_ca_valid() {
+  lab_tls_ca_parseable || return 1
+  openssl x509 \
+    -checkend "$CA_RENEW_BEFORE_SECONDS" \
+    -noout \
+    -in "$CA_CERT" >/dev/null 2>&1
+}
+
+lab_tls_cert_parseable() {
+  [[ -f "$TLS_PEM" ]] || return 1
+  openssl x509 -in "$TLS_PEM" -noout >/dev/null 2>&1
+}
+
+lab_tls_cert_valid() {
+  lab_tls_cert_parseable || return 1
+  openssl x509 \
+    -checkend "$TLS_RENEW_BEFORE_SECONDS" \
+    -noout \
+    -in "$TLS_PEM" >/dev/null 2>&1
+}
+
+lab_tls_cert_signed_by_current_ca() {
+  lab_tls_ca_parseable || return 1
+  lab_tls_cert_parseable || return 1
+
+  local cert_tmp
+  cert_tmp="$(mktemp "$GATEWAY_RUN/tls-verify-cert.XXXXXX")"
+
+  if ! openssl x509 -in "$TLS_PEM" -out "$cert_tmp" >/dev/null 2>&1; then
+    rm -f "$cert_tmp"
+    return 1
+  fi
+
+  if openssl verify -CAfile "$CA_CERT" "$cert_tmp" >/dev/null 2>&1; then
+    rm -f "$cert_tmp"
+    return 0
+  fi
+
+  rm -f "$cert_tmp"
+  return 1
+}
+
+lab_tls_cert_has_host() {
+  local host="$1"
+
+  lab_tls_cert_parseable || return 1
+
+  openssl x509 \
+      -in "$TLS_PEM" \
+      -noout \
+      -ext subjectAltName 2>/dev/null |
+    tr ',' '\n' |
+    sed 's/^[[:space:]]*//' |
+    grep -Fxq "DNS:${host}"
+}
+
+lab_tls_cert_has_all_hosts() {
+  local host
+  local found=0
+
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    found=1
+    lab_tls_cert_has_host "$host" || return 1
+  done < <(lab_tls_expected_hosts)
+
+  [[ "$found" -eq 1 ]]
+}
+
+lab_tls_ca_key_matches_cert() {
+  [[ -f "$CA_KEY" ]] || return 1
+  lab_tls_ca_parseable || return 1
+
+  local cert_digest
+  local key_digest
+
+  cert_digest="$(
+    openssl x509 -in "$CA_CERT" -pubkey -noout 2>/dev/null |
+    openssl pkey -pubin -outform DER 2>/dev/null |
+    openssl dgst -sha256 2>/dev/null
+  )" || return 1
+
+  key_digest="$(
+    openssl pkey -in "$CA_KEY" -pubout -outform DER 2>/dev/null |
+    openssl dgst -sha256 2>/dev/null
+  )" || return 1
+
+  [[ -n "$cert_digest" && "$cert_digest" == "$key_digest" ]]
+}
+
+lab_tls_backup_current() {
+  local stamp
+  local dir
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  dir="$GATEWAY_RUN/tls-backup/$stamp"
+
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  [[ ! -f "$TLS_PEM" ]] || cp -p "$TLS_PEM" "$dir/"
+  [[ ! -f "$CA_CERT" ]] || cp -p "$CA_CERT" "$dir/"
+  [[ ! -f "$CA_KEY" ]] || cp -p "$CA_KEY" "$dir/"
+
+  printf '%s\n' "$dir"
+}
+
+lab_tls_ca_fingerprint() {
+  [[ -f "$CA_CERT" ]] || return 1
+  openssl x509 \
+    -in "$CA_CERT" \
+    -noout \
+    -fingerprint \
+    -sha256 2>/dev/null
+}
+
 migrate_existing_lab_tls() {
   [[ "$PROFILE" != "production" ]] || return 0
-  [[ -f "$TLS_PEM" && -f "$CA_CERT" ]] && return 0
+
+  # Material local existente deve ser avaliado, não sobrescrito.
+  [[ -f "$TLS_PEM" || -f "$CA_CERT" || -f "$CA_KEY" ]] && return 0
 
   local old="$SISTER_DIR/.run/gateway"
+
   if [[ -f "$old/gateway-lab.pem" && -f "$old/ca-lab.crt" ]]; then
-    log "Migrando uma cópia do TLS de laboratório já confiado no SisTer para sister-infra..."
+    log "Migrando TLS legado do SisTer para avaliação pelo sister-infra..."
+
     cp -p "$old/gateway-lab.pem" "$TLS_PEM"
     cp -p "$old/ca-lab.crt" "$CA_CERT"
+
+    if [[ -f "$old/ca-lab.key" ]]; then
+      cp -p "$old/ca-lab.key" "$CA_KEY"
+      chmod 600 "$CA_KEY"
+    fi
+
     chmod 600 "$TLS_PEM"
     chmod 644 "$CA_CERT"
-    pass "certificado de laboratório copiado para sister-infra"
+
+    pass "TLS legado copiado; lifecycle será validado antes do uso"
   fi
+}
+
+generate_lab_ca() {
+  log "Gerando nova CA de laboratório do sister-infra..."
+
+  openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
+  chmod 600 "$CA_KEY"
+
+  openssl req \
+    -x509 \
+    -new \
+    -nodes \
+    -key "$CA_KEY" \
+    -sha256 \
+    -days 3650 \
+    -subj "/CN=SisTer Infra Lab CA" \
+    -out "$CA_CERT" >/dev/null 2>&1
+
+  chmod 644 "$CA_CERT"
+
+  lab_tls_ca_valid || \
+    die "CA recém-gerada falhou na validação temporal"
+}
+
+generate_lab_server_certificate() {
+  lab_tls_ca_valid || \
+    die "não é possível emitir certificado: CA lab inválida"
+
+  lab_tls_ca_key_matches_cert || \
+    die "não é possível emitir certificado: chave da CA não corresponde à CA"
+
+  local tmp
+  local host
+  local -a hosts=()
+
+  tmp="$(mktemp -d "$GATEWAY_RUN/tls-issue.XXXXXX")"
+  chmod 700 "$tmp"
+
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    hosts+=("$host")
+  done < <(lab_tls_expected_hosts)
+
+  [[ "${#hosts[@]}" -gt 0 ]] || {
+    rm -rf "$tmp"
+    die "nenhum hostname configurado para o certificado TLS"
+  }
+
+  openssl genrsa -out "$tmp/gateway.key" 3072 >/dev/null 2>&1
+
+  {
+    cat <<CFG
+[req]
+prompt = no
+distinguished_name = dn
+req_extensions = req_ext
+
+[dn]
+CN = ${hosts[0]}
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+CFG
+
+    local i=1
+    for host in "${hosts[@]}"; do
+      printf 'DNS.%d = %s\n' "$i" "$host"
+      i=$((i + 1))
+    done
+  } > "$tmp/openssl.cnf"
+
+  openssl req \
+    -new \
+    -key "$tmp/gateway.key" \
+    -out "$tmp/gateway.csr" \
+    -config "$tmp/openssl.cnf" >/dev/null 2>&1
+
+  {
+    printf 'subjectAltName='
+
+    local first=1
+    for host in "${hosts[@]}"; do
+      if [[ "$first" -eq 0 ]]; then
+        printf ','
+      fi
+      printf 'DNS:%s' "$host"
+      first=0
+    done
+
+    printf '\nextendedKeyUsage=serverAuth\n'
+    printf 'keyUsage=digitalSignature,keyEncipherment\n'
+  } > "$tmp/ext.cnf"
+
+  openssl x509 \
+    -req \
+    -in "$tmp/gateway.csr" \
+    -CA "$CA_CERT" \
+    -CAkey "$CA_KEY" \
+    -CAserial "$tmp/ca.srl" \
+    -CAcreateserial \
+    -out "$tmp/gateway.crt" \
+    -days 825 \
+    -sha256 \
+    -extfile "$tmp/ext.cnf" >/dev/null 2>&1
+
+  cat "$tmp/gateway.crt" "$tmp/gateway.key" > "$TLS_PEM"
+  chmod 600 "$TLS_PEM"
+
+  rm -rf "$tmp"
+
+  lab_tls_cert_valid || \
+    die "certificado recém-gerado falhou na validação temporal"
+
+  lab_tls_cert_signed_by_current_ca || \
+    die "certificado recém-gerado não valida contra a CA corrente"
+
+  lab_tls_cert_has_all_hosts || \
+    die "certificado recém-gerado não cobre todos os hosts configurados"
 }
 
 generate_lab_tls() {
@@ -130,77 +428,91 @@ generate_lab_tls() {
 
   migrate_existing_lab_tls
 
-  if [[ -f "$TLS_PEM" && -f "$CA_CERT" ]]; then
-    if openssl x509 -in "$TLS_PEM" -noout -ext subjectAltName 2>/dev/null \
-         | grep -Fq "DNS:${PRAXIS_HOST}"; then
-      return 0
+  local ca_ok=0
+  local cert_ok=0
+  local rotate_ca=0
+  local renew_cert=0
+  local backup_dir=""
+  local old_fingerprint=""
+
+  if lab_tls_ca_valid; then
+    ca_ok=1
+  fi
+
+  if [[ "$ca_ok" -eq 1 ]] &&
+     lab_tls_cert_valid &&
+     lab_tls_cert_signed_by_current_ca &&
+     lab_tls_cert_has_all_hosts; then
+    cert_ok=1
+  fi
+
+  if [[ "$ca_ok" -eq 1 && "$cert_ok" -eq 1 ]]; then
+    return 0
+  fi
+
+  if [[ "$ca_ok" -eq 0 ]]; then
+    if lab_tls_ca_parseable; then
+      warn "CA lab expirada ou dentro da janela preventiva de renovação."
+      old_fingerprint="$(lab_tls_ca_fingerprint || true)"
+    else
+      warn "CA lab ausente ou não parseável."
     fi
-    log "TLS existente não cobre $PRAXIS_HOST; reemitindo certificado."
+
+    rotate_ca=1
+    renew_cert=1
+  else
+    if ! lab_tls_cert_parseable; then
+      warn "certificado TLS lab ausente ou não parseável; será reemitido."
+    elif ! lab_tls_cert_valid; then
+      warn "certificado TLS lab expirado ou dentro da janela preventiva; será reemitido."
+    elif ! lab_tls_cert_signed_by_current_ca; then
+      warn "certificado TLS lab não pertence à CA corrente; será reemitido."
+    elif ! lab_tls_cert_has_all_hosts; then
+      warn "certificado TLS lab não cobre todos os hosts configurados; será reemitido."
+    fi
+
+    renew_cert=1
+
+    if ! lab_tls_ca_key_matches_cert; then
+      warn "chave privada da CA ausente ou incompatível."
+      warn "não é possível renovar preservando essa CA; será necessária rotação."
+      rotate_ca=1
+    fi
   fi
 
-  if [[ -f "$CA_CERT" && ! -f "$CA_KEY" ]]; then
-    die "CA existente sem chave privada; não é seguro rotacionar confiança silenciosamente: $CA_KEY"
+  backup_dir="$(lab_tls_backup_current)"
+  log "Backup do material TLS anterior: $backup_dir"
+
+  if [[ "$rotate_ca" -eq 1 ]]; then
+    generate_lab_ca
+
+    warn "A CA de laboratório foi ROTACIONADA."
+    warn "Clientes LAN que confiavam na CA anterior devem instalar:"
+    warn "  $CA_CERT"
+
+    if [[ -n "$old_fingerprint" ]]; then
+      warn "Fingerprint anterior: $old_fingerprint"
+    fi
+
+    warn "Fingerprint atual: $(lab_tls_ca_fingerprint)"
   fi
 
-  log "Preparando certificado TLS próprio do sister-infra..."
-  local tmp="$GATEWAY_RUN/tls"
-  rm -rf "$tmp"
-  mkdir -p "$tmp"
-  chmod 700 "$tmp"
+  if [[ "$renew_cert" -eq 1 ]]; then
+    generate_lab_server_certificate
 
-  if [[ ! -f "$CA_CERT" || ! -f "$CA_KEY" ]]; then
-    log "Gerando nova CA de laboratório..."
-    openssl genrsa -out "$CA_KEY" 4096 >/dev/null 2>&1
-    chmod 600 "$CA_KEY"
-    openssl req -x509 -new -nodes \
-      -key "$CA_KEY" \
-      -sha256 -days 3650 \
-      -subj "/CN=SisTer Infra Lab CA" \
-      -out "$CA_CERT" >/dev/null 2>&1
+    local hosts_text=""
+    local host
+
+    while IFS= read -r host; do
+      [[ -n "$host" ]] || continue
+      if [[ -n "$hosts_text" ]]; then
+        hosts_text="${hosts_text}, "
+      fi
+      hosts_text="${hosts_text}${host}"
+    done < <(lab_tls_expected_hosts)
+
+    pass "TLS lab válido para: $hosts_text"
   fi
-
-  openssl genrsa -out "$tmp/gateway.key" 3072 >/dev/null 2>&1
-  cat > "$tmp/openssl.cnf" <<CFG
-[req]
-prompt = no
-distinguished_name = dn
-req_extensions = req_ext
-
-[dn]
-CN = ${SISTER_HOST}
-
-[req_ext]
-subjectAltName = @alt_names
-
-[alt_names]
-DNS.1 = ${SISTER_HOST}
-DNS.2 = ${NEXO_HOST}
-DNS.3 = ${PRAXIS_HOST}
-CFG
-
-  openssl req -new \
-    -key "$tmp/gateway.key" \
-    -out "$tmp/gateway.csr" \
-    -config "$tmp/openssl.cnf" >/dev/null 2>&1
-
-  cat > "$tmp/ext.cnf" <<CFG
-subjectAltName=DNS:${SISTER_HOST},DNS:${NEXO_HOST},DNS:${PRAXIS_HOST}
-extendedKeyUsage=serverAuth
-keyUsage=digitalSignature,keyEncipherment
-CFG
-
-  openssl x509 -req \
-    -in "$tmp/gateway.csr" \
-    -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
-    -out "$tmp/gateway.crt" \
-    -days 825 -sha256 \
-    -extfile "$tmp/ext.cnf" >/dev/null 2>&1
-
-  cat "$tmp/gateway.crt" "$tmp/gateway.key" > "$TLS_PEM"
-  chmod 600 "$TLS_PEM"
-  chmod 644 "$CA_CERT"
-  rm -rf "$tmp"
-  pass "TLS lab gerado para $SISTER_HOST, $NEXO_HOST e $PRAXIS_HOST"
 }
 
 render_gateway() {
@@ -616,4 +928,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -65,3 +65,35 @@ já instalada nos clientes. Se ele não existir, uma nova CA de laboratório é
 gerada em `secrets/`.
 
 Nunca versione `secrets/` nem `config/production.env`.
+
+<!-- SISTER-INFRA-TLS-LIFECYCLE:BEGIN -->
+## Ciclo de vida do TLS de laboratório
+
+A existência dos arquivos TLS não é evidência suficiente de validade. Antes de
+reutilizar a cadeia de laboratório, o `sister-infra` verifica:
+
+- validade temporal residual da CA;
+- validade temporal residual do certificado do gateway;
+- assinatura do certificado pela CA corrente;
+- cobertura dos hostnames configurados no SAN, incluindo o Praxis quando
+  `PRAXIS_HOST` estiver configurado.
+
+Por padrão, CA e certificado entram em renovação preventiva quando restam menos
+de 30 dias de validade. As janelas podem ser ajustadas por
+`CA_RENEW_BEFORE_SECONDS` e `TLS_RENEW_BEFORE_SECONDS`.
+
+Quando somente o certificado precisa ser renovado e a chave privada da CA
+corrente corresponde à CA instalada, a CA é preservada. Quando a CA precisa ser
+rotacionada, ou sua chave privada não permite a reemissão necessária, uma nova
+CA é criada e o operador é avisado de que os clientes LAN precisam instalar
+novamente `secrets/ecosystem-lab-ca.crt`.
+
+Antes de qualquer rotação, o material existente é copiado para
+`.run/gateway/tls-backup/`.
+
+Teste de regressão:
+
+```bash
+./tests/tls_lifecycle_test.sh
+```
+<!-- SISTER-INFRA-TLS-LIFECYCLE:END -->
