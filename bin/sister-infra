@@ -644,6 +644,9 @@ start_nexo() {
     log "Subindo Nexo..."
     (
       cd "$NEXO_DIR"
+      # SISTER-INFRA-NEXO-LOOPBACK-BOUNDARY
+      # Subsistemas gerenciados não publicam borda própria na LAN.
+      export NEXO_HOST="$NEXO_ADDRESS"
       export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
       ./scripts/run.sh
     )
