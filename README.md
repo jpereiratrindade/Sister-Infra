@@ -161,3 +161,22 @@ um incremento próprio antes de considerar este modelo candidato a produção.
 
 Produção continua proibida por inferência: `workstation` não é `production`.
 <!-- SISTER-INFRA-OPS001-WORKSTATION:END -->
+
+<!-- SISTER-INFRA-OPS001C-BUILD:BEGIN -->
+### Build-qualified workstation releases
+
+A partir de OPS-001C, `release-create` não publica apenas clones de código.
+
+A candidata passa por:
+
+1. clone independente dos commits;
+2. build `Release` e CTest em caminhos curtos temporários;
+3. build final dentro da própria candidata de release;
+4. identificação dos artefatos de runtime;
+5. SHA-256 dos artefatos no manifesto;
+6. validação de integridade antes da publicação.
+
+O `install` seleciona a release e renderiza a unidade, mas não habilita autostart. O `activate` habilita a unidade somente depois de `start + verify` bem-sucedidos. Falha de ativação mantém o autostart desabilitado e tenta restaurar o runtime anterior.
+
+Isso separa explicitamente `build`, `release`, `install` e `activation`.
+<!-- SISTER-INFRA-OPS001C-BUILD:END -->

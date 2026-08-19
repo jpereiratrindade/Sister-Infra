@@ -195,6 +195,39 @@ release_integrity() {
     }
   done
 
+  local build_status
+  build_status="$(jq -r '.qualification.build.status // "UNQUALIFIED"' "$(manifest_path "$release")")"
+
+  if [[ "$build_status" == "PASS" ]]; then
+    local artifact component_name relpath expected_hash actual_hash absolute
+
+    while IFS=$'\t' read -r artifact component_name relpath expected_hash; do
+      [[ -n "$artifact" ]] || continue
+
+      case "$component_name" in
+        sister) absolute="$release/components/SisTer/$relpath" ;;
+        nexo) absolute="$release/components/sister-nexo/$relpath" ;;
+        praxis) absolute="$release/components/sister-praxis/$relpath" ;;
+        *) die "manifesto contém componente de artefato desconhecido: $component_name" ;;
+      esac
+
+      [[ -x "$absolute" ]] || \
+        die "release corrompida: artefato ausente/não executável: $artifact"
+
+      actual_hash="$(sha256sum "$absolute" | awk '{print $1}')"
+
+      [[ "$actual_hash" == "$expected_hash" ]] || \
+        die "release corrompida: hash divergente para $artifact"
+    done < <(
+      jq -r '
+        .qualification.build.artifacts
+        | to_entries[]
+        | [.key, .value.component, .value.path, .value.sha256]
+        | @tsv
+      ' "$(manifest_path "$release")"
+    )
+  fi
+
   pass "integridade da release $(basename "$release")"
 }
 
@@ -333,6 +366,114 @@ clone_component() {
     die "clone não materializou commit esperado em $dest"
 }
 
+release_build_qualification() {
+  local workspace="$1"
+  local sister_commit="$2"
+  local nexo_commit="$3"
+  local praxis_commit="$4"
+  local evidence_dir="$5"
+
+  mkdir -p "$evidence_dir"
+
+  local short_root
+  short_root="$(mktemp -d /tmp/si-wsqual.XXXXXX)"
+
+  local component source commit clone build log
+
+  for component in sister nexo praxis; do
+    case "$component" in
+      sister)
+        source="$(repo_path "$workspace" sister)"
+        commit="$sister_commit"
+        ;;
+      nexo)
+        source="$(repo_path "$workspace" nexo)"
+        commit="$nexo_commit"
+        ;;
+      praxis)
+        source="$(repo_path "$workspace" praxis)"
+        commit="$praxis_commit"
+        ;;
+    esac
+
+    clone="$short_root/$component"
+    build="$clone/build"
+    log="$evidence_dir/${component}.log"
+
+    if ! {
+      git clone --no-hardlinks --quiet "$source" "$clone"
+      git -C "$clone" checkout --quiet --detach "$commit"
+      cmake -S "$clone" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release
+      cmake --build "$build"
+      ctest --test-dir "$build" --output-on-failure
+    } > >(tee "$log") 2>&1; then
+      rm -rf "$short_root"
+      die "build/test qualification falhou para $component"
+    fi
+
+    pass "source qualification: $component"
+  done
+
+  rm -rf "$short_root"
+}
+
+find_runtime_artifact() {
+  local component="$1"
+  local root="$2"
+  local candidate=""
+
+  case "$component" in
+    sister)
+      for candidate in "$root/build/apps/sisterd/sisterd" "$root/build/sisterd"; do
+        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+      done
+      find "$root/build" -type f -name sisterd -perm -u+x -print -quit 2>/dev/null
+      ;;
+    nexo)
+      for candidate in "$root/build/sister-nexo"; do
+        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+      done
+      find "$root/build" -type f -name sister-nexo -perm -u+x -print -quit 2>/dev/null
+      ;;
+    praxis)
+      for candidate in "$root/build/sister-praxis-http"; do
+        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+      done
+      find "$root/build" -type f -name sister-praxis-http -perm -u+x -print -quit 2>/dev/null
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+materialize_release_build() {
+  local release="$1"
+  local component root
+
+  for component in sister nexo praxis; do
+    case "$component" in
+      sister) root="$release/components/SisTer" ;;
+      nexo) root="$release/components/sister-nexo" ;;
+      praxis) root="$release/components/sister-praxis" ;;
+    esac
+
+    cmake -S "$root" -B "$root/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$root/build"
+    pass "release build: $component"
+  done
+}
+
+require_release_build_qualified() {
+  local release="$1"
+  local status
+
+  status="$(jq -r '.qualification.build.status // "UNQUALIFIED"' "$(manifest_path "$release")")"
+
+  [[ "$status" == "PASS" ]] || \
+    die "release não possui build qualification PASS: $(basename "$release")"
+}
+
 release_create() {
   ensure_dirs
 
@@ -376,7 +517,16 @@ release_create() {
   [[ ! -e "$release" ]] || die "release já existe: $id"
 
   rm -rf "$tmp"
-  mkdir -p "$tmp/components"
+  mkdir -p "$tmp/components" "$tmp/evidence/build"
+
+  info "qualificando fontes da release $id"
+
+  release_build_qualification \
+    "$workspace" \
+    "$sister_commit" \
+    "$nexo_commit" \
+    "$praxis_commit" \
+    "$tmp/evidence/build"
 
   info "materializando release $id"
 
@@ -386,20 +536,48 @@ release_create() {
   clone_component "$praxis" "$tmp/components/sister-praxis" "$praxis_commit"
 
   copy_operational_config "$workspace" "$tmp"
+  materialize_release_build "$tmp"
+
+  local sister_artifact nexo_artifact praxis_artifact
+  local sister_rel nexo_rel praxis_rel
+  local sister_hash nexo_hash praxis_hash
+
+  sister_artifact="$(find_runtime_artifact sister "$tmp/components/SisTer")"
+  nexo_artifact="$(find_runtime_artifact nexo "$tmp/components/sister-nexo")"
+  praxis_artifact="$(find_runtime_artifact praxis "$tmp/components/sister-praxis")"
+
+  [[ -x "$sister_artifact" ]] || die "artefato sisterd não materializado"
+  [[ -x "$nexo_artifact" ]] || die "artefato sister-nexo não materializado"
+  [[ -x "$praxis_artifact" ]] || die "artefato sister-praxis-http não materializado"
+
+  sister_rel="${sister_artifact#"$tmp/components/SisTer/"}"
+  nexo_rel="${nexo_artifact#"$tmp/components/sister-nexo/"}"
+  praxis_rel="${praxis_artifact#"$tmp/components/sister-praxis/"}"
+
+  sister_hash="$(sha256sum "$sister_artifact" | awk '{print $1}')"
+  nexo_hash="$(sha256sum "$nexo_artifact" | awk '{print $1}')"
+  praxis_hash="$(sha256sum "$praxis_artifact" | awk '{print $1}')"
 
   python3 - "$tmp/manifest.json" \
     "$id" "$timestamp" "$workspace" \
-    "$infra_commit" "$sister_commit" "$nexo_commit" "$praxis_commit" <<'PY'
-import json, sys
+    "$infra_commit" "$sister_commit" "$nexo_commit" "$praxis_commit" \
+    "$sister_rel" "$sister_hash" \
+    "$nexo_rel" "$nexo_hash" \
+    "$praxis_rel" "$praxis_hash" <<'PY_MANIFEST_OPS001C'
+import json
+import sys
 from pathlib import Path
 
 (
     out, rid, created, workspace,
-    infra, sister, nexo, praxis
+    infra, sister, nexo, praxis,
+    sister_path, sister_hash,
+    nexo_path, nexo_hash,
+    praxis_path, praxis_hash,
 ) = sys.argv[1:]
 
 payload = {
-    "schema": "sister.infra.workstation.release/1",
+    "schema": "sister.infra.workstation.release/2",
     "release_id": rid,
     "created_at_utc": created,
     "source_workspace": workspace,
@@ -407,34 +585,59 @@ payload = {
     "isolation": {
         "source_code": "independent-local-clone",
         "configuration": "persistent-outside-release",
-        "data_plane": "component-entrypoints-current-contracts"
+        "data_plane": "component-entrypoints-current-contracts",
     },
     "components": {
         "infra": {"commit": infra},
         "sister": {"commit": sister},
         "nexo": {"commit": nexo},
-        "praxis": {"commit": praxis}
-    }
+        "praxis": {"commit": praxis},
+    },
+    "qualification": {
+        "build": {
+            "status": "PASS",
+            "profile": "Release",
+            "source_tests": "PASS",
+            "artifacts": {
+                "sisterd": {
+                    "component": "sister",
+                    "path": sister_path,
+                    "sha256": sister_hash,
+                },
+                "sister-nexo": {
+                    "component": "nexo",
+                    "path": nexo_path,
+                    "sha256": nexo_hash,
+                },
+                "sister-praxis-http": {
+                    "component": "praxis",
+                    "path": praxis_path,
+                    "sha256": praxis_hash,
+                },
+            },
+        }
+    },
 }
 
 Path(out).write_text(json.dumps(payload, indent=2) + "\n")
-PY
+PY_MANIFEST_OPS001C
 
   printf '%s\n' "$id" > "$tmp/RELEASE_ID"
-  printf '%s\n' "SISTER-INFRA-OPS-001" > "$tmp/QUALIFICATION"
+  printf '%s\n' "SISTER-INFRA-OPS-001C" > "$tmp/QUALIFICATION"
 
-  # Valide a candidata ainda no staging. Uma candidata inválida
-  # nunca deve aparecer como release publicada.
   if ! ( release_integrity "$tmp" ); then
     rm -rf "$tmp"
     die "candidata de release falhou na validação de integridade"
   fi
 
   mv "$tmp" "$release"
+
   release_integrity "$release"
+  require_release_build_qualified "$release"
 
   printf '%s\n' "$id" > "$STATE_ROOT/last-created-release"
-  pass "release criada: $id"
+
+  pass "release build-qualified criada: $id"
   printf '%s\n' "$id"
 }
 
@@ -486,7 +689,9 @@ install_release() {
 
   local release
   release="$(release_path_by_id "$id")"
+
   release_integrity "$release"
+  require_release_build_qualified "$release"
 
   local old_current=""
 
@@ -502,14 +707,12 @@ install_release() {
 
   render_unit
   ensure_runtime_env
-
   ln -sfn "$CURRENT_LINK/components/sister-infra/bin/sister-infra" "$CLI_LINK"
 
   systemctl_user daemon-reload
-  systemctl_user enable "$UNIT_NAME" >/dev/null
 
   pass "release instalada como current: $id"
-  info "serviço habilitado, mas não iniciado"
+  info "serviço instalado, mas permanece desabilitado e não iniciado"
 }
 
 verify_installed() {
@@ -517,6 +720,7 @@ verify_installed() {
   release="$(current_release_path)" || die "nenhuma release current"
 
   release_integrity "$release"
+  require_release_build_qualified "$release"
 
   "$release/components/sister-infra/bin/sister-infra" verify --profile lan
   pass "workstation verificado"
@@ -555,10 +759,12 @@ activate_workstation() {
   release="$(current_release_path)" || die "instale uma release antes de activate"
 
   release_integrity "$release"
+  require_release_build_qualified "$release"
 
   if service_active; then
     info "workstation já está ativo"
     verify_installed
+    systemctl_user enable "$UNIT_NAME" >/dev/null
     return 0
   fi
 
@@ -578,12 +784,14 @@ activate_workstation() {
 
   if systemctl_user start "$UNIT_NAME"; then
     if verify_installed; then
-      pass "workstation assumiu o runtime"
+      systemctl_user enable "$UNIT_NAME" >/dev/null
+      pass "workstation assumiu o runtime e autostart foi habilitado"
       return 0
     fi
   fi
 
   warn "ativação workstation falhou; tentando restaurar runtime anterior"
+  systemctl_user disable "$UNIT_NAME" >/dev/null 2>&1 || true
   systemctl_user stop "$UNIT_NAME" >/dev/null 2>&1 || true
 
   if [[ -n "$source_infra" ]]; then
