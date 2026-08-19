@@ -5,6 +5,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=SISTER_INFRA_RUNTIME_MODE=installed
 Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-%h/.config/sister/workstation/runtime.env

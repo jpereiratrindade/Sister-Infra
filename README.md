@@ -180,3 +180,23 @@ O `install` seleciona a release e renderiza a unidade, mas não habilita autosta
 
 Isso separa explicitamente `build`, `release`, `install` e `activation`.
 <!-- SISTER-INFRA-OPS001C-BUILD:END -->
+
+<!-- SISTER-INFRA-OPS001D-RUNTIME:BEGIN -->
+### Installed runtime contract
+
+Releases workstation usam `SISTER_INFRA_RUNTIME_MODE=installed`.
+
+Nesse modo, o `sister-infra` não reutiliza os entrypoints de desenvolvimento
+para SisTer e Nexo. Cada componente expõe um `scripts/runtime.sh` que inicia
+somente artefatos já qualificados pela release.
+
+A separação é intencional:
+
+- desenvolvimento: build, CTest e qualificação;
+- release-create: materialização e hashes dos artefatos;
+- installed runtime: banco/migrações/readiness + execução dos artefatos;
+- activate: handover e verificação;
+- autostart: habilitado somente após ativação bem-sucedida.
+
+O installed runtime não pode executar CMake, CTest nem reconstruir imagens.
+<!-- SISTER-INFRA-OPS001D-RUNTIME:END -->
