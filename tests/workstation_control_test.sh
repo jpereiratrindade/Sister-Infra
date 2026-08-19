@@ -31,9 +31,20 @@ git_init_commit() {
 make_infra() {
   local path="$WORKSPACE/sister-infra"
 
-  mkdir -p "$path/bin" "$path/secrets"
-  cp "$ROOT/bin/sister-infra" "$path/bin/sister-infra"
-  cp "$ROOT/bin/sister-workstation" "$path/bin/sister-workstation"
+  mkdir -p \
+    "$path/bin" \
+    "$path/secrets" \
+    "$path/templates/systemd"
+
+  cp "$ROOT/bin/sister-infra" \
+    "$path/bin/sister-infra"
+
+  cp "$ROOT/bin/sister-workstation" \
+    "$path/bin/sister-workstation"
+
+  cp "$ROOT/templates/systemd/sister-workstation.service.in" \
+    "$path/templates/systemd/sister-workstation.service.in"
+
   chmod +x "$path/bin/"*
   printf 'infra\n' > "$path/README.md"
 
@@ -138,6 +149,18 @@ printf '%s\n' "$OUT1"
 ID1="$(printf '%s\n' "$OUT1" | tail -n1)"
 RELEASE1="$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1"
 
+[[ -f "$RELEASE1/components/sister-infra/templates/systemd/sister-workstation.service.in" ]] || {
+  echo "[FAIL] release não contém template systemd do sister-infra" >&2
+  exit 1
+}
+
+grep -Fxq \
+  'Environment=SISTER_INFRA_RUNTIME_MODE=installed' \
+  "$RELEASE1/components/sister-infra/templates/systemd/sister-workstation.service.in" || {
+    echo "[FAIL] template da release perdeu contrato installed" >&2
+    exit 1
+  }
+
 jq -e '.schema == "sister.infra.workstation.release/2"' \
   "$RELEASE1/manifest.json" >/dev/null
 jq -e '.qualification.build.status == "PASS"' \
@@ -152,6 +175,29 @@ echo "=== install não habilita ==="
 "$CLI" install "$ID1"
 
 [[ "$(basename "$(readlink -f "$SISTER_WORKSTATION_INSTALL_ROOT/current")")" == "$ID1" ]]
+
+UNIT="$SISTER_WORKSTATION_SYSTEMD_ROOT/sister-workstation.service"
+
+[[ -f "$UNIT" ]] || {
+  echo "[FAIL] unit workstation não foi materializada" >&2
+  exit 1
+}
+
+grep -Fxq \
+  'Environment=SISTER_INFRA_RUNTIME_MODE=installed' \
+  "$UNIT" || {
+    echo "[FAIL] unit instalada não declarou runtime installed" >&2
+    exit 1
+  }
+
+grep -Fq \
+  "ExecStart=$SISTER_WORKSTATION_INSTALL_ROOT/current/components/sister-infra/bin/sister-infra up --profile lan" \
+  "$UNIT" || {
+    echo "[FAIL] ExecStart da unit instalada não aponta para current" >&2
+    exit 1
+  }
+
+echo "[PASS] unit instalada deriva da release e declara installed mode"
 
 echo
 echo "=== release 2 ==="

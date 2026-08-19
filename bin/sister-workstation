@@ -644,25 +644,45 @@ PY_MANIFEST_OPS001C
 render_unit() {
   ensure_dirs
 
-  cat > "$UNIT_FILE" <<EOF
-[Unit]
-Description=SisTer Workstation Ecosystem
-Documentation=file://${CURRENT_LINK}/manifest.json
-After=network-online.target
-Wants=network-online.target
+  # SISTER-INFRA-OPS001E-SYSTEMD-SINGLE-SOURCE
+  #
+  # A unit instalada deriva exclusivamente do template pertencente à
+  # release selecionada. O control plane não mantém uma segunda
+  # representação do contrato systemd.
+  local template
+  template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-EnvironmentFile=-${RUNTIME_ENV}
-ExecStart=${CURRENT_LINK}/components/sister-infra/bin/sister-infra up --profile lan
-ExecStop=${CURRENT_LINK}/components/sister-infra/bin/sister-infra down --profile lan
-TimeoutStartSec=1200
-TimeoutStopSec=180
+  [[ -f "$template" ]] || \
+    die "template systemd ausente na release current: $template"
 
-[Install]
-WantedBy=default.target
-EOF
+  python3 - "$template" "$UNIT_FILE" "$HOME_DIR" <<'PY_RENDER_UNIT'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+home = sys.argv[3]
+
+text = source.read_text()
+
+required = "Environment=SISTER_INFRA_RUNTIME_MODE=installed"
+
+if required not in text:
+    raise SystemExit(
+        f"template workstation sem contrato installed obrigatório: {source}"
+    )
+
+# O template usa %h para representar HOME.
+# A unit materializada usa caminhos absolutos para facilitar auditoria.
+text = text.replace("%h", home)
+
+target.write_text(text)
+PY_RENDER_UNIT
+
+  grep -Fxq \
+    'Environment=SISTER_INFRA_RUNTIME_MODE=installed' \
+    "$UNIT_FILE" || \
+    die "unit renderizada perdeu SISTER_INFRA_RUNTIME_MODE=installed"
 
   chmod 644 "$UNIT_FILE"
 }
