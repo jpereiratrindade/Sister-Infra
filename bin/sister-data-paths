@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+usage() {
+    cat <<'EOF'
+Uso:
+  sister-data-paths show --class development
+  sister-data-paths show --class candidate --candidate-id <id>
+  sister-data-paths show --class operational
+
+Opções:
+  --root <path>          sobrescreve SISTER_DATA_ROOT
+  --class <class>        development | candidate | operational
+  --candidate-id <id>    obrigatório para candidate
+  -h, --help             mostra esta ajuda
+EOF
+}
+
+fail() {
+    printf '[FAIL] %s\n' "$*" >&2
+    exit 2
+}
+
+COMMAND="${1:-}"
+
+case "$COMMAND" in
+    show)
+        shift
+        ;;
+    -h|--help|"")
+        usage
+        exit 0
+        ;;
+    *)
+        fail "comando desconhecido: $COMMAND"
+        ;;
+esac
+
+DATA_ROOT="${SISTER_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/sister-data}"
+DEPLOYMENT_CLASS=""
+CANDIDATE_ID=""
+
+while (($# > 0)); do
+    case "$1" in
+        --root)
+            (($# >= 2)) || fail "--root requer argumento"
+            DATA_ROOT="$2"
+            shift 2
+            ;;
+        --class)
+            (($# >= 2)) || fail "--class requer argumento"
+            DEPLOYMENT_CLASS="$2"
+            shift 2
+            ;;
+        --candidate-id)
+            (($# >= 2)) || fail "--candidate-id requer argumento"
+            CANDIDATE_ID="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "argumento desconhecido: $1"
+            ;;
+    esac
+done
+
+[[ -n "$DEPLOYMENT_CLASS" ]] || fail "--class é obrigatório"
+
+case "$DATA_ROOT" in
+    /*) ;;
+    *) fail "SISTER_DATA_ROOT precisa ser caminho absoluto" ;;
+esac
+
+case "$DEPLOYMENT_CLASS" in
+    development)
+        [[ -z "$CANDIDATE_ID" ]] || \
+            fail "--candidate-id não se aplica a development"
+        ENV_ROOT="${DATA_ROOT}/development"
+        ;;
+    candidate)
+        [[ -n "$CANDIDATE_ID" ]] || \
+            fail "--candidate-id é obrigatório para candidate"
+
+        case "$CANDIDATE_ID" in
+            *[!A-Za-z0-9._-]*|"."|"..")
+                fail "candidate-id inválido"
+                ;;
+        esac
+
+        ENV_ROOT="${DATA_ROOT}/candidate/${CANDIDATE_ID}"
+        ;;
+    operational)
+        [[ -z "$CANDIDATE_ID" ]] || \
+            fail "--candidate-id não se aplica a operational"
+        ENV_ROOT="${DATA_ROOT}/operational"
+        ;;
+    *)
+        fail "deployment class inválida: $DEPLOYMENT_CLASS"
+        ;;
+esac
+
+cat <<EOF
+deployment_class=${DEPLOYMENT_CLASS}
+data_root=${DATA_ROOT}
+environment_root=${ENV_ROOT}
+sister_db_data_dir=${ENV_ROOT}/sister/postgres
+sister_backup_dir=${ENV_ROOT}/sister/backups
+nexo_db_data_dir=${ENV_ROOT}/nexo/postgres
+nexo_backup_dir=${ENV_ROOT}/nexo/backups
+EOF
