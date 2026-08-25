@@ -34,12 +34,14 @@ frontend ecosystem_https
     acl host_sister hdr(host),lower -i __SISTER_HOST__ __SISTER_HOST__:__LISTEN_PORT__
     acl host_nexo   hdr(host),lower -i __NEXO_HOST__ __NEXO_HOST__:__LISTEN_PORT__
     acl host_praxis hdr(host),lower -i __PRAXIS_HOST__ __PRAXIS_HOST__:__LISTEN_PORT__
+    acl host_urt    hdr(host),lower -i __URT_HOST__ __URT_HOST__:__LISTEN_PORT__
 
     # Host desconhecido falha fechado.
-    http-request deny deny_status 421 unless host_sister or host_nexo or host_praxis
+    http-request deny deny_status 421 unless host_sister or host_nexo or host_praxis or host_urt
 
     use_backend nexo_backend if host_nexo
     use_backend praxis_backend if host_praxis
+    use_backend urt_backend if host_urt
     use_backend sister_backend if host_sister
 
 backend sister_backend
@@ -56,3 +58,8 @@ backend praxis_backend
     option httpchk GET __PRAXIS_HEALTH_PATH__
     http-check expect status 200
     server praxis __PRAXIS_ADDRESS__:__PRAXIS_PORT__ check inter 2s fall 3 rise 2
+
+backend urt_backend
+    option httpchk GET __URT_HEALTH_PATH__
+    http-check expect status 200
+    server urt __URT_ADDRESS__:__URT_PORT__ check inter 2s fall 3 rise 2
