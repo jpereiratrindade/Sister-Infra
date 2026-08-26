@@ -548,6 +548,17 @@ runtime_preflight() {
   require_command jq
   require_command openssl
 
+  if [[ -z "${SISTER_RESOLVED_DEPLOYMENT_FILE:-}" || ! -f "$SISTER_RESOLVED_DEPLOYMENT_FILE" ]]; then
+    local current_link="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME/.local/share/sister}/current"
+    if [[ -L "$current_link" ]]; then
+      local current_path
+      current_path="$(readlink -f "$current_link")/evidence/deployment/resolved.json"
+      if [[ -f "$current_path" ]]; then
+        export SISTER_RESOLVED_DEPLOYMENT_FILE="$current_path"
+      fi
+    fi
+  fi
+
   local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
   [[ -n "$resolved" && -f "$resolved" ]] || \
     die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
