@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import jsonschema
+    from referencing import Registry, Resource
+except ImportError as exc:  # pragma: no cover - environment failure
+    raise SystemExit(
+        "[FAIL] sister-component requer os módulos Python jsonschema e referencing"
+    ) from exc
+
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+DESCRIPTOR_RELATIVE_PATH = Path(".sister/component.json")
+
+
+class ComponentError(RuntimeError):
+    pass
+
+
+def parse_contract_identifier(value: str, expected_name: str) -> str:
+    prefix = f"{expected_name}/"
+    if not value.startswith(prefix):
+        raise ComponentError(
+            f"contrato não suportado: esperado {expected_name}/<versão>, recebido {value!r}"
+        )
+
+    version = value[len(prefix):]
+    if not version or "/" in version:
+        raise ComponentError(f"versão contratual inválida em {value!r}")
+
+    return version
+
+
+def component_root_from_argument(value: str) -> Path:
+    path = Path(value).expanduser()
+
+    if path.name == "component.json" and path.parent.name == ".sister":
+        root = path.parent.parent
+    else:
+        root = path
+
+    root = root.resolve()
+    descriptor = root / DESCRIPTOR_RELATIVE_PATH
+
+    if not root.is_dir():
+        raise ComponentError(f"raiz de componente inexistente: {root}")
+    if not descriptor.is_file():
+        raise ComponentError(f"descritor ausente: {descriptor}")
+
+    return root
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ComponentError(f"não foi possível ler {label}: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ComponentError(
+            f"JSON inválido em {label}: {path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(value, dict):
+        raise ComponentError(f"{label} deve ser um objeto JSON: {path}")
+
+    return value
+
+
+def contract_root(explicit: str | None) -> Path:
+    candidates: list[Path] = []
+
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    elif os.environ.get("SISTER_CONTRACT_ROOT"):
+        candidates.append(Path(os.environ["SISTER_CONTRACT_ROOT"]).expanduser())
+    else:
+        # Convenção local/release: sister-infra e SisTer são irmãos.
+        candidates.append(INFRA_ROOT.parent / "SisTer" / "contracts")
+
+    root = candidates[0].resolve()
+    if not root.is_dir():
+        raise ComponentError(
+            "raiz dos contratos SisTer não localizada; use --contracts-root "
+            "ou SISTER_CONTRACT_ROOT: " + str(root)
+        )
+
+    return root
+
+
+def component_schema_path(contracts: Path, descriptor: dict[str, Any]) -> Path:
+    component_contract = descriptor.get("schema")
+    if not isinstance(component_contract, str):
+        raise ComponentError("descritor não declara schema como string")
+
+    component_version = parse_contract_identifier(
+        component_contract,
+        "sister.component",
+    )
+
+    return contracts / "component" / component_version / "component.schema.json"
+
+
+def runtime_schema_path(
+    contracts: Path,
+    descriptor: dict[str, Any],
+) -> Path | None:
+    runtime = descriptor.get("runtime")
+    if runtime is None:
+        return None
+    if not isinstance(runtime, dict):
+        raise ComponentError("runtime deve ser um objeto JSON")
+
+    runtime_contract = runtime.get("schema")
+    if not isinstance(runtime_contract, str):
+        raise ComponentError("runtime não declara schema como string")
+
+    runtime_version = parse_contract_identifier(
+        runtime_contract,
+        "sister.runtime",
+    )
+
+    return contracts / "runtime" / runtime_version / "runtime.schema.json"
+
+
+def validate_descriptor(
+    root: Path,
+    contracts: Path,
+) -> dict[str, Any]:
+    descriptor_path = root / DESCRIPTOR_RELATIVE_PATH
+    descriptor = load_json(descriptor_path, "descritor de componente")
+    component_path = component_schema_path(contracts, descriptor)
+    runtime_path = runtime_schema_path(contracts, descriptor)
+
+    component_schema = load_json(component_path, "schema de componente")
+    schemas = [component_schema]
+
+    if runtime_path is not None:
+        schemas.append(load_json(runtime_path, "schema de runtime"))
+
+    try:
+        for schema in schemas:
+            jsonschema.Draft202012Validator.check_schema(schema)
+
+        registry = Registry().with_resources(
+            (
+                schema["$id"],
+                Resource.from_contents(schema),
+            )
+            for schema in schemas
+        )
+
+        validator = jsonschema.Draft202012Validator(
+            component_schema,
+            registry=registry,
+        )
+
+        errors = sorted(
+            validator.iter_errors(descriptor),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+    except (KeyError, jsonschema.SchemaError) as exc:
+        raise ComponentError(f"contrato SisTer inválido: {exc}") from exc
+
+    if errors:
+        lines = []
+        for error in errors:
+            location = ".".join(str(part) for part in error.absolute_path) or "<root>"
+            lines.append(f"{location}: {error.message}")
+        raise ComponentError("descritor rejeitado:\n  - " + "\n  - ".join(lines))
+
+    return descriptor
+
+
+def print_description(root: Path, descriptor: dict[str, Any]) -> None:
+    build = descriptor["build"]
+    runtime = descriptor.get("runtime")
+
+    print(f"root             {root}")
+    print(f"component_id     {descriptor['component_id']}")
+    print(f"system_id        {descriptor['system_id']}")
+    print(f"role             {descriptor['deployment_role']}")
+    print(f"semantic         {descriptor.get('semantic_contract', '-')}")
+    print()
+    print("build")
+    print(f"  driver         {build['driver']}")
+    print(f"  source         {build['source']}")
+    print(f"  build_dir      {build.get('build_dir', '-')}")
+    print(f"  configuration  {build.get('configuration', '-')}")
+    print(f"  tests          {build['tests']['driver']}")
+    print("  artifacts")
+
+    for artifact in build["artifacts"]:
+        executable = " executable" if artifact["executable"] else ""
+        print(f"    {artifact['id']:<14} {artifact['path']}{executable}")
+
+    if runtime is not None:
+        print()
+        print("runtime")
+        print(f"  schema         {runtime['schema']}")
+        print(f"  entrypoint     {runtime['entrypoint']}")
+        print(f"  state          {runtime['state_policy']}")
+        print(f"  actions        {' '.join(runtime['actions'])}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-component",
+        description="Inspeciona componentes autodescritos sem decidir composição ou binding.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("inspect", "validate"):
+        command = subparsers.add_parser(name)
+        command.add_argument("component_root")
+        command.add_argument(
+            "--contracts-root",
+            help="diretório contracts/ da fonte normativa SisTer",
+        )
+        if name == "inspect":
+            command.add_argument(
+                "--json",
+                action="store_true",
+                dest="as_json",
+                help="emite o descritor validado como JSON",
+            )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        root = component_root_from_argument(args.component_root)
+        contracts = contract_root(args.contracts_root)
+        descriptor = validate_descriptor(root, contracts)
+    except ComponentError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
+
+    if args.command == "validate":
+        print(
+            "[PASS] "
+            f"{descriptor['component_id']} atende {descriptor['schema']}"
+        )
+        return 0
+
+    if args.as_json:
+        print(json.dumps(descriptor, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print_description(root, descriptor)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
