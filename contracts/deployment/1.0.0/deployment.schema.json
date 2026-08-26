@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sister.local/contracts/infra/deployment/1.0.0/deployment.schema.json",
+  "title": "SisTer Infra Deployment 1.0.0",
+  "description": "Liga os system_id de uma composição qualificada a bindings físicos, probes e publicação no gateway.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "deployment_id",
+    "composition_id",
+    "bindings"
+  ],
+  "properties": {
+    "schema": {
+      "const": "sister.infra.deployment/1.0.0"
+    },
+    "deployment_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "composition_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "bindings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "system_id",
+          "runtime"
+        ],
+        "properties": {
+          "system_id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "runtime": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/tcpRuntime"
+              },
+              {
+                "$ref": "#/$defs/unixRuntime"
+              }
+            ]
+          },
+          "probe": {
+            "$ref": "#/$defs/probe"
+          },
+          "gateway": {
+            "$ref": "#/$defs/gateway"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "tcpRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "listen",
+        "port"
+      ],
+      "properties": {
+        "transport": {
+          "const": "tcp"
+        },
+        "listen": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "unixRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "socket"
+      ],
+      "properties": {
+        "transport": {
+          "const": "unix"
+        },
+        "socket": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/"
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "health_path"
+      ],
+      "properties": {
+        "health_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/"
+        }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+        }
+      }
+    }
+  }
+}
