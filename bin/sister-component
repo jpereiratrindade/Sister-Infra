@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -273,10 +274,50 @@ def verify_artifacts(root: Path, descriptor: dict[str, Any]) -> list[dict[str, A
     return verified
 
 
+
+
+def export_verified_artifacts(
+    source: Path,
+    artifacts: list[dict[str, Any]],
+    artifacts_out: Path,
+) -> None:
+    artifacts_out.mkdir(parents=True, exist_ok=True)
+
+    for artifact in artifacts:
+        rel = Path(artifact["path"])
+
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ComponentError(
+                f"path de artefato inseguro para exportação: {artifact['path']}"
+            )
+
+        source_path = source / rel
+        target_path = artifacts_out / rel
+
+        if not source_path.is_file():
+            raise ComponentError(
+                "artefato verificado desapareceu antes da exportação: "
+                f"{artifact['id']} -> {artifact['path']}"
+            )
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+
+        if sha256_file(target_path) != artifact["sha256"]:
+            raise ComponentError(
+                f"hash divergiu durante exportação: {artifact['id']}"
+            )
+
+        if artifact["executable"] and not os.access(target_path, os.X_OK):
+            raise ComponentError(
+                f"exportação perdeu bit executável: {artifact['id']}"
+            )
+
 def qualify_component(
     root: Path,
     contracts: Path,
     descriptor: dict[str, Any],
+    artifacts_out: Path | None = None,
 ) -> dict[str, Any]:
     commit = git_commit_for_clean_root(root)
     build = descriptor["build"]
@@ -351,6 +392,13 @@ def qualify_component(
             raise ComponentError(f"driver de build não suportado: {build_driver}")
 
         artifacts = verify_artifacts(source, qualified_descriptor)
+
+        if artifacts_out is not None:
+            export_verified_artifacts(
+                source,
+                artifacts,
+                artifacts_out,
+            )
 
     return {
         "schema": "sister.infra.component.qualification/1",
@@ -447,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             )
 
+        if name == "qualify":
+            command.add_argument(
+                "--artifacts-out",
+                help=(
+                    "exporta cópias dos artefatos verificados, "
+                    "preservando seus paths relativos"
+                ),
+            )
+
     return parser
 
 
@@ -469,8 +526,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "qualify":
+        artifacts_out = (
+            Path(args.artifacts_out).expanduser().resolve()
+            if args.artifacts_out
+            else None
+        )
+
         try:
-            report = qualify_component(root, contracts, descriptor)
+            report = qualify_component(
+                root,
+                contracts,
+                descriptor,
+                artifacts_out,
+            )
         except ComponentError as exc:
             print(f"[FAIL] {exc}", file=sys.stderr)
             return 2

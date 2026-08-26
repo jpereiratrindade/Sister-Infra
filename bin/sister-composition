@@ -191,6 +191,7 @@ def resolved_component(
 def qualify_component(
     component: dict[str, Any],
     component_contracts_root: str | None,
+    artifacts_root: Path | None = None,
 ) -> dict[str, Any]:
     command = [
         str(COMPONENT_CLI),
@@ -201,6 +202,14 @@ def qualify_component(
     if component_contracts_root:
         command.extend(
             ["--contracts-root", component_contracts_root]
+        )
+
+    if artifacts_root is not None:
+        command.extend(
+            [
+                "--artifacts-out",
+                str(artifacts_root / component["component_id"]),
+            ]
         )
 
     command.append("--json")
@@ -267,6 +276,7 @@ def qualify_component(
 def qualify(
     composition_path: Path,
     component_contracts_root: str | None,
+    artifacts_root: Path | None = None,
 ) -> dict[str, Any]:
     resolved = resolve(
         composition_path,
@@ -278,6 +288,7 @@ def qualify(
         report = qualify_component(
             component,
             component_contracts_root,
+            artifacts_root,
         )
         components.append(
             {
@@ -421,6 +432,15 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+        if name == "qualify":
+            command.add_argument(
+                "--artifacts-root",
+                help=(
+                    "exporta bundles de artefatos verificados "
+                    "sob <root>/<component_id>/"
+                ),
+            )
+
     return parser
 
 
@@ -430,7 +450,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = composition_path_from_argument(args.composition)
         if args.command == "qualify":
-            document = qualify(path, args.contracts_root)
+            artifacts_root = (
+                Path(args.artifacts_root).expanduser().resolve()
+                if args.artifacts_root
+                else None
+            )
+            document = qualify(
+                path,
+                args.contracts_root,
+                artifacts_root,
+            )
         else:
             document = resolve(path, args.contracts_root)
     except CompositionError as exc:

@@ -8,6 +8,7 @@ INFRA_ROOT="$(cd "$SELF_DIR/.." && pwd -P)"
 HOME_DIR="${HOME:?HOME não definido}"
 INSTALL_ROOT="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME_DIR/.local/share/sister}"
 RELEASES_ROOT="$INSTALL_ROOT/releases"
+CANDIDATES_ROOT="$INSTALL_ROOT/candidates"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
 
@@ -24,6 +25,9 @@ RUNTIME_ENV="$CONFIG_ROOT/runtime.env"
 TLS_CONFIG="$CONFIG_ROOT/tls"
 NEXO_ENV="$CONFIG_ROOT/nexo.env"
 SISTER_ENV="$CONFIG_ROOT/sister.env"
+
+COMPOSITION_FILE="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONFIG_ROOT/composition.json}"
+COMPOSITION_CONTRACTS_ROOT="${SISTER_WORKSTATION_CONTRACTS_ROOT:-}"
 
 TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
 
@@ -43,6 +47,8 @@ Comandos:
   doctor          valida host, fontes, Git, systemd e layout
   plan            mostra diferença entre release atual e fontes, sem mutar
   release-create  cria release local independente dos repositórios de dev
+  release-create-composition [arquivo]  materializa candidata declarativa
+  candidate-verify <id>  verifica candidata declarativa materializada
   release-list    lista releases instaladas
   install [id]    seleciona release e instala unidade systemd (não inicia)
   activate        migra o runtime atual para o serviço workstation
@@ -62,6 +68,7 @@ EOF
 ensure_dirs() {
   mkdir -p \
     "$RELEASES_ROOT" \
+    "$CANDIDATES_ROOT" \
     "$CONFIG_ROOT" \
     "$STATE_ROOT" \
     "$SYSTEMD_USER_ROOT" \
@@ -365,6 +372,412 @@ clone_component() {
   [[ "$(git -C "$dest" rev-parse HEAD)" == "$commit" ]] || \
     die "clone não materializou commit esperado em $dest"
 }
+
+# SISTER-INFRA-CR05-COMPOSITION-BEGIN
+composition_path() {
+  local requested="${1:-$COMPOSITION_FILE}"
+
+  [[ -n "$requested" ]] || die "arquivo de composição não informado"
+  [[ -f "$requested" ]] || die "composição ausente: $requested"
+
+  (
+    cd "$(dirname "$requested")"
+    printf '%s/%s\n' "$PWD" "$(basename "$requested")"
+  )
+}
+
+safe_component_id() {
+  local component_id="$1"
+
+  [[ "$component_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+    die "component_id inseguro para materialização: $component_id"
+}
+
+safe_relative_artifact_path() {
+  local relpath="$1"
+
+  [[ -n "$relpath" ]] || die "artefato sem path"
+
+  case "$relpath" in
+    /*|..|../*|*/../*|*/..)
+      die "path de artefato inseguro: $relpath"
+      ;;
+  esac
+}
+
+materialize_qualified_artifact() {
+  local artifact_root="$1"
+  local release_root="$2"
+  local relpath="$3"
+  local expected_hash="$4"
+  local executable="$5"
+
+  safe_relative_artifact_path "$relpath"
+
+  local source_artifact="$artifact_root/$relpath"
+  local target_artifact="$release_root/$relpath"
+
+  [[ -f "$source_artifact" ]] || \
+    die "artefato qualificado ausente na fonte: $source_artifact"
+
+  mkdir -p "$(dirname "$target_artifact")"
+
+  if git -C "$release_root" \
+      ls-files --error-unmatch "$relpath" >/dev/null 2>&1; then
+    :
+  else
+    cp -p "$source_artifact" "$target_artifact"
+  fi
+
+  [[ -f "$target_artifact" ]] || \
+    die "artefato não materializado: $target_artifact"
+
+  if [[ "$executable" == "true" ]]; then
+    [[ -x "$target_artifact" ]] || \
+      die "artefato deveria ser executável: $target_artifact"
+  fi
+
+  local actual_hash
+  actual_hash="$(sha256sum "$target_artifact" | awk '{print $1}')"
+
+  [[ "$actual_hash" == "$expected_hash" ]] || \
+    die "hash divergente ao materializar artefato: $relpath"
+}
+
+composition_candidate_integrity() {
+  local candidate="$1"
+  local manifest="$candidate/manifest.json"
+
+  [[ -d "$candidate" ]] || die "candidata ausente: $candidate"
+  [[ -f "$manifest" ]] || die "manifest ausente em $candidate"
+
+  jq -e \
+    '.schema == "sister.infra.workstation.candidate/1"' \
+    "$manifest" >/dev/null || \
+    die "schema de candidata não suportado"
+
+  jq -e \
+    '.qualification.status == "PASS"' \
+    "$manifest" >/dev/null || \
+    die "candidata sem qualificação PASS"
+
+  jq -e \
+    '.deployment.status == "PENDING_BINDINGS"' \
+    "$manifest" >/dev/null || \
+    die "candidata CR-05 deve permanecer PENDING_BINDINGS"
+
+  local evidence_rel evidence expected_evidence_hash actual_evidence_hash
+  evidence_rel="$(jq -r '.qualification.evidence' "$manifest")"
+  expected_evidence_hash="$(jq -r '.qualification.sha256' "$manifest")"
+  evidence="$candidate/$evidence_rel"
+
+  [[ -f "$evidence" ]] || \
+    die "evidência de composição ausente: $evidence_rel"
+
+  actual_evidence_hash="$(sha256sum "$evidence" | awk '{print $1}')"
+  [[ "$actual_evidence_hash" == "$expected_evidence_hash" ]] || \
+    die "hash divergente da evidência de composição"
+
+  local infra_commit infra_repo actual_commit tracked
+  infra_commit="$(jq -r '.control_plane.commit' "$manifest")"
+  infra_repo="$candidate/$(jq -r '.control_plane.path' "$manifest")"
+
+  [[ -d "$infra_repo/.git" ]] || \
+    die "candidata corrompida: control plane sem .git"
+
+  actual_commit="$(git -C "$infra_repo" rev-parse HEAD)"
+  [[ "$actual_commit" == "$infra_commit" ]] || \
+    die "candidata corrompida: control plane divergiu do manifesto"
+
+  tracked="$(git -C "$infra_repo" status --porcelain --untracked-files=no)"
+  [[ -z "$tracked" ]] || \
+    die "candidata corrompida: control plane possui alterações rastreadas"
+
+  local component_id component_path component_repo expected_commit
+  local artifact_id relpath expected_hash executable absolute actual_hash
+
+  while IFS=$'\t' read -r \
+      component_id component_path expected_commit; do
+    [[ -n "$component_id" ]] || continue
+
+    safe_component_id "$component_id"
+    component_repo="$candidate/$component_path"
+
+    [[ -d "$component_repo/.git" ]] || \
+      die "candidata corrompida: $component_id sem .git"
+
+    actual_commit="$(git -C "$component_repo" rev-parse HEAD)"
+    [[ "$actual_commit" == "$expected_commit" ]] || \
+      die "candidata corrompida: $component_id HEAD divergiu"
+
+    tracked="$(
+      git -C "$component_repo" status --porcelain --untracked-files=no
+    )"
+    [[ -z "$tracked" ]] || \
+      die "candidata corrompida: $component_id possui alterações rastreadas"
+
+    while IFS=$'\t' read -r \
+        artifact_id relpath expected_hash executable; do
+      [[ -n "$artifact_id" ]] || continue
+
+      safe_relative_artifact_path "$relpath"
+      absolute="$component_repo/$relpath"
+
+      [[ -f "$absolute" ]] || \
+        die "candidata corrompida: artefato ausente: $artifact_id"
+
+      if [[ "$executable" == "true" ]]; then
+        [[ -x "$absolute" ]] || \
+          die "candidata corrompida: artefato não executável: $artifact_id"
+      fi
+
+      actual_hash="$(sha256sum "$absolute" | awk '{print $1}')"
+      [[ "$actual_hash" == "$expected_hash" ]] || \
+        die "candidata corrompida: hash divergente: $artifact_id"
+    done < <(
+      jq -r \
+        --arg component_id "$component_id" '
+          .components[]
+          | select(.component_id == $component_id)
+          | .artifacts[]
+          | [.id, .path, .sha256, (.executable | tostring)]
+          | @tsv
+        ' "$manifest"
+    )
+  done < <(
+    jq -r '
+      .components[]
+      | [.component_id, .path, .commit]
+      | @tsv
+    ' "$manifest"
+  )
+
+  pass "integridade da candidata $(basename "$candidate")"
+}
+
+release_create_composition() {
+  ensure_dirs
+
+  local composition
+  composition="$(composition_path "${1:-}")"
+
+  local workspace
+  workspace="$(source_workspace_guess)" || \
+    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
+  workspace="$(cd "$workspace" && pwd -P)"
+
+  local infra
+  infra="$(repo_path "$workspace" infra)"
+  require_repo_clean "$infra" "sister-infra"
+
+  local artifact_bundle
+  artifact_bundle="$CANDIDATES_ROOT/.qualified-artifacts-$$"
+  rm -rf "$artifact_bundle"
+  mkdir -p "$artifact_bundle"
+
+  local qualify_cmd=(
+    "$INFRA_ROOT/bin/sister-composition"
+    qualify
+    "$composition"
+    --artifacts-root
+    "$artifact_bundle"
+    --json
+  )
+
+  if [[ -n "$COMPOSITION_CONTRACTS_ROOT" ]]; then
+    qualify_cmd+=(
+      --contracts-root
+      "$COMPOSITION_CONTRACTS_ROOT"
+    )
+  fi
+
+  info "qualificando composição declarativa"
+
+  local qualification_json
+  if ! qualification_json="$("${qualify_cmd[@]}")"; then
+    rm -rf "$artifact_bundle"
+    die "qualificação da composição falhou"
+  fi
+
+  jq -e \
+    '.schema == "sister.infra.composition.qualification/1"
+     and .status == "PASS"' \
+    <<<"$qualification_json" >/dev/null || \
+    die "sister-composition não produziu qualificação PASS"
+
+  local infra_commit infra_short qualification_hash qualification_short
+  infra_commit="$(repo_head "$infra")"
+  infra_short="$(repo_short "$infra")"
+  qualification_hash="$(
+    printf '%s\n' "$qualification_json" |
+      sha256sum |
+      awk '{print $1}'
+  )"
+  qualification_short="${qualification_hash:0:12}"
+
+  local timestamp id candidate tmp
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  id="wc-${timestamp}-${infra_short}-${qualification_short}"
+  candidate="$CANDIDATES_ROOT/$id"
+  tmp="$CANDIDATES_ROOT/.creating-$id-$$"
+
+  [[ ! -e "$candidate" ]] || die "candidata já existe: $id"
+
+  rm -rf "$tmp"
+  mkdir -p \
+    "$tmp/components" \
+    "$tmp/evidence/composition"
+
+  printf '%s\n' "$qualification_json" \
+    > "$tmp/evidence/composition/qualification.json"
+
+  info "materializando control plane"
+  clone_component \
+    "$infra" \
+    "$tmp/components/sister-infra" \
+    "$infra_commit"
+
+  local component_id system_id role source_root commit destination
+  local artifact_id relpath expected_hash executable
+
+  while IFS=$'\t' read -r \
+      component_id system_id role source_root commit; do
+    [[ -n "$component_id" ]] || continue
+    safe_component_id "$component_id"
+
+    destination="$tmp/components/$component_id"
+
+    info "materializando componente $component_id"
+    clone_component "$source_root" "$destination" "$commit"
+
+    while IFS=$'\t' read -r \
+        artifact_id relpath expected_hash executable; do
+      [[ -n "$artifact_id" ]] || continue
+
+      materialize_qualified_artifact \
+        "$artifact_bundle/$component_id" \
+        "$destination" \
+        "$relpath" \
+        "$expected_hash" \
+        "$executable"
+    done < <(
+      jq -r \
+        --arg component_id "$component_id" '
+          .components[]
+          | select(.component_id == $component_id)
+          | .qualification.artifacts[]
+          | [.id, .path, .sha256, (.executable | tostring)]
+          | @tsv
+        ' "$tmp/evidence/composition/qualification.json"
+    )
+  done < <(
+    jq -r '
+      .components[]
+      | [
+          .component_id,
+          .system_id,
+          .role,
+          .root,
+          .qualification.source.commit
+        ]
+      | @tsv
+    ' "$tmp/evidence/composition/qualification.json"
+  )
+
+  python3 - \
+    "$tmp/manifest.json" \
+    "$tmp/evidence/composition/qualification.json" \
+    "$id" \
+    "$timestamp" \
+    "$infra_commit" \
+    "$qualification_hash" <<'PY_CR05_MANIFEST'
+import json
+import sys
+from pathlib import Path
+
+(
+    out,
+    qualification_path,
+    candidate_id,
+    created,
+    infra_commit,
+    qualification_hash,
+) = sys.argv[1:]
+
+qualification = json.loads(
+    Path(qualification_path).read_text(encoding="utf-8")
+)
+
+components = []
+for item in qualification["components"]:
+    report = item["qualification"]
+    components.append(
+        {
+            "component_id": item["component_id"],
+            "system_id": item["system_id"],
+            "role": item["role"],
+            "component_contract": item["component_contract"],
+            "path": f"components/{item['component_id']}",
+            "commit": report["source"]["commit"],
+            "artifacts": report["artifacts"],
+        }
+    )
+
+payload = {
+    "schema": "sister.infra.workstation.candidate/1",
+    "candidate_id": candidate_id,
+    "created_at_utc": created,
+    "deployment_class": qualification["deployment_class"],
+    "control_plane": {
+        "component_id": "infra",
+        "path": "components/sister-infra",
+        "commit": infra_commit,
+    },
+    "composition": {
+        "composition_id": qualification["composition_id"],
+        "schema": qualification["schema"],
+    },
+    "components": components,
+    "qualification": {
+        "status": "PASS",
+        "evidence": "evidence/composition/qualification.json",
+        "sha256": qualification_hash,
+    },
+    "deployment": {
+        "status": "PENDING_BINDINGS",
+    },
+}
+
+Path(out).write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY_CR05_MANIFEST
+
+  printf '%s\n' "$id" > "$tmp/CANDIDATE_ID"
+  printf '%s\n' "SISTER-INFRA-CR-05" > "$tmp/QUALIFICATION"
+
+  composition_candidate_integrity "$tmp"
+
+  mv "$tmp" "$candidate"
+  composition_candidate_integrity "$candidate"
+
+  rm -rf "$artifact_bundle"
+
+  pass "candidata declarativa materializada: $id"
+  info "bindings ainda não foram resolvidos; candidata não foi instalada"
+  printf '%s\n' "$id"
+}
+
+candidate_verify() {
+  ensure_dirs
+
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "candidate-verify requer id"
+
+  composition_candidate_integrity "$CANDIDATES_ROOT/$id"
+}
+# SISTER-INFRA-CR05-COMPOSITION-END
 
 release_build_qualification() {
   local workspace="$1"
@@ -1083,6 +1496,8 @@ main() {
   case "$command" in
     doctor) doctor ;;
     plan) plan ;;
+    release-create-composition) release_create_composition "${1:-}" ;;
+    candidate-verify) candidate_verify "${1:-}" ;;
     release-create) release_create ;;
     release-list) release_list ;;
     install) install_release "${1:-}" ;;
