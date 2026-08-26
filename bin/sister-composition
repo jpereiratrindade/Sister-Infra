@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import jsonschema
+except ImportError as exc:  # pragma: no cover - environment failure
+    raise SystemExit(
+        "[FAIL] sister-composition requer o módulo Python jsonschema"
+    ) from exc
+
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+COMPONENT_CLI = INFRA_ROOT / "bin" / "sister-component"
+COMPOSITION_CONTRACT = "sister.infra.composition"
+DEFAULT_VERSION = "1.0.0"
+
+
+class CompositionError(RuntimeError):
+    pass
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CompositionError(
+            f"não foi possível ler {label}: {path}: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise CompositionError(
+            f"JSON inválido em {label}: "
+            f"{path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(value, dict):
+        raise CompositionError(f"{label} deve ser um objeto JSON: {path}")
+
+    return value
+
+
+def composition_path_from_argument(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise CompositionError(f"composição inexistente: {path}")
+    return path
+
+
+def parse_composition_version(document: dict[str, Any]) -> str:
+    value = document.get("schema")
+    prefix = f"{COMPOSITION_CONTRACT}/"
+
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise CompositionError(
+            "contrato de composição não suportado: "
+            f"esperado {COMPOSITION_CONTRACT}/<versão>"
+        )
+
+    version = value[len(prefix):]
+    if not version or "/" in version:
+        raise CompositionError(f"versão de composição inválida: {value!r}")
+
+    return version
+
+
+def schema_path_for(document: dict[str, Any]) -> Path:
+    version = parse_composition_version(document)
+    return (
+        INFRA_ROOT
+        / "contracts"
+        / "composition"
+        / version
+        / "composition.schema.json"
+    )
+
+
+def validate_composition(document: dict[str, Any]) -> None:
+    schema_path = schema_path_for(document)
+    schema = load_json(schema_path, "schema de composição")
+
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+        errors = sorted(
+            validator.iter_errors(document),
+            key=lambda error: tuple(
+                str(part) for part in error.absolute_path
+            ),
+        )
+    except jsonschema.SchemaError as exc:
+        raise CompositionError(
+            f"contrato de composição inválido: {exc}"
+        ) from exc
+
+    if errors:
+        lines = []
+        for error in errors:
+            location = (
+                ".".join(str(part) for part in error.absolute_path)
+                or "<root>"
+            )
+            lines.append(f"{location}: {error.message}")
+        raise CompositionError(
+            "composição rejeitada:\n  - " + "\n  - ".join(lines)
+        )
+
+
+def inspect_component(
+    root: Path,
+    component_contracts_root: str | None,
+) -> dict[str, Any]:
+    command = [
+        str(COMPONENT_CLI),
+        "inspect",
+        str(root),
+    ]
+
+    if component_contracts_root:
+        command.extend(
+            ["--contracts-root", component_contracts_root]
+        )
+
+    command.append("--json")
+
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise CompositionError(
+            f"não foi possível executar sister-component: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        suffix = f"\n{detail}" if detail else ""
+        raise CompositionError(
+            f"componente inválido: {root}{suffix}"
+        )
+
+    try:
+        descriptor = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CompositionError(
+            f"sister-component produziu JSON inválido para {root}: {exc}"
+        ) from exc
+
+    if not isinstance(descriptor, dict):
+        raise CompositionError(
+            f"sister-component não produziu objeto JSON para {root}"
+        )
+
+    return descriptor
+
+
+def resolved_component(
+    source_text: str,
+    composition_dir: Path,
+    component_contracts_root: str | None,
+) -> dict[str, Any]:
+    source = Path(source_text).expanduser()
+    if not source.is_absolute():
+        source = composition_dir / source
+    root = source.resolve()
+
+    descriptor = inspect_component(root, component_contracts_root)
+
+    return {
+        "component_id": descriptor["component_id"],
+        "system_id": descriptor["system_id"],
+        "role": descriptor["deployment_role"],
+        "component_contract": descriptor["schema"],
+        "root": str(root),
+    }
+
+
+def reject_duplicate_identities(
+    components: list[dict[str, Any]],
+) -> None:
+    component_ids: dict[str, str] = {}
+    system_ids: dict[str, str] = {}
+
+    for component in components:
+        component_id = component["component_id"]
+        system_id = component["system_id"]
+        root = component["root"]
+
+        if component_id in component_ids:
+            raise CompositionError(
+                "component_id duplicado: "
+                f"{component_id!r}: "
+                f"{component_ids[component_id]} e {root}"
+            )
+        component_ids[component_id] = root
+
+        if system_id in system_ids:
+            raise CompositionError(
+                "system_id duplicado: "
+                f"{system_id!r}: "
+                f"{system_ids[system_id]} e {root}"
+            )
+        system_ids[system_id] = root
+
+
+def resolve(
+    composition_path: Path,
+    component_contracts_root: str | None,
+) -> dict[str, Any]:
+    document = load_json(composition_path, "composição")
+    validate_composition(document)
+
+    components = [
+        resolved_component(
+            entry["source"],
+            composition_path.parent,
+            component_contracts_root,
+        )
+        for entry in document["components"]
+    ]
+
+    reject_duplicate_identities(components)
+
+    return {
+        "schema": "sister.infra.composition.resolved/1",
+        "composition_id": document["composition_id"],
+        "deployment_class": document["deployment_class"],
+        "components": components,
+    }
+
+
+def print_resolution(document: dict[str, Any]) -> None:
+    print(f"composition_id   {document['composition_id']}")
+    print(f"class            {document['deployment_class']}")
+    print()
+    print("components")
+
+    for component in document["components"]:
+        print(f"  {component['component_id']}")
+        print(f"    system       {component['system_id']}")
+        print(f"    role         {component['role']}")
+        print(f"    contract     {component['component_contract']}")
+        print(f"    source       {component['root']}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-composition",
+        description=(
+            "Resolve genericamente uma composição declarativa "
+            "sem qualificar build ou decidir bindings."
+        ),
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    command = subparsers.add_parser("resolve")
+    command.add_argument("composition")
+    command.add_argument(
+        "--contracts-root",
+        help=(
+            "diretório contracts/ da fonte normativa SisTer, "
+            "repassado a sister-component"
+        ),
+    )
+    command.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emite a composição resolvida como JSON",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        path = composition_path_from_argument(args.composition)
+        document = resolve(path, args.contracts_root)
+    except CompositionError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(
+            json.dumps(
+                document,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        print_resolution(document)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
