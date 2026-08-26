@@ -1,0 +1,63 @@
+{
+  "schema": "sister.infra.deployment/1.0.0",
+  "deployment_id": "workstation-lab",
+  "composition_id": "workstation",
+  "bindings": [
+    {
+      "system_id": "sister",
+      "runtime": {
+        "transport": "tcp",
+        "listen": "127.0.0.1",
+        "port": 8000
+      },
+      "probe": {
+        "health_path": "/api/health"
+      },
+      "gateway": {
+        "host": "sister-gateway.test"
+      }
+    },
+    {
+      "system_id": "sister_nexo",
+      "runtime": {
+        "transport": "tcp",
+        "listen": "127.0.0.1",
+        "port": 8015
+      },
+      "probe": {
+        "health_path": "/api/health"
+      },
+      "gateway": {
+        "host": "nexo-gateway.test"
+      }
+    },
+    {
+      "system_id": "sister_praxis",
+      "runtime": {
+        "transport": "tcp",
+        "listen": "127.0.0.1",
+        "port": 8093
+      },
+      "probe": {
+        "health_path": "/health"
+      },
+      "gateway": {
+        "host": "praxis-gateway.test"
+      }
+    },
+    {
+      "system_id": "sister_urt",
+      "runtime": {
+        "transport": "tcp",
+        "listen": "127.0.0.1",
+        "port": 8094
+      },
+      "probe": {
+        "health_path": "/_sister/health"
+      },
+      "gateway": {
+        "host": "urt-gateway.test"
+      }
+    }
+  ]
+}
