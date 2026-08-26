@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import jsonschema
+except ImportError as exc:  # pragma: no cover - environment failure
+    raise SystemExit(
+        "[FAIL] sister-deployment requer o módulo Python jsonschema"
+    ) from exc
+
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+DEPLOYMENT_CONTRACT = "sister.infra.deployment"
+
+
+class DeploymentError(RuntimeError):
+    pass
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise DeploymentError(
+            f"não foi possível ler {label}: {path}: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise DeploymentError(
+            f"JSON inválido em {label}: "
+            f"{path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(value, dict):
+        raise DeploymentError(f"{label} deve ser um objeto JSON: {path}")
+    return value
+
+
+def existing_file(value: str, label: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise DeploymentError(f"{label} inexistente: {path}")
+    return path
+
+
+def schema_path(document: dict[str, Any]) -> Path:
+    contract = document.get("schema")
+    prefix = f"{DEPLOYMENT_CONTRACT}/"
+    if not isinstance(contract, str) or not contract.startswith(prefix):
+        raise DeploymentError(
+            "contrato de deployment não suportado: "
+            f"esperado {DEPLOYMENT_CONTRACT}/<versão>"
+        )
+    version = contract[len(prefix):]
+    if not version or "/" in version:
+        raise DeploymentError(f"versão de deployment inválida: {contract!r}")
+    return (
+        INFRA_ROOT
+        / "contracts"
+        / "deployment"
+        / version
+        / "deployment.schema.json"
+    )
+
+
+def validate_deployment(document: dict[str, Any]) -> None:
+    schema = load_json(schema_path(document), "schema de deployment")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        errors = sorted(
+            jsonschema.Draft202012Validator(schema).iter_errors(document),
+            key=lambda error: tuple(
+                str(part) for part in error.absolute_path
+            ),
+        )
+    except jsonschema.SchemaError as exc:
+        raise DeploymentError(
+            f"contrato de deployment inválido: {exc}"
+        ) from exc
+
+    if errors:
+        details = []
+        for error in errors:
+            location = (
+                ".".join(str(part) for part in error.absolute_path)
+                or "<root>"
+            )
+            details.append(f"{location}: {error.message}")
+        raise DeploymentError(
+            "deployment rejeitado:\n  - " + "\n  - ".join(details)
+        )
+
+
+def validate_candidate(candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    if candidate.get("schema") != "sister.infra.workstation.candidate/1":
+        raise DeploymentError("schema de candidata não suportado")
+    if candidate.get("qualification", {}).get("status") != "PASS":
+        raise DeploymentError("candidata deve possuir qualification=PASS")
+    if candidate.get("deployment", {}).get("status") != "PENDING_BINDINGS":
+        raise DeploymentError(
+            "candidata deve possuir deployment=PENDING_BINDINGS"
+        )
+
+    components = candidate.get("components")
+    if not isinstance(components, list) or not components:
+        raise DeploymentError("candidata deve possuir participantes")
+
+    component_ids: set[str] = set()
+    system_ids: set[str] = set()
+    for index, component in enumerate(components):
+        if not isinstance(component, dict):
+            raise DeploymentError(
+                f"participante inválido na candidata: components.{index}"
+            )
+        component_id = component.get("component_id")
+        system_id = component.get("system_id")
+        component_path = component.get("path")
+        if not all(
+            isinstance(value, str) and value
+            for value in (component_id, system_id, component_path)
+        ):
+            raise DeploymentError(
+                f"participante incompleto na candidata: components.{index}"
+            )
+        if component_id in component_ids:
+            raise DeploymentError(
+                f"component_id duplicado na candidata: {component_id}"
+            )
+        if system_id in system_ids:
+            raise DeploymentError(
+                f"system_id duplicado na candidata: {system_id}"
+            )
+        component_ids.add(component_id)
+        system_ids.add(system_id)
+    return components
+
+
+def validate_bindings(
+    components: list[dict[str, Any]],
+    deployment: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    expected = {component["system_id"] for component in components}
+    by_system: dict[str, dict[str, Any]] = {}
+    tcp_endpoints: set[tuple[str, int]] = set()
+    gateway_hosts: set[str] = set()
+
+    for binding in deployment["bindings"]:
+        system_id = binding["system_id"]
+        if system_id in by_system:
+            raise DeploymentError(
+                f"system_id duplicado nos bindings: {system_id}"
+            )
+        if system_id not in expected:
+            raise DeploymentError(f"binding desconhecido: {system_id}")
+        by_system[system_id] = binding
+
+        runtime = binding["runtime"]
+        if runtime["transport"] == "tcp":
+            endpoint = (runtime["listen"], runtime["port"])
+            if endpoint in tcp_endpoints:
+                raise DeploymentError(
+                    "conflito de endpoint TCP: "
+                    f"{runtime['listen']}:{runtime['port']}"
+                )
+            tcp_endpoints.add(endpoint)
+
+        gateway = binding.get("gateway")
+        if gateway is not None:
+            normalized_host = gateway["host"].lower()
+            if normalized_host in gateway_hosts:
+                raise DeploymentError(
+                    f"gateway host duplicado: {gateway['host']}"
+                )
+            gateway_hosts.add(normalized_host)
+
+    missing = sorted(expected - by_system.keys())
+    if missing:
+        raise DeploymentError(
+            "binding faltante para: " + ", ".join(missing)
+        )
+    return by_system
+
+
+def resolve(
+    candidate: dict[str, Any],
+    deployment: dict[str, Any],
+) -> dict[str, Any]:
+    validate_deployment(deployment)
+    components = validate_candidate(candidate)
+
+    composition = candidate.get("composition")
+    composition_id = (
+        composition.get("composition_id")
+        if isinstance(composition, dict)
+        else None
+    )
+    if composition_id != deployment["composition_id"]:
+        raise DeploymentError(
+            "composição incompatível: "
+            f"candidata={composition_id!r} "
+            f"deployment={deployment['composition_id']!r}"
+        )
+
+    bindings = validate_bindings(components, deployment)
+    resolved_components = []
+    for component in components:
+        binding = bindings[component["system_id"]]
+        resolved = {
+            "component_id": component["component_id"],
+            "system_id": component["system_id"],
+            "component_path": component["path"],
+            "runtime": binding["runtime"],
+        }
+        if "probe" in binding:
+            resolved["probe"] = binding["probe"]
+        if "gateway" in binding:
+            resolved["gateway"] = binding["gateway"]
+        resolved_components.append(resolved)
+
+    return {
+        "schema": "sister.infra.deployment.resolved/1",
+        "status": "READY",
+        "deployment_id": deployment["deployment_id"],
+        "candidate_id": candidate.get("candidate_id"),
+        "composition_id": deployment["composition_id"],
+        "components": resolved_components,
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Resolve bindings de deployment para uma candidata"
+    )
+    subcommands = result.add_subparsers(dest="command", required=True)
+    resolve_parser = subcommands.add_parser("resolve")
+    resolve_parser.add_argument("candidate_manifest")
+    resolve_parser.add_argument("deployment")
+    resolve_parser.add_argument("--json", action="store_true")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        candidate_path = existing_file(
+            args.candidate_manifest, "manifesto de candidata"
+        )
+        deployment_path = existing_file(args.deployment, "deployment")
+        result = resolve(
+            load_json(candidate_path, "manifesto de candidata"),
+            load_json(deployment_path, "deployment"),
+        )
+    except DeploymentError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            "[PASS] deployment resolvido: "
+            f"{result['deployment_id']} -> {result['candidate_id']}"
+        )
+        print(f"status={result['status']}")
+        for component in result["components"]:
+            print(
+                f"{component['system_id']} -> "
+                f"{component['runtime']['transport']}"
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
