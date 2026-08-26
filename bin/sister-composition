@@ -183,6 +183,7 @@ def resolved_component(
         "system_id": descriptor["system_id"],
         "role": descriptor["deployment_role"],
         "component_contract": descriptor["schema"],
+        "runtime": descriptor.get("runtime"),
         "root": str(root),
     }
 

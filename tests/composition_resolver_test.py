@@ -358,6 +358,10 @@ def main() -> None:
             for item in document["components"]
         ] == ["sister_alpha", "sister_beta"]
         assert [
+            item["runtime"]["entrypoint"]
+            for item in document["components"]
+        ] == ["scripts/runtime.sh", "scripts/runtime.sh"]
+        assert [
             item["role"]
             for item in document["components"]
         ] == ["system", "system"]

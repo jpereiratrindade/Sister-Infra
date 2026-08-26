@@ -719,6 +719,7 @@ for item in qualification["components"]:
             "component_contract": item["component_contract"],
             "path": f"components/{item['component_id']}",
             "commit": report["source"]["commit"],
+            "runtime": item["runtime"],
             "artifacts": report["artifacts"],
         }
     )

@@ -296,6 +296,11 @@ def main() -> None:
             component["system_id"]
             for component in components
         ] == ["sister_alpha", "sister_beta"]
+        assert all(
+            component["runtime"]["entrypoint"]
+            == "scripts/runtime.sh"
+            for component in components
+        )
 
         for component in components:
             component_id = component["component_id"]
