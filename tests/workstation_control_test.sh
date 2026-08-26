@@ -44,6 +44,8 @@ make_infra() {
 
   cp "$ROOT/templates/systemd/sister-workstation.service.in" \
     "$path/templates/systemd/sister-workstation.service.in"
+  cp "$ROOT/templates/systemd/sister-workstation-legacy.service.in" \
+    "$path/templates/systemd/sister-workstation-legacy.service.in"
 
   chmod +x "$path/bin/"*
   printf 'infra\n' > "$path/README.md"
@@ -144,7 +146,7 @@ echo "=== doctor ==="
 
 echo
 echo "=== release 1 build-qualified ==="
-OUT1="$("$CLI" release-create)"
+OUT1="$("$CLI" release-create-legacy)"
 printf '%s\n' "$OUT1"
 ID1="$(printf '%s\n' "$OUT1" | tail -n1)"
 RELEASE1="$SISTER_WORKSTATION_INSTALL_ROOT/releases/$ID1"
@@ -205,7 +207,7 @@ printf '//change\n' >> "$WORKSPACE/SisTer/apps/sisterd/main.cpp"
 git -C "$WORKSPACE/SisTer" add apps/sisterd/main.cpp
 git -C "$WORKSPACE/SisTer" commit -q -m second
 
-OUT2="$("$CLI" release-create)"
+OUT2="$("$CLI" release-create-legacy)"
 printf '%s\n' "$OUT2"
 ID2="$(printf '%s\n' "$OUT2" | tail -n1)"
 

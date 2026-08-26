@@ -9,8 +9,8 @@ Environment=SISTER_INFRA_RUNTIME_MODE=installed
 Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-%h/.config/sister/workstation/runtime.env
-ExecStart=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra up --profile lan
-ExecStop=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra down --profile lan
+ExecStart=%h/.local/share/sister/current/components/sister-infra/bin/sister-workstation runtime-start
+ExecStop=%h/.local/share/sister/current/components/sister-infra/bin/sister-workstation runtime-stop
 TimeoutStartSec=1200
 TimeoutStopSec=180
 

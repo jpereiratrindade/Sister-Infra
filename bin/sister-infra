@@ -4,7 +4,7 @@ IFS=$'\n\t'
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE_DIR="$(dirname "$INFRA_ROOT")"
-RUN_ROOT="$INFRA_ROOT/.run"
+RUN_ROOT="${SISTER_INFRA_RUN_ROOT:-$INFRA_ROOT/.run}"
 GATEWAY_RUN="$RUN_ROOT/gateway"
 LOG_ROOT="$RUN_ROOT/logs"
 PROFILE="lan"
@@ -24,6 +24,10 @@ Comandos:
   status      mostra saúde, processos e URLs
   verify      valida configuração e endpoints
   gateway     reinicia apenas o HAProxy do sister-infra
+  declarative-up      inicia gateway derivado do deployment resolvido
+  declarative-down    para o gateway declarativo
+  declarative-status  observa bindings e gateway declarativos
+  declarative-verify  valida bindings, TLS e gateway declarativos
 
 Exemplos:
   ./bin/sister-infra bootstrap --profile lan
@@ -928,6 +932,138 @@ cmd_verify() {
   pass "ecossistema verificado"
 }
 
+declarative_preflight() {
+  require_command curl
+  require_command jq
+  require_command openssl
+
+  local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
+  [[ -n "$resolved" && -f "$resolved" ]] || \
+    die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
+  jq -e '
+    .schema == "sister.infra.deployment.resolved/1"
+    and .status == "READY"
+    and (.components | type == "array" and length > 0)
+  ' "$resolved" >/dev/null || die "deployment resolvido inválido"
+
+  if [[ ! -x "$HAPROXY_BIN" ]]; then
+    local detected
+    detected="$(command -v haproxy 2>/dev/null || true)"
+    [[ -n "$detected" ]] || die "HAProxy não encontrado em $HAPROXY_BIN nem no PATH"
+    HAPROXY_BIN="$detected"
+  fi
+  "$HAPROXY_BIN" -vv >/dev/null 2>&1 || \
+    die "HAProxy não executável: $HAPROXY_BIN"
+}
+
+declarative_component_health() {
+  local component_id="$1"
+  local transport="$2"
+  local endpoint_a="$3"
+  local endpoint_b="$4"
+  local health_path="$5"
+
+  [[ -n "$health_path" && "$health_path" != "null" ]] || return 0
+
+  case "$transport" in
+    tcp)
+      curl --noproxy '*' -fsS --max-time 5 \
+        "http://${endpoint_a}:${endpoint_b}${health_path}" >/dev/null
+      ;;
+    unix)
+      curl --noproxy '*' -fsS --max-time 5 \
+        --unix-socket "$endpoint_a" \
+        "http://localhost${health_path}" >/dev/null
+      ;;
+    *) die "transport desconhecido para $component_id: $transport" ;;
+  esac
+}
+
+declarative_verify_components() {
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local component_id transport endpoint_a endpoint_b health_path
+  while IFS=$'\t' read -r \
+      component_id transport endpoint_a endpoint_b health_path; do
+    [[ -n "$component_id" ]] || continue
+    declarative_component_health \
+      "$component_id" "$transport" "$endpoint_a" "$endpoint_b" "$health_path" \
+      && pass "$component_id saudável" \
+      || die "$component_id não respondeu ao probe declarativo"
+  done < <(
+    jq -r '
+      .components[]
+      | [
+          .component_id,
+          .runtime.transport,
+          (if .runtime.transport == "tcp" then .runtime.listen else .runtime.socket end),
+          (if .runtime.transport == "tcp" then (.runtime.port | tostring) else "-" end),
+          (.probe.health_path // "")
+        ] | @tsv
+    ' "$resolved"
+  )
+}
+
+declarative_verify_gateway_urls() {
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local -a cacert_args=()
+  if [[ "$PROFILE" != "production" && -f "$CA_CERT" ]]; then
+    cacert_args=(--cacert "$CA_CERT")
+  fi
+
+  local component_id host health_path
+  while IFS=$'\t' read -r component_id host health_path; do
+    [[ -n "$component_id" ]] || continue
+    curl --noproxy '*' -fsS --max-time 5 \
+      "${cacert_args[@]}" \
+      --resolve "$host:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
+      "https://$host:$GATEWAY_LISTEN_PORT$health_path" >/dev/null \
+      && pass "$component_id via gateway" \
+      || die "$component_id não respondeu via gateway"
+  done < <(
+    jq -r '
+      .components[]
+      | select(.gateway != null and (.probe.health_path // "") != "")
+      | [.component_id, .gateway.host, .probe.health_path] | @tsv
+    ' "$resolved"
+  )
+}
+
+cmd_declarative_up() {
+  declarative_preflight
+  production_preflight
+  [[ "$PROFILE" == "production" ]] || generate_lab_tls
+  start_gateway
+  if ! declarative_verify_components || ! declarative_verify_gateway_urls; then
+    stop_gateway
+    die "verificação após start do gateway declarativo falhou"
+  fi
+  pass "gateway declarativo ativo"
+}
+
+cmd_declarative_down() {
+  declarative_preflight
+  stop_gateway
+  pass "gateway declarativo parado"
+}
+
+cmd_declarative_status() {
+  declarative_preflight
+  declarative_verify_components
+  pid_alive "$GATEWAY_PID" || die "gateway declarativo OFFLINE"
+  pass "gateway declarativo PID $(cat "$GATEWAY_PID")"
+}
+
+cmd_declarative_verify() {
+  declarative_preflight
+  production_preflight
+  [[ "$PROFILE" == "production" ]] || generate_lab_tls
+  render_gateway
+  declarative_verify_components
+  pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"
+  declarative_verify_gateway_urls
+  pass "deployment declarativo verificado"
+}
+
 parse_args() {
   [[ $# -ge 1 ]] || { usage; exit 2; }
   COMMAND="$1"
@@ -966,6 +1102,10 @@ main() {
     down)      cmd_down ;;
     status)    cmd_status ;;
     verify)    cmd_verify ;;
+    declarative-up)     cmd_declarative_up ;;
+    declarative-down)   cmd_declarative_down ;;
+    declarative-status) cmd_declarative_status ;;
+    declarative-verify) cmd_declarative_verify ;;
     gateway)
       preflight_common
       production_preflight

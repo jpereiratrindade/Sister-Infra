@@ -1,0 +1,18 @@
+# Template de transição para releases workstation/2 já materializadas.
+[Unit]
+Description=SisTer Workstation Ecosystem (legacy transition)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=SISTER_INFRA_RUNTIME_MODE=installed
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-%h/.config/sister/workstation/runtime.env
+ExecStart=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra up --profile lan
+ExecStop=%h/.local/share/sister/current/components/sister-infra/bin/sister-infra down --profile lan
+TimeoutStartSec=1200
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target

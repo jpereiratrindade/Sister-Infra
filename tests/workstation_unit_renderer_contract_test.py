@@ -20,6 +20,9 @@ assert (
     in template
 ), "template não declara installed runtime"
 
+assert "sister-workstation runtime-start" in template
+assert "sister-workstation runtime-stop" in template
+
 begin = control.index("render_unit() {")
 end = control.index("\nsystemctl_user() {", begin)
 

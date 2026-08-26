@@ -27,6 +27,7 @@ NEXO_ENV="$CONFIG_ROOT/nexo.env"
 SISTER_ENV="$CONFIG_ROOT/sister.env"
 
 COMPOSITION_FILE="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONFIG_ROOT/composition.json}"
+DEPLOYMENT_FILE="${SISTER_WORKSTATION_DEPLOYMENT_FILE:-$CONFIG_ROOT/deployment.json}"
 COMPOSITION_CONTRACTS_ROOT="${SISTER_WORKSTATION_CONTRACTS_ROOT:-}"
 
 TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
@@ -46,9 +47,14 @@ Uso:
 Comandos:
   doctor          valida host, fontes, Git, systemd e layout
   plan            mostra diferença entre release atual e fontes, sem mutar
-  release-create  cria release local independente dos repositórios de dev
+  release-create  cria release declarativa qualificada e READY
+  release-create-legacy  cria release pelo caminho concreto de transição
   release-create-composition [arquivo]  materializa candidata declarativa
   candidate-verify <id>  verifica candidata declarativa materializada
+  runtime-start   inicia participantes e gateway da release declarativa
+  runtime-stop    para gateway e participantes da release declarativa
+  runtime-status  observa participantes da release declarativa
+  runtime-verify  verifica participantes e gateway declarativos
   release-list    lista releases instaladas
   install [id]    seleciona release e instala unidade systemd (não inicia)
   activate        migra o runtime atual para o serviço workstation
@@ -176,6 +182,13 @@ release_integrity() {
 
   [[ -d "$release" ]] || die "release ausente: $release"
   [[ -f "$(manifest_path "$release")" ]] || die "manifest ausente em $release"
+
+  if jq -e \
+      '.schema == "sister.infra.workstation.release/3"' \
+      "$(manifest_path "$release")" >/dev/null; then
+    declarative_release_integrity "$release"
+    return
+  fi
 
   local component repo expected actual tracked
 
@@ -780,6 +793,365 @@ candidate_verify() {
 }
 # SISTER-INFRA-CR05-COMPOSITION-END
 
+sha256_path() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+declarative_release_integrity() {
+  local release="$1"
+  local manifest="$release/manifest.json"
+
+  jq -e '
+    .schema == "sister.infra.workstation.release/3"
+    and .qualification.status == "PASS"
+    and .deployment.status == "READY"
+    and (.components | type == "array" and length > 0)
+  ' "$manifest" >/dev/null || \
+    die "release declarativa não está qualificada e READY"
+
+  local evidence expected actual
+  while IFS=$'\t' read -r evidence expected; do
+    [[ -n "$evidence" ]] || continue
+    [[ -f "$release/$evidence" ]] || \
+      die "evidência ausente na release: $evidence"
+    actual="$(sha256_path "$release/$evidence")"
+    [[ "$actual" == "$expected" ]] || \
+      die "hash divergente da evidência: $evidence"
+  done < <(
+    jq -r '
+      [
+        [.qualification.evidence, .qualification.sha256],
+        [.deployment.declaration, .deployment.declaration_sha256],
+        [.deployment.evidence, .deployment.sha256]
+      ][] | @tsv
+    ' "$manifest"
+  )
+
+  local control_path control_commit control_repo tracked
+  control_path="$(jq -r '.control_plane.path' "$manifest")"
+  control_commit="$(jq -r '.control_plane.commit' "$manifest")"
+  safe_relative_artifact_path "$control_path"
+  control_repo="$release/$control_path"
+  [[ -d "$control_repo/.git" ]] || \
+    die "release declarativa sem control plane Git"
+  [[ "$(git -C "$control_repo" rev-parse HEAD)" == "$control_commit" ]] || \
+    die "control plane divergiu do manifesto"
+  tracked="$(git -C "$control_repo" status --porcelain --untracked-files=no)"
+  [[ -z "$tracked" ]] || die "control plane possui alteração rastreada"
+
+  local component_id component_path component_repo expected_commit entrypoint
+  local artifact_id relpath expected_hash executable absolute
+  while IFS=$'\t' read -r \
+      component_id component_path expected_commit entrypoint; do
+    [[ -n "$component_id" ]] || continue
+    safe_component_id "$component_id"
+    safe_relative_artifact_path "$component_path"
+    safe_relative_artifact_path "$entrypoint"
+    component_repo="$release/$component_path"
+
+    [[ -d "$component_repo/.git" ]] || \
+      die "release declarativa: $component_id sem .git"
+    [[ "$(git -C "$component_repo" rev-parse HEAD)" == "$expected_commit" ]] || \
+      die "release declarativa: commit divergente para $component_id"
+    tracked="$(git -C "$component_repo" status --porcelain --untracked-files=no)"
+    [[ -z "$tracked" ]] || \
+      die "release declarativa: alteração rastreada em $component_id"
+    [[ -x "$component_repo/$entrypoint" ]] || \
+      die "entrypoint ausente/não executável para $component_id"
+
+    while IFS=$'\t' read -r \
+        artifact_id relpath expected_hash executable; do
+      [[ -n "$artifact_id" ]] || continue
+      safe_relative_artifact_path "$relpath"
+      absolute="$component_repo/$relpath"
+      [[ -f "$absolute" ]] || \
+        die "artefato ausente: $component_id/$artifact_id"
+      if [[ "$executable" == "true" ]]; then
+        [[ -x "$absolute" ]] || \
+          die "artefato não executável: $component_id/$artifact_id"
+      fi
+      [[ "$(sha256_path "$absolute")" == "$expected_hash" ]] || \
+        die "hash divergente: $component_id/$artifact_id"
+    done < <(
+      jq -r --arg id "$component_id" '
+        .components[] | select(.component_id == $id) | .artifacts[]
+        | [.id, .path, .sha256, (.executable | tostring)] | @tsv
+      ' "$manifest"
+    )
+  done < <(
+    jq -r '
+      .components[]
+      | [.component_id, .path, .commit, .runtime.entrypoint]
+      | @tsv
+    ' "$manifest"
+  )
+
+  local resolved="$release/$(jq -r '.deployment.evidence' "$manifest")"
+  jq -e --slurpfile deployment "$resolved" '
+    .candidate_id == $deployment[0].candidate_id
+    and .composition.composition_id == $deployment[0].composition_id
+    and (
+      [.components[].system_id] | sort
+    ) == (
+      [$deployment[0].components[].system_id] | sort
+    )
+  ' "$manifest" >/dev/null || \
+    die "deployment resolvido diverge da release"
+
+  pass "integridade declarativa da release $(basename "$release")"
+}
+
+declarative_source_files() {
+  local workspace
+  workspace="$(source_workspace_guess)" || \
+    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
+  workspace="$(cd "$workspace" && pwd -P)"
+  write_source_workspace "$workspace"
+
+  local control_plane
+  control_plane="$(repo_path "$workspace" infra)"
+  require_repo_clean "$control_plane" "sister-infra"
+
+  local composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-}"
+  local deployment="${SISTER_WORKSTATION_DEPLOYMENT_FILE:-}"
+  [[ -n "$composition" ]] || \
+    composition="$control_plane/config/compositions/workstation.json"
+  [[ -n "$deployment" ]] || \
+    deployment="$control_plane/config/deployments/workstation-lab.json"
+
+  [[ -f "$composition" ]] || die "composição oficial ausente: $composition"
+  [[ -f "$deployment" ]] || die "deployment oficial ausente: $deployment"
+  printf '%s\t%s\n' "$composition" "$deployment"
+}
+
+release_create_declarative() {
+  ensure_dirs
+
+  local composition deployment
+  IFS=$'\t' read -r composition deployment < <(declarative_source_files)
+
+  local candidate_output candidate_id candidate
+  candidate_output="$(release_create_composition "$composition")"
+  printf '%s\n' "$candidate_output"
+  candidate_id="$(printf '%s\n' "$candidate_output" | tail -n1)"
+  candidate="$CANDIDATES_ROOT/$candidate_id"
+  composition_candidate_integrity "$candidate"
+
+  local id release tmp
+  id="wr-${candidate_id#wc-}"
+  release="$RELEASES_ROOT/$id"
+  tmp="$RELEASES_ROOT/.creating-$id-$$"
+  [[ ! -e "$release" ]] || die "release já existe: $id"
+
+  mkdir -p "$tmp"
+  cp -a "$candidate/." "$tmp/"
+  mkdir -p "$tmp/evidence/deployment"
+  cp -p "$deployment" "$tmp/evidence/deployment/declaration.json"
+
+  "$tmp/components/sister-infra/bin/sister-deployment" resolve \
+    "$tmp/manifest.json" \
+    "$tmp/evidence/deployment/declaration.json" \
+    --json > "$tmp/evidence/deployment/resolved.json" || {
+      find "$tmp" -depth -delete
+      die "deployment da release não resolveu READY"
+    }
+
+  local declaration_hash resolved_hash
+  declaration_hash="$(sha256_path "$tmp/evidence/deployment/declaration.json")"
+  resolved_hash="$(sha256_path "$tmp/evidence/deployment/resolved.json")"
+
+  python3 - \
+    "$tmp/manifest.json" \
+    "$id" \
+    "$declaration_hash" \
+    "$resolved_hash" <<'PY_RELEASE_V3'
+import json
+import sys
+from pathlib import Path
+
+manifest_path, release_id, declaration_hash, resolved_hash = sys.argv[1:]
+path = Path(manifest_path)
+manifest = json.loads(path.read_text(encoding="utf-8"))
+resolved = json.loads(
+    (path.parent / "evidence/deployment/resolved.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+manifest["schema"] = "sister.infra.workstation.release/3"
+manifest["release_id"] = release_id
+manifest["deployment"] = {
+    "status": "READY",
+    "deployment_id": resolved["deployment_id"],
+    "declaration": "evidence/deployment/declaration.json",
+    "declaration_sha256": declaration_hash,
+    "evidence": "evidence/deployment/resolved.json",
+    "sha256": resolved_hash,
+}
+
+path.write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY_RELEASE_V3
+
+  printf '%s\n' "$id" > "$tmp/RELEASE_ID"
+  printf '%s\n' "SISTER-INFRA-DECLARATIVE-RELEASE-3" > "$tmp/QUALIFICATION"
+  declarative_release_integrity "$tmp"
+  mv "$tmp" "$release"
+  declarative_release_integrity "$release"
+  printf '%s\n' "$id" > "$STATE_ROOT/last-created-release"
+  pass "release declarativa READY criada: $id"
+  printf '%s\n' "$id"
+}
+
+release_resolved_deployment() {
+  local release="$1"
+  printf '%s/%s\n' \
+    "$release" \
+    "$(jq -r '.deployment.evidence' "$release/manifest.json")"
+}
+
+invoke_component_action() {
+  local release="$1"
+  local component_id="$2"
+  local component_path="$3"
+  local entrypoint="$4"
+  local action="$5"
+  local resolved="$6"
+  local root="$release/$component_path"
+  local config="$CONFIG_ROOT/${component_id}.env"
+
+  mkdir -p \
+    "$STATE_ROOT/components/$component_id" \
+    "$STATE_ROOT/run/$component_id"
+
+  (
+    cd "$root"
+    export SISTER_RESOLVED_DEPLOYMENT_FILE="$resolved"
+    export SISTER_COMPONENT_CONFIG_FILE="$config"
+    export SISTER_RUNTIME_STATE_DIR="$STATE_ROOT/components/$component_id"
+    export SISTER_RUNTIME_RUN_DIR="$STATE_ROOT/run/$component_id"
+    "$root/$entrypoint" "$action"
+  )
+}
+
+component_rows() {
+  jq -r '
+    .components[]
+    | [.component_id, .path, .runtime.entrypoint]
+    | @tsv
+  ' "$1/manifest.json"
+}
+
+components_action_forward() {
+  local release="$1"
+  local action="$2"
+  local resolved
+  resolved="$(release_resolved_deployment "$release")"
+
+  local component_id component_path entrypoint
+  while IFS=$'\t' read -r component_id component_path entrypoint; do
+    [[ -n "$component_id" ]] || continue
+    info "$action: $component_id"
+    invoke_component_action \
+      "$release" "$component_id" "$component_path" \
+      "$entrypoint" "$action" "$resolved" || return 1
+  done < <(component_rows "$release")
+}
+
+components_action_reverse() {
+  local release="$1"
+  local action="$2"
+  local resolved
+  resolved="$(release_resolved_deployment "$release")"
+
+  local -a rows=()
+  mapfile -t rows < <(component_rows "$release")
+  local index component_id component_path entrypoint
+  for ((index=${#rows[@]} - 1; index >= 0; index--)); do
+    IFS=$'\t' read -r component_id component_path entrypoint \
+      <<<"${rows[$index]}"
+    [[ -n "$component_id" ]] || continue
+    info "$action: $component_id"
+    invoke_component_action \
+      "$release" "$component_id" "$component_path" \
+      "$entrypoint" "$action" "$resolved" || \
+      warn "$component_id reportou falha em $action"
+  done
+}
+
+declarative_gateway_action() {
+  local release="$1"
+  local action="$2"
+  local resolved
+  resolved="$(release_resolved_deployment "$release")"
+
+  if [[ "$TEST_MODE" == "1" ]]; then
+    info "TEST_MODE gateway declarativo: $action"
+    return 0
+  fi
+
+  local control_plane
+  control_plane="$release/$(jq -r '.control_plane.path' "$release/manifest.json")"
+  mkdir -p "$TLS_CONFIG" "$STATE_ROOT/control-plane"
+
+  SISTER_RESOLVED_DEPLOYMENT_FILE="$resolved" \
+  SISTER_INFRA_RUN_ROOT="$STATE_ROOT/control-plane" \
+  TLS_PEM="$TLS_CONFIG/ecosystem-lab.pem" \
+  CA_CERT="$TLS_CONFIG/ecosystem-lab-ca.crt" \
+  CA_KEY="$TLS_CONFIG/ecosystem-lab-ca.key" \
+    "$control_plane/bin/sister-infra" "$action" --profile lan
+}
+
+runtime_start() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release current"
+  declarative_release_integrity "$release"
+
+  if ! components_action_forward "$release" start; then
+    warn "start declarativo falhou; parando participantes já acionados"
+    components_action_reverse "$release" stop
+    die "runtime declarativo não iniciou"
+  fi
+  components_action_forward "$release" health || {
+    components_action_reverse "$release" stop
+    die "participante falhou no health após start"
+  }
+  declarative_gateway_action "$release" declarative-up || {
+    declarative_gateway_action "$release" declarative-down || true
+    components_action_reverse "$release" stop
+    die "gateway declarativo não iniciou"
+  }
+  pass "runtime declarativo iniciado"
+}
+
+runtime_stop() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release current"
+  declarative_gateway_action "$release" declarative-down || \
+    warn "gateway declarativo reportou falha ao parar"
+  components_action_reverse "$release" stop
+  pass "runtime declarativo parado"
+}
+
+runtime_status() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release current"
+  declarative_release_integrity "$release"
+  components_action_forward "$release" status
+  declarative_gateway_action "$release" declarative-status
+}
+
+runtime_verify() {
+  local release
+  release="$(current_release_path)" || die "nenhuma release current"
+  declarative_release_integrity "$release"
+  components_action_forward "$release" health
+  declarative_gateway_action "$release" declarative-verify
+  pass "workstation declarativa verificada"
+}
+
 release_build_qualification() {
   local workspace="$1"
   local sister_commit="$2"
@@ -882,13 +1254,24 @@ require_release_build_qualified() {
   local release="$1"
   local status
 
+  if jq -e '.schema == "sister.infra.workstation.release/3"' \
+      "$(manifest_path "$release")" >/dev/null; then
+    status="$(jq -r '
+      if .qualification.status == "PASS" and .deployment.status == "READY"
+      then "PASS" else "UNQUALIFIED" end
+    ' "$(manifest_path "$release")")"
+    [[ "$status" == "PASS" ]] || \
+      die "release declarativa não possui qualification PASS e deployment READY: $(basename "$release")"
+    return
+  fi
+
   status="$(jq -r '.qualification.build.status // "UNQUALIFIED"' "$(manifest_path "$release")")"
 
   [[ "$status" == "PASS" ]] || \
     die "release não possui build qualification PASS: $(basename "$release")"
 }
 
-release_create() {
+release_create_legacy() {
   ensure_dirs
 
   local workspace
@@ -1055,6 +1438,10 @@ PY_MANIFEST_OPS001C
   printf '%s\n' "$id"
 }
 
+release_create() {
+  release_create_declarative
+}
+
 render_unit() {
   ensure_dirs
 
@@ -1063,8 +1450,16 @@ render_unit() {
   # A unit instalada deriva exclusivamente do template pertencente à
   # release selecionada. O control plane não mantém uma segunda
   # representação do contrato systemd.
-  local template
-  template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
+  local template schema
+  schema="$(jq -r '.schema' "$CURRENT_LINK/manifest.json")"
+  if [[ "$schema" == "sister.infra.workstation.release/3" ]]; then
+    template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
+  else
+    template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation-legacy.service.in"
+    if [[ ! -f "$template" ]]; then
+      template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
+    fi
+  fi
 
   [[ -f "$template" ]] || \
     die "template systemd ausente na release current: $template"
@@ -1156,7 +1551,12 @@ verify_installed() {
   release_integrity "$release"
   require_release_build_qualified "$release"
 
-  "$release/components/sister-infra/bin/sister-infra" verify --profile lan
+  if jq -e '.schema == "sister.infra.workstation.release/3"' \
+      "$release/manifest.json" >/dev/null; then
+    runtime_verify
+  else
+    "$release/components/sister-infra/bin/sister-infra" verify --profile lan
+  fi
   pass "workstation verificado"
 }
 
@@ -1459,7 +1859,12 @@ status() {
     release_integrity "$release"
 
     printf '\n--- ecosystem status ---\n'
-    "$release/components/sister-infra/bin/sister-infra" status --profile lan || true
+    if jq -e '.schema == "sister.infra.workstation.release/3"' \
+        "$release/manifest.json" >/dev/null; then
+      runtime_status || true
+    else
+      "$release/components/sister-infra/bin/sister-infra" status --profile lan || true
+    fi
   fi
 }
 
@@ -1468,7 +1873,7 @@ release_list() {
 
   local d
 
-  for d in "$RELEASES_ROOT"/ws-*; do
+  for d in "$RELEASES_ROOT"/ws-* "$RELEASES_ROOT"/wr-*; do
     [[ -d "$d" ]] || continue
 
     local id marker=""
@@ -1500,6 +1905,11 @@ main() {
     release-create-composition) release_create_composition "${1:-}" ;;
     candidate-verify) candidate_verify "${1:-}" ;;
     release-create) release_create ;;
+    release-create-legacy) release_create_legacy ;;
+    runtime-start) runtime_start ;;
+    runtime-stop) runtime_stop ;;
+    runtime-status) runtime_status ;;
+    runtime-verify) runtime_verify ;;
     release-list) release_list ;;
     install) install_release "${1:-}" ;;
     activate) activate_workstation ;;
