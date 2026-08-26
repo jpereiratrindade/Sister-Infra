@@ -208,6 +208,10 @@ def resolve(
             f"deployment={deployment['composition_id']!r}"
         )
 
+    gateway_config = deployment.get("gateway") or {}
+    default_protocol = gateway_config.get("protocol", "https")
+    default_port = gateway_config.get("port", 8443)
+
     bindings = validate_bindings(components, deployment)
     resolved_components = []
     for component in components:
@@ -221,7 +225,16 @@ def resolve(
         if "probe" in binding:
             resolved["probe"] = binding["probe"]
         if "gateway" in binding:
-            resolved["gateway"] = binding["gateway"]
+            gw = dict(binding["gateway"])
+            host = gw["host"]
+            if not gw.get("public_url"):
+                if (default_protocol == "https" and default_port == 443) or (
+                    default_protocol == "http" and default_port == 80
+                ):
+                    gw["public_url"] = f"{default_protocol}://{host}"
+                else:
+                    gw["public_url"] = f"{default_protocol}://{host}:{default_port}"
+            resolved["gateway"] = gw
         resolved_components.append(resolved)
 
     return {

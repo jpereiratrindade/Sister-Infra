@@ -703,6 +703,32 @@ parse_args() {
   esac
 }
 
+cmd_client_env() {
+  runtime_preflight
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local values
+  values="$(jq -r --arg gw_ip "${GATEWAY_LISTEN_ADDRESS:-}" '
+    ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
+    + (if $gw_ip != "" then [$gw_ip] else [] end)
+    + [.components[] | select(.runtime.transport == "tcp") | .runtime.listen]
+    + [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(",")
+  ' "$resolved")"
+  printf 'export NO_PROXY="%s"\n' "$values"
+  printf 'export no_proxy="%s"\n' "$values"
+}
+
+cmd_hosts_line() {
+  runtime_preflight
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local hosts_list
+  hosts_list="$(jq -r '
+    [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(" ")
+  ' "$resolved")"
+  printf '%s %s\n' "${GATEWAY_LISTEN_ADDRESS:-127.0.0.1}" "$hosts_list"
+}
+
 main() {
   parse_args "$@"
   load_profile
@@ -713,6 +739,8 @@ main() {
     down)      cmd_down ;;
     status)    cmd_status ;;
     verify)    cmd_verify ;;
+    client-env) cmd_client_env ;;
+    hosts-line|hosts) cmd_hosts_line ;;
     help|-h|--help) usage ;;
     *) die "comando desconhecido: $COMMAND" ;;
   esac

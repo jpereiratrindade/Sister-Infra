@@ -2,6 +2,10 @@
   "schema": "sister.infra.deployment/1.0.0",
   "deployment_id": "workstation-lab",
   "composition_id": "workstation",
+  "gateway": {
+    "protocol": "https",
+    "port": 8443
+  },
   "bindings": [
     {
       "system_id": "sister",

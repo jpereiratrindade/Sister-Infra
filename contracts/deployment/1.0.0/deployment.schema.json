@@ -21,6 +21,28 @@
     "composition_id": {
       "$ref": "#/$defs/identifier"
     },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listen": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "http",
+            "https"
+          ]
+        }
+      }
+    },
     "bindings": {
       "type": "array",
       "minItems": 1,
@@ -127,6 +149,11 @@
           "type": "string",
           "minLength": 1,
           "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+        },
+        "public_url": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^https?://"
         }
       }
     }

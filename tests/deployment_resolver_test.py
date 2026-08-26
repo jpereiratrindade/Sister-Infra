@@ -131,8 +131,39 @@ def main() -> None:
             "system_beta",
         ]
         assert resolved["components"][0]["runtime"]["transport"] == "tcp"
+        assert resolved["components"][0]["gateway"]["host"] == "alpha-gateway.test"
+        assert (
+            resolved["components"][0]["gateway"]["public_url"]
+            == "https://alpha-gateway.test:8443"
+        )
         assert resolved["components"][1]["runtime"]["transport"] == "unix"
         assert "gateway" not in resolved["components"][1]
+
+        # Extensibility test: add delta component dynamically
+        ext_candidate = copy.deepcopy(base_candidate)
+        ext_candidate["components"].append({
+            "component_id": "delta",
+            "system_id": "system_delta",
+            "path": "components/delta",
+        })
+        ext_deployment = copy.deepcopy(base_deployment)
+        ext_deployment["bindings"].append({
+            "system_id": "system_delta",
+            "runtime": {
+                "transport": "tcp",
+                "listen": "127.0.0.1",
+                "port": 18003,
+            },
+            "probe": {"health_path": "/health"},
+            "gateway": {"host": "delta-gateway.test"},
+        })
+        ext_resolved = accepted(tmp, ext_candidate, ext_deployment)
+        assert len(ext_resolved["components"]) == 3
+        delta_comp = next(
+            c for c in ext_resolved["components"] if c["component_id"] == "delta"
+        )
+        assert delta_comp["gateway"]["host"] == "delta-gateway.test"
+        assert delta_comp["gateway"]["public_url"] == "https://delta-gateway.test:8443"
 
         changed = copy.deepcopy(base_candidate)
         changed["qualification"]["status"] = "FAIL"

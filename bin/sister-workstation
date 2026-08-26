@@ -144,8 +144,13 @@ sync_runtime_env() {
   local release resolved values
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
-  values="$(jq -r '
-    ["localhost", "127.0.0.1", "::1"]
+  local gateway_listen=""
+  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
+    gateway_listen="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
+  fi
+  values="$(jq -r --arg gw_ip "$gateway_listen" '
+    ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
+    + (if $gw_ip != "" then [$gw_ip] else [] end)
     + [.components[] | select(.runtime.transport == "tcp") | .runtime.listen]
     + [.components[] | select(.gateway != null) | .gateway.host]
     | unique | join(",")
@@ -155,6 +160,44 @@ sync_runtime_env() {
     printf 'no_proxy=%s\n' "$values"
   } > "$RUNTIME_ENV"
   chmod 600 "$RUNTIME_ENV"
+}
+
+cmd_client_env() {
+  ensure_dirs
+  local release resolved values
+  release="$(current_release_path)" || die "nenhuma release current"
+  resolved="$(release_resolved_deployment "$release")"
+  local gateway_listen=""
+  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
+    gateway_listen="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
+  fi
+  values="$(jq -r --arg gw_ip "$gateway_listen" '
+    ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
+    + (if $gw_ip != "" then [$gw_ip] else [] end)
+    + [.components[] | select(.runtime.transport == "tcp") | .runtime.listen]
+    + [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(",")
+  ' "$resolved")"
+  printf 'export NO_PROXY="%s"\n' "$values"
+  printf 'export no_proxy="%s"\n' "$values"
+}
+
+cmd_hosts_line() {
+  ensure_dirs
+  local release resolved hosts_list
+  release="$(current_release_path)" || die "nenhuma release current"
+  resolved="$(release_resolved_deployment "$release")"
+  local gateway_listen="127.0.0.1"
+  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
+    local found
+    found="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
+    if [[ -n "$found" ]]; then gateway_listen="$found"; fi
+  fi
+  hosts_list="$(jq -r '
+    [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(" ")
+  ' "$resolved")"
+  printf '%s %s\n' "$gateway_listen" "$hosts_list"
 }
 
 clone_component() {
@@ -1390,6 +1433,8 @@ main() {
     update) update_workstation ;;
     rollback) rollback_workstation ;;
     logs) logs_cmd ;;
+    client-env) cmd_client_env ;;
+    hosts-line|hosts) cmd_hosts_line ;;
     current)
       printf 'current=%s\n' "$(current_release_id)"
       printf 'previous=%s\n' "$(previous_release_id)"
