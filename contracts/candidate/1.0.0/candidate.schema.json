@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sister.local/contracts/infra/candidate/1.0.0/candidate.schema.json",
+  "title": "SisTer Infra Candidate 1.0.0",
+  "description": "Descreve uma candidata imutável qualificada contendo participantes, commits exatos e artefatos verificados, aguardando bindings físicos.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "candidate_id",
+    "created_at_utc",
+    "composition",
+    "qualification",
+    "deployment",
+    "components"
+  ],
+  "properties": {
+    "schema": {
+      "enum": [
+        "sister.infra.candidate/1",
+        "sister.infra.workstation.candidate/1"
+      ]
+    },
+    "candidate_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "created_at_utc": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deployment_class": {
+      "type": "string",
+      "minLength": 1
+    },
+    "control_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component_id",
+        "path",
+        "commit"
+      ],
+      "properties": {
+        "component_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "$ref": "#/$defs/commitHex"
+        }
+      }
+    },
+    "composition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "composition_id",
+        "schema"
+      ],
+      "properties": {
+        "composition_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "evidence",
+        "sha256"
+      ],
+      "properties": {
+        "status": {
+          "const": "PASS"
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "const": "PENDING_BINDINGS"
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "component_id",
+          "system_id",
+          "path",
+          "commit"
+        ],
+        "properties": {
+          "component_id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "system_id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1
+          },
+          "component_contract": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "commit": {
+            "$ref": "#/$defs/commitHex"
+          },
+          "runtime": {
+            "type": "object"
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "path",
+                "sha256",
+                "executable"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "sha256": {
+                  "$ref": "#/$defs/sha256Hex"
+                },
+                "executable": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "commitHex": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{7,40}$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    }
+  }
+}

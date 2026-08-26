@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ except ImportError as exc:  # pragma: no cover - environment failure
 
 
 INFRA_ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
 DEPLOYMENT_CONTRACT = "sister.infra.deployment"
 
 
@@ -99,7 +101,11 @@ def validate_deployment(document: dict[str, Any]) -> None:
 
 
 def validate_candidate(candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    if candidate.get("schema") != "sister.infra.workstation.candidate/1":
+    schema = candidate.get("schema")
+    if schema not in (
+        "sister.infra.candidate/1",
+        "sister.infra.workstation.candidate/1",
+    ):
         raise DeploymentError("schema de candidata não suportado")
     if candidate.get("qualification", {}).get("status") != "PASS":
         raise DeploymentError("candidata deve possuir qualification=PASS")
@@ -188,11 +194,50 @@ def validate_bindings(
     return by_system
 
 
+def verify_canonical_candidate(candidate_dir: Path) -> dict[str, Any]:
+    if not CANDIDATE_CLI.is_file():
+        raise DeploymentError(
+            f"autoridade sister-candidate não encontrada em {CANDIDATE_CLI}"
+        )
+    result = subprocess.run(
+        [sys.executable, str(CANDIDATE_CLI), "verify", str(candidate_dir), "--json"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip()
+        raise DeploymentError(
+            f"verificação autoritativa da candidata falhou:\n{err}"
+        )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DeploymentError(
+            f"saída JSON inválida de sister-candidate verify: {exc}"
+        ) from exc
+
+
 def resolve(
     candidate: dict[str, Any],
     deployment: dict[str, Any],
+    candidate_path: Path | None = None,
 ) -> dict[str, Any]:
     validate_deployment(deployment)
+
+    schema = candidate.get("schema")
+    if schema == "sister.infra.candidate/1":
+        if candidate_path is None:
+            raise DeploymentError(
+                "resolução de candidata canônica requer o caminho do manifesto"
+            )
+        if candidate_path.name != "manifest.json":
+            raise DeploymentError(
+                "manifesto de candidata canônica deve ser 'manifest.json'"
+            )
+        candidate = verify_canonical_candidate(candidate_path.parent)
+
     components = validate_candidate(candidate)
 
     composition = candidate.get("composition")
@@ -269,6 +314,7 @@ def main() -> int:
         result = resolve(
             load_json(candidate_path, "manifesto de candidata"),
             load_json(deployment_path, "deployment"),
+            candidate_path=candidate_path,
         )
     except DeploymentError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)

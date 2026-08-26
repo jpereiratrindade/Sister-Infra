@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    import jsonschema
+except ImportError as exc:
+    raise SystemExit(
+        "[FAIL] sister-candidate requer o módulo Python jsonschema"
+    ) from exc
+
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+COMPOSITION_CLI = INFRA_ROOT / "bin" / "sister-composition"
+CANDIDATE_SCHEMA_PATH = (
+    INFRA_ROOT
+    / "contracts"
+    / "candidate"
+    / "1.0.0"
+    / "candidate.schema.json"
+)
+
+
+class CandidateError(RuntimeError):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CandidateError(f"não foi possível ler {label}: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CandidateError(
+            f"JSON inválido em {label}: {path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise CandidateError(f"{label} deve ser um objeto JSON: {path}")
+    return value
+
+
+def validate_candidate_manifest(manifest: dict[str, Any]) -> None:
+    schema = load_json(CANDIDATE_SCHEMA_PATH, "schema de candidata")
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        errors = sorted(
+            jsonschema.Draft202012Validator(schema).iter_errors(manifest),
+            key=lambda err: tuple(str(p) for p in err.absolute_path),
+        )
+    except jsonschema.SchemaError as exc:
+        raise CandidateError(f"contrato de candidata inválido: {exc}") from exc
+
+    if errors:
+        details = []
+        for error in errors:
+            loc = ".".join(str(p) for p in error.absolute_path) or "<root>"
+            details.append(f"{loc}: {error.message}")
+        raise CandidateError("manifesto de candidata rejeitado:\n  - " + "\n  - ".join(details))
+
+
+def verify_candidate_directory(candidate_dir: Path) -> dict[str, Any]:
+    manifest_path = candidate_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise CandidateError(f"manifest.json ausente na candidata: {candidate_dir}")
+
+    manifest = load_json(manifest_path, "manifesto da candidata")
+    validate_candidate_manifest(manifest)
+
+    # 1. Valida evidência de qualificação
+    qual_rel = manifest["qualification"]["evidence"]
+    qual_file = candidate_dir / qual_rel
+    if not qual_file.is_file():
+        raise CandidateError(f"evidência de qualificação ausente: {qual_rel}")
+
+    actual_qual_hash = sha256_file(qual_file)
+    expected_qual_hash = manifest["qualification"]["sha256"]
+    if actual_qual_hash != expected_qual_hash:
+        raise CandidateError(
+            f"hash divergente da evidência de qualificação: "
+            f"esperado={expected_qual_hash} atual={actual_qual_hash}"
+        )
+
+    # 2. Valida componentes e artefatos
+    for comp in manifest["components"]:
+        comp_dir = candidate_dir / comp["path"]
+        if not comp_dir.is_dir():
+            raise CandidateError(f"diretório do componente ausente: {comp['path']}")
+
+        for art in comp.get("artifacts", []):
+            art_file = comp_dir / art["path"]
+            if not art_file.is_file():
+                raise CandidateError(f"artefato ausente: {comp['path']}/{art['path']}")
+
+            actual_art_hash = sha256_file(art_file)
+            expected_art_hash = art["sha256"]
+            if actual_art_hash != expected_art_hash:
+                raise CandidateError(
+                    f"hash divergente do artefato {art['id']}: "
+                    f"esperado={expected_art_hash} atual={actual_art_hash}"
+                )
+
+            if art.get("executable") and not os.access(art_file, os.X_OK):
+                raise CandidateError(f"artefato deveria ser executável: {art_file}")
+
+    return manifest
+
+
+def create_candidate(
+    composition_path: Path,
+    out_dir: Path,
+    candidate_id: str | None = None,
+    contracts_root: str | None = None,
+) -> dict[str, Any]:
+    composition_path = composition_path.expanduser().resolve()
+    if not composition_path.is_file():
+        raise CandidateError(f"composição inexistente: {composition_path}")
+
+    out_dir = out_dir.expanduser().resolve()
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise CandidateError(f"diretório de saída já existe e não está vazio: {out_dir}")
+
+    tmp_artifacts = out_dir.parent / f".tmp-artifacts-{os.getpid()}"
+    tmp_artifacts.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Executa sister-composition qualify
+        cmd = [
+            str(COMPOSITION_CLI),
+            "qualify",
+            str(composition_path),
+            "--artifacts-root",
+            str(tmp_artifacts),
+            "--json",
+        ]
+        if contracts_root:
+            cmd.extend(["--contracts-root", contracts_root])
+
+        res = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            raise CandidateError(f"qualificação da composição falhou:\n{err}")
+
+        try:
+            qual_doc = json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            raise CandidateError(f"qualificação produziu JSON inválido: {exc}") from exc
+
+        if qual_doc.get("status") != "PASS":
+            raise CandidateError(f"qualificação não aprovada: status={qual_doc.get('status')!r}")
+
+        qual_bytes = (
+            json.dumps(qual_doc, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        qual_hash = hashlib.sha256(qual_bytes).hexdigest()
+        qual_short = qual_hash[:12]
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        timestamp = now_utc.strftime("%Y%m%dT%H%M%SZ")
+
+        if not candidate_id:
+            candidate_id = f"cand-{timestamp}-{qual_short}"
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        evidence_dir = out_dir / "evidence" / "composition"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "qualification.json").write_bytes(qual_bytes)
+
+        components_dir = out_dir / "components"
+        components_dir.mkdir(parents=True, exist_ok=True)
+
+        candidate_components = []
+        for comp in qual_doc["components"]:
+            cid = comp["component_id"]
+            source_root = Path(comp["root"])
+            target_comp_dir = components_dir / cid
+            target_comp_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copia arquivos rastreados ou fonte
+            if (source_root / ".git").is_dir():
+                # Checkout limpo do commit qualificado
+                commit = comp["qualification"]["source"]["commit"]
+                subprocess.run(
+                    ["git", "clone", "--quiet", "--no-checkout", str(source_root), str(target_comp_dir)],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(target_comp_dir), "checkout", "--quiet", commit],
+                    check=True,
+                )
+            else:
+                shutil.copytree(source_root, target_comp_dir, dirs_exist_ok=True)
+
+            # Materializa artefatos qualificados
+            artifacts = comp["qualification"].get("artifacts", [])
+            for art in artifacts:
+                art_rel = Path(art["path"])
+                src_art = tmp_artifacts / cid / art_rel
+                dst_art = target_comp_dir / art_rel
+                dst_art.parent.mkdir(parents=True, exist_ok=True)
+                if src_art.is_file():
+                    shutil.copy2(src_art, dst_art)
+                if art.get("executable"):
+                    dst_art.chmod(dst_art.stat().st_mode | 0o111)
+
+            candidate_components.append(
+                {
+                    "component_id": cid,
+                    "system_id": comp["system_id"],
+                    "role": comp.get("role", "system"),
+                    "component_contract": comp.get("component_contract", ""),
+                    "path": f"components/{cid}",
+                    "commit": comp["qualification"]["source"]["commit"],
+                    "runtime": comp.get("runtime"),
+                    "artifacts": artifacts,
+                }
+            )
+
+        manifest = {
+            "schema": "sister.infra.candidate/1",
+            "candidate_id": candidate_id,
+            "created_at_utc": timestamp,
+            "composition": {
+                "composition_id": qual_doc["composition_id"],
+                "schema": qual_doc["schema"],
+            },
+            "qualification": {
+                "status": "PASS",
+                "evidence": "evidence/composition/qualification.json",
+                "sha256": qual_hash,
+            },
+            "deployment": {
+                "status": "PENDING_BINDINGS",
+            },
+            "components": candidate_components,
+        }
+
+        if "deployment_class" in qual_doc:
+            manifest["deployment_class"] = qual_doc["deployment_class"]
+
+        manifest_path = out_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        verify_candidate_directory(out_dir)
+        return manifest
+
+    finally:
+        shutil.rmtree(tmp_artifacts, ignore_errors=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-candidate",
+        description="Materializa e valida candidatas imutáveis declarativas do sister-infra",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    create_p = sub.add_parser("create", help="Materializa candidata a partir de uma composição qualificada")
+    create_p.add_argument("composition", help="Caminho para composition.json")
+    create_p.add_argument("--out", required=True, help="Diretório de destino da candidata")
+    create_p.add_argument("--candidate-id", help="Identificador opcional da candidata")
+    create_p.add_argument("--contracts-root", help="Diretório de contratos normativos")
+    create_p.add_argument("--json", action="store_true", help="Emite o manifesto em JSON")
+
+    verify_p = sub.add_parser("verify", help="Verifica integridade fail-closed de uma candidata")
+    verify_p.add_argument("candidate_dir", help="Diretório da candidata a verificar")
+    verify_p.add_argument("--json", action="store_true", help="Emite resultado em JSON")
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "create":
+            manifest = create_candidate(
+                Path(args.composition),
+                Path(args.out),
+                candidate_id=args.candidate_id,
+                contracts_root=args.contracts_root,
+            )
+            if args.json:
+                print(json.dumps(manifest, indent=2, sort_keys=True))
+            else:
+                print(f"[PASS] candidata imutável materializada: {manifest['candidate_id']}")
+                print(f"diretório: {Path(args.out).resolve()}")
+                print(f"participantes: {len(manifest['components'])}")
+        elif args.command == "verify":
+            manifest = verify_candidate_directory(Path(args.candidate_dir).resolve())
+            if args.json:
+                print(json.dumps(manifest, indent=2, sort_keys=True))
+            else:
+                print(f"[PASS] integridade da candidata verificada: {manifest['candidate_id']}")
+                print(f"schema: {manifest['schema']}")
+                print(f"participantes: {len(manifest['components'])}")
+    except CandidateError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

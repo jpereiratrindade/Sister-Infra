@@ -295,7 +295,7 @@ composition_candidate_integrity() {
   [[ -f "$manifest" ]] || die "manifest ausente em $candidate"
 
   jq -e \
-    '.schema == "sister.infra.workstation.candidate/1"' \
+    '(.schema == "sister.infra.candidate/1" or .schema == "sister.infra.workstation.candidate/1")' \
     "$manifest" >/dev/null || \
     die "schema de candidata não suportado"
 
@@ -438,7 +438,7 @@ materialize_composition_candidate() {
   fi
 
   jq -e \
-    '.schema == "sister.infra.composition.qualification/1"
+    '(.schema == "sister.infra.composition.qualification/1" or .schema == "sister.infra.composition.qualification/2")
      and .status == "PASS"' \
     <<<"$qualification_json" >/dev/null || \
     die "sister-composition não produziu qualificação PASS"
@@ -566,7 +566,6 @@ payload = {
     "schema": "sister.infra.workstation.candidate/1",
     "candidate_id": candidate_id,
     "created_at_utc": created,
-    "deployment_class": qualification["deployment_class"],
     "control_plane": {
         "component_id": "infra",
         "path": "components/sister-infra",
@@ -586,6 +585,8 @@ payload = {
         "status": "PENDING_BINDINGS",
     },
 }
+if "deployment_class" in qualification:
+    payload["deployment_class"] = qualification["deployment_class"]
 
 Path(out).write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n",
