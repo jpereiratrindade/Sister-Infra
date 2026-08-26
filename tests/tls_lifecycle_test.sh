@@ -19,6 +19,48 @@ fail_test() {
   exit 1
 }
 
+write_resolved_deployment() {
+  python3 - "$SISTER_RESOLVED_DEPLOYMENT_FILE" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+hosts = sys.argv[2:]
+components = [
+    {
+        "component_id": f"component_{index}",
+        "system_id": f"system_{index}",
+        "component_path": f"components/component_{index}",
+        "runtime": {
+            "transport": "tcp",
+            "listen": "127.0.0.1",
+            "port": 18000 + index,
+        },
+        "probe": {"health_path": "/health"},
+        "gateway": {"host": host},
+    }
+    for index, host in enumerate(hosts, start=1)
+]
+out.write_text(
+    json.dumps(
+        {
+            "schema": "sister.infra.deployment.resolved/1",
+            "status": "READY",
+            "deployment_id": "tls-fixture",
+            "candidate_id": "wc-tls-fixture",
+            "composition_id": "tls-fixture",
+            "components": components,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
 setup_case() {
   local name="$1"
 
@@ -32,16 +74,17 @@ setup_case() {
   PROFILE="lan"
   TLS_MODE="lab"
 
-  SISTER_HOST="sister-gateway.test"
-  NEXO_HOST="nexo-gateway.test"
-  PRAXIS_HOST="praxis-gateway.test"
-
   SISTER_DIR="$CASE/sister"
 
   GATEWAY_RUN="$CASE/run"
   TLS_PEM="$CASE/secrets/ecosystem-lab.pem"
   CA_CERT="$CASE/secrets/ecosystem-lab-ca.crt"
   CA_KEY="$CASE/secrets/ecosystem-lab-ca.key"
+  SISTER_RESOLVED_DEPLOYMENT_FILE="$CASE/resolved.json"
+
+  write_resolved_deployment \
+    "alpha-gateway.test" \
+    "beta-gateway.test"
 
   TLS_RENEW_BEFORE_SECONDS=2592000
   CA_RENEW_BEFORE_SECONDS=2592000
@@ -147,9 +190,9 @@ generate_lab_tls
 lab_tls_ca_valid || fail_test "CA nova inválida"
 lab_tls_cert_valid || fail_test "certificado novo inválido"
 lab_tls_cert_signed_by_current_ca || fail_test "assinatura inválida"
-lab_tls_cert_has_all_hosts || fail_test "SANs incompletos"
+lab_tls_cert_matches_expected_hosts || fail_test "SANs divergentes"
 
-pass_test "bootstrap gera cadeia válida com SisTer/Nexo/Praxis"
+pass_test "bootstrap gera cadeia válida com hosts do deployment"
 
 echo
 echo "=== TEST 2: idempotência ==="
@@ -176,13 +219,12 @@ setup_case missing-san
 
 make_ca 3650
 make_cert 825 \
-  "$SISTER_HOST" \
-  "$NEXO_HOST"
+  "alpha-gateway.test"
 
 ca_before="$(sha_file "$CA_CERT")"
 
-lab_tls_cert_has_all_hosts && \
-  fail_test "fixture deveria estar sem SAN Praxis"
+lab_tls_cert_matches_expected_hosts && \
+  fail_test "fixture deveria estar sem SAN beta"
 
 generate_lab_tls
 
@@ -191,8 +233,8 @@ ca_after="$(sha_file "$CA_CERT")"
 [[ "$ca_before" == "$ca_after" ]] || \
   fail_test "CA foi rotacionada ao corrigir somente SAN"
 
-lab_tls_cert_has_all_hosts || \
-  fail_test "Praxis não foi incluído após renovação"
+lab_tls_cert_matches_expected_hosts || \
+  fail_test "beta não foi incluído após renovação"
 
 pass_test "SAN ausente reemite apenas certificado"
 
@@ -202,9 +244,8 @@ setup_case expiring-cert
 
 make_ca 3650
 make_cert 1 \
-  "$SISTER_HOST" \
-  "$NEXO_HOST" \
-  "$PRAXIS_HOST"
+  "alpha-gateway.test" \
+  "beta-gateway.test"
 
 TLS_RENEW_BEFORE_SECONDS=172800
 
@@ -236,9 +277,8 @@ setup_case expiring-ca
 
 make_ca 1
 make_cert 1 \
-  "$SISTER_HOST" \
-  "$NEXO_HOST" \
-  "$PRAXIS_HOST"
+  "alpha-gateway.test" \
+  "beta-gateway.test"
 
 CA_RENEW_BEFORE_SECONDS=172800
 TLS_RENEW_BEFORE_SECONDS=0
@@ -261,10 +301,51 @@ lab_tls_ca_valid || \
 lab_tls_cert_signed_by_current_ca || \
   fail_test "novo certificado não pertence à nova CA"
 
-lab_tls_cert_has_all_hosts || \
+lab_tls_cert_matches_expected_hosts || \
   fail_test "novo certificado perdeu SANs"
 
 pass_test "CA em expiração rotaciona cadeia completa"
+
+echo
+echo "=== TEST 6: adicionar host deriva novo SAN ==="
+setup_case add-host
+
+make_ca 3650
+make_cert 825 \
+  "alpha-gateway.test" \
+  "beta-gateway.test"
+
+write_resolved_deployment \
+  "alpha-gateway.test" \
+  "beta-gateway.test" \
+  "gamma-gateway.test"
+
+generate_lab_tls
+
+lab_tls_cert_matches_expected_hosts || \
+  fail_test "gamma não foi derivado do deployment"
+
+lab_tls_cert_has_host "gamma-gateway.test" || \
+  fail_test "certificado não contém gamma"
+
+pass_test "adicionar gamma ao deployment adiciona SAN"
+
+echo
+echo "=== TEST 7: remover host elimina SAN excedente ==="
+
+write_resolved_deployment \
+  "alpha-gateway.test" \
+  "gamma-gateway.test"
+
+generate_lab_tls
+
+lab_tls_cert_matches_expected_hosts || \
+  fail_test "SANs não acompanham remoção de beta"
+
+lab_tls_cert_has_host "beta-gateway.test" && \
+  fail_test "certificado ainda contém beta removido"
+
+pass_test "remover beta do deployment remove SAN"
 
 echo
 echo "=== RESULTADO ==="

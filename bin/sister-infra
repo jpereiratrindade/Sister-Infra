@@ -70,6 +70,7 @@ load_profile() {
 
 preflight_common() {
   require_command curl
+  require_command jq
   require_command sed
   require_command openssl
 
@@ -135,24 +136,20 @@ TLS_RENEW_BEFORE_SECONDS="${TLS_RENEW_BEFORE_SECONDS:-2592000}"
 CA_RENEW_BEFORE_SECONDS="${CA_RENEW_BEFORE_SECONDS:-2592000}"
 
 lab_tls_expected_hosts() {
-  local seen="|"
-  local host
+  local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
+  [[ -n "$resolved" && -f "$resolved" ]] || \
+    die "deployment resolvido ausente para lifecycle TLS"
 
-  for host in \
-    "${SISTER_HOST:-}" \
-    "${NEXO_HOST:-}" \
-    "${PRAXIS_HOST:-}"
-  do
-    [[ -n "$host" ]] || continue
-
-    case "$seen" in
-      *"|${host}|"*) ;;
-      *)
-        printf '%s\n' "$host"
-        seen="${seen}${host}|"
-        ;;
-    esac
-  done
+  jq -er '
+    if .schema == "sister.infra.deployment.resolved/1"
+       and .status == "READY"
+    then
+      [.components[] | select(.gateway != null) | .gateway.host]
+      | unique[]
+    else
+      error("deployment resolvido inválido para lifecycle TLS")
+    end
+  ' "$resolved" || die "não foi possível derivar hosts TLS do deployment"
 }
 
 lab_tls_ca_parseable() {
@@ -216,17 +213,27 @@ lab_tls_cert_has_host() {
     grep -Fxq "DNS:${host}"
 }
 
-lab_tls_cert_has_all_hosts() {
-  local host
-  local found=0
+lab_tls_certificate_hosts() {
+  lab_tls_cert_parseable || return 1
 
-  while IFS= read -r host; do
-    [[ -n "$host" ]] || continue
-    found=1
-    lab_tls_cert_has_host "$host" || return 1
-  done < <(lab_tls_expected_hosts)
+  openssl x509 \
+      -in "$TLS_PEM" \
+      -noout \
+      -ext subjectAltName 2>/dev/null |
+    tr ',' '\n' |
+    sed 's/^[[:space:]]*//' |
+    sed -n 's/^DNS://p' |
+    sort -u
+}
 
-  [[ "$found" -eq 1 ]]
+lab_tls_cert_matches_expected_hosts() {
+  local actual
+  local expected
+
+  actual="$(lab_tls_certificate_hosts)" || return 1
+  expected="$(lab_tls_expected_hosts | sort -u)" || return 1
+
+  [[ -n "$expected" && "$actual" == "$expected" ]]
 }
 
 lab_tls_ca_key_matches_cert() {
@@ -418,8 +425,8 @@ CFG
   lab_tls_cert_signed_by_current_ca || \
     die "certificado recém-gerado não valida contra a CA corrente"
 
-  lab_tls_cert_has_all_hosts || \
-    die "certificado recém-gerado não cobre todos os hosts configurados"
+  lab_tls_cert_matches_expected_hosts || \
+    die "SANs do certificado recém-gerado divergem do deployment"
 }
 
 generate_lab_tls() {
@@ -442,7 +449,7 @@ generate_lab_tls() {
   if [[ "$ca_ok" -eq 1 ]] &&
      lab_tls_cert_valid &&
      lab_tls_cert_signed_by_current_ca &&
-     lab_tls_cert_has_all_hosts; then
+     lab_tls_cert_matches_expected_hosts; then
     cert_ok=1
   fi
 
@@ -467,8 +474,8 @@ generate_lab_tls() {
       warn "certificado TLS lab expirado ou dentro da janela preventiva; será reemitido."
     elif ! lab_tls_cert_signed_by_current_ca; then
       warn "certificado TLS lab não pertence à CA corrente; será reemitido."
-    elif ! lab_tls_cert_has_all_hosts; then
-      warn "certificado TLS lab não cobre todos os hosts configurados; será reemitido."
+    elif ! lab_tls_cert_matches_expected_hosts; then
+      warn "SANs do certificado TLS divergem do deployment; será reemitido."
     fi
 
     renew_cert=1
