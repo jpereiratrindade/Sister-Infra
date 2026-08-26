@@ -185,19 +185,33 @@ def main() -> None:
             check=True,
         )
 
-        out = accepted(env, "update")
-        release2_id = [
-            line for line in out.splitlines() if line.startswith("wr-")
-        ][-1]
+        out = accepted(env, "release-create")
+        release2_id = out.strip().splitlines()[-1]
         release2 = home / "install" / "releases" / release2_id
         current = home / "install" / "current"
         previous = home / "install" / "previous"
+        accepted(env, "promote", release2_id)
         assert current.resolve() == release2.resolve()
         assert previous.resolve() == release1.resolve()
 
         accepted(env, "rollback")
         assert current.resolve() == release1.resolve()
         assert previous.resolve() == release2.resolve()
+
+        (beta / "main.cpp").write_text("int main() { return 0; }\n// v3\n")
+        subprocess.run(["git", "-C", str(beta), "add", "main.cpp"], check=True)
+        subprocess.run(
+            ["git", "-C", str(beta), "commit", "-q", "-m", "fixture v3"],
+            check=True,
+        )
+        update_out = accepted(env, "update")
+        release3_id = [
+            line for line in update_out.splitlines() if line.startswith("wr-")
+        ][-1]
+        assert current.resolve().name == release3_id
+        assert previous.resolve() == release1.resolve()
+        accepted(env, "rollback")
+        assert current.resolve() == release1.resolve()
 
         manifest2 = json.loads((release2 / "manifest.json").read_text())
         artifact = manifest2["components"][0]["artifacts"][0]

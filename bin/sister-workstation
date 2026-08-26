@@ -57,6 +57,7 @@ Comandos:
   runtime-verify  verifica participantes e gateway declarativos
   release-list    lista releases instaladas
   install [id]    seleciona release e instala unidade systemd (não inicia)
+  promote <id>    promove release já verificada com rollback automático
   activate        migra o runtime atual para o serviço workstation
   start           inicia a instalação workstation
   stop            para a instalação workstation
@@ -1912,6 +1913,10 @@ main() {
     runtime-verify) runtime_verify ;;
     release-list) release_list ;;
     install) install_release "${1:-}" ;;
+    promote)
+      [[ -n "${1:-}" ]] || die "promote requer id"
+      promote_release "$1"
+      ;;
     activate) activate_workstation ;;
     start) start_service ;;
     stop) stop_service ;;
