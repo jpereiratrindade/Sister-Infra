@@ -243,14 +243,16 @@ def main() -> None:
                     home / ".local" / "bin"
                 ),
                 "SISTER_WORKSTATION_TEST_MODE": "1",
-                "SISTER_SOURCE_WORKSPACE": str(workspace),
+                "SISTER_WORKSTATION_CONTROL_PLANE_SOURCE": str(
+                    workspace / "sister-infra"
+                ),
                 "SISTER_WORKSTATION_CONTRACTS_ROOT": str(contracts),
             }
         )
 
         created = run(
             env,
-            "release-create-composition",
+            "candidate-create",
             str(composition),
         )
         assert created.returncode == 0, (

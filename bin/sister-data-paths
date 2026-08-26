@@ -13,6 +13,7 @@ Opções:
   --root <path>          sobrescreve SISTER_DATA_ROOT
   --class <class>        development | candidate | operational
   --candidate-id <id>    obrigatório para candidate
+  --component <id>       participante; pode ser repetido
   -h, --help             mostra esta ajuda
 EOF
 }
@@ -40,6 +41,7 @@ esac
 DATA_ROOT="${SISTER_DATA_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/sister-data}"
 DEPLOYMENT_CLASS=""
 CANDIDATE_ID=""
+COMPONENTS=()
 
 while (($# > 0)); do
     case "$1" in
@@ -56,6 +58,14 @@ while (($# > 0)); do
         --candidate-id)
             (($# >= 2)) || fail "--candidate-id requer argumento"
             CANDIDATE_ID="$2"
+            shift 2
+            ;;
+        --component)
+            (($# >= 2)) || fail "--component requer argumento"
+            case "$2" in
+                *[!A-Za-z0-9._-]*|"") fail "component id inválido" ;;
+            esac
+            COMPONENTS+=("$2")
             shift 2
             ;;
         -h|--help)
@@ -107,8 +117,9 @@ cat <<EOF
 deployment_class=${DEPLOYMENT_CLASS}
 data_root=${DATA_ROOT}
 environment_root=${ENV_ROOT}
-sister_db_data_dir=${ENV_ROOT}/sister/postgres
-sister_backup_dir=${ENV_ROOT}/sister/backups
-nexo_db_data_dir=${ENV_ROOT}/nexo/postgres
-nexo_backup_dir=${ENV_ROOT}/nexo/backups
 EOF
+
+for component_id in "${COMPONENTS[@]}"; do
+    printf 'component_state_dir=%s\t%s\n' \
+        "$component_id" "${ENV_ROOT}/components/${component_id}"
+done

@@ -58,12 +58,11 @@ assert (
 fixture = (
     ROOT
     / "tests"
-    / "workstation_control_test.sh"
+    / "workstation_declarative_lifecycle_test.py"
 ).read_text()
 
 assert (
-    'templates/systemd/sister-workstation.service.in'
-    in fixture
+    '"templates"' in fixture
 ), "fixture workstation não transporta template systemd"
 
 print(

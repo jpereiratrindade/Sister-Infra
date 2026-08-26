@@ -93,10 +93,6 @@ def rejected(env: dict[str, str], *args: str) -> str:
 
 def main() -> None:
     source = CLI.read_text(encoding="utf-8").lower()
-    lifecycle = source[
-        source.index("declarative_release_integrity() {"):
-        source.index("release_build_qualification() {")
-    ]
     for forbidden in (
         "sister_nexo",
         "sister-nexo",
@@ -108,7 +104,7 @@ def main() -> None:
         "8093",
         "8094",
     ):
-        assert forbidden not in lifecycle, (
+        assert forbidden not in source, (
             f"lifecycle declarativo contém conhecimento concreto: {forbidden}"
         )
 
@@ -149,7 +145,9 @@ def main() -> None:
         env.update(
             {
                 "HOME": str(home),
-                "SISTER_SOURCE_WORKSPACE": str(workspace),
+                "SISTER_WORKSTATION_CONTROL_PLANE_SOURCE": str(
+                    workspace / "sister-infra"
+                ),
                 "SISTER_WORKSTATION_INSTALL_ROOT": str(home / "install"),
                 "SISTER_WORKSTATION_CONFIG_ROOT": str(home / "config"),
                 "SISTER_WORKSTATION_STATE_ROOT": str(home / "state"),

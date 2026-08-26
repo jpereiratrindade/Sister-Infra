@@ -20,15 +20,13 @@ UNIT_FILE="$SYSTEMD_USER_ROOT/$UNIT_NAME"
 BIN_ROOT="${SISTER_WORKSTATION_BIN_ROOT:-$HOME_DIR/.local/bin}"
 CLI_LINK="$BIN_ROOT/sister-infra"
 
-SOURCE_WORKSPACE_FILE="$CONFIG_ROOT/source-workspace"
 RUNTIME_ENV="$CONFIG_ROOT/runtime.env"
 TLS_CONFIG="$CONFIG_ROOT/tls"
-NEXO_ENV="$CONFIG_ROOT/nexo.env"
-SISTER_ENV="$CONFIG_ROOT/sister.env"
 
 COMPOSITION_FILE="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONFIG_ROOT/composition.json}"
 DEPLOYMENT_FILE="${SISTER_WORKSTATION_DEPLOYMENT_FILE:-$CONFIG_ROOT/deployment.json}"
 COMPOSITION_CONTRACTS_ROOT="${SISTER_WORKSTATION_CONTRACTS_ROOT:-}"
+CONTROL_PLANE_SOURCE="${SISTER_WORKSTATION_CONTROL_PLANE_SOURCE:-$INFRA_ROOT}"
 
 TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
 
@@ -48,8 +46,7 @@ Comandos:
   doctor          valida host, fontes, Git, systemd e layout
   plan            mostra diferença entre release atual e fontes, sem mutar
   release-create  cria release declarativa qualificada e READY
-  release-create-legacy  cria release pelo caminho concreto de transição
-  release-create-composition [arquivo]  materializa candidata declarativa
+  candidate-create [arquivo]  materializa candidata qualificada, sem bindings
   candidate-verify <id>  verifica candidata declarativa materializada
   runtime-start   inicia participantes e gateway da release declarativa
   runtime-stop    para gateway e participantes da release declarativa
@@ -80,44 +77,6 @@ ensure_dirs() {
     "$STATE_ROOT" \
     "$SYSTEMD_USER_ROOT" \
     "$BIN_ROOT"
-}
-
-source_workspace_guess() {
-  if [[ -n "${SISTER_SOURCE_WORKSPACE:-}" ]]; then
-    printf '%s\n' "$SISTER_SOURCE_WORKSPACE"
-    return 0
-  fi
-
-  if [[ -f "$SOURCE_WORKSPACE_FILE" ]]; then
-    cat "$SOURCE_WORKSPACE_FILE"
-    return 0
-  fi
-
-  local parent
-  parent="$(dirname "$INFRA_ROOT")"
-
-  if [[ -d "$parent/SisTer/.git" &&
-        -d "$parent/sister-nexo/.git" &&
-        -d "$parent/sister-praxis/.git" &&
-        -d "$parent/sister-infra/.git" ]]; then
-    printf '%s\n' "$parent"
-    return 0
-  fi
-
-  return 1
-}
-
-repo_path() {
-  local workspace="$1"
-  local kind="$2"
-
-  case "$kind" in
-    infra)  printf '%s\n' "$workspace/sister-infra" ;;
-    sister) printf '%s\n' "$workspace/SisTer" ;;
-    nexo)   printf '%s\n' "$workspace/sister-nexo" ;;
-    praxis) printf '%s\n' "$workspace/sister-praxis" ;;
-    *) die "componente desconhecido: $kind" ;;
-  esac
 }
 
 require_repo_clean() {
@@ -172,203 +131,30 @@ manifest_path() {
   printf '%s\n' "$1/manifest.json"
 }
 
-manifest_value() {
-  local release="$1"
-  local jq_expr="$2"
-  jq -r "$jq_expr" "$(manifest_path "$release")"
-}
-
 release_integrity() {
   local release="$1"
 
   [[ -d "$release" ]] || die "release ausente: $release"
   [[ -f "$(manifest_path "$release")" ]] || die "manifest ausente em $release"
-
-  if jq -e \
-      '.schema == "sister.infra.workstation.release/3"' \
-      "$(manifest_path "$release")" >/dev/null; then
-    declarative_release_integrity "$release"
-    return
-  fi
-
-  local component repo expected actual tracked
-
-  for component in infra sister nexo praxis; do
-    case "$component" in
-      infra) repo="$release/components/sister-infra" ;;
-      sister) repo="$release/components/SisTer" ;;
-      nexo) repo="$release/components/sister-nexo" ;;
-      praxis) repo="$release/components/sister-praxis" ;;
-    esac
-
-    [[ -d "$repo/.git" ]] || die "release corrompida: $component sem .git"
-
-    expected="$(manifest_value "$release" ".components.$component.commit")"
-    actual="$(git -C "$repo" rev-parse HEAD)"
-
-    [[ "$expected" == "$actual" ]] || \
-      die "release corrompida: $component HEAD divergiu do manifesto"
-
-    tracked="$(git -C "$repo" status --porcelain --untracked-files=no)"
-    [[ -z "$tracked" ]] || {
-      printf '%s\n' "$tracked" >&2
-      die "release corrompida: arquivos rastreados de $component foram alterados"
-    }
-  done
-
-  local build_status
-  build_status="$(jq -r '.qualification.build.status // "UNQUALIFIED"' "$(manifest_path "$release")")"
-
-  if [[ "$build_status" == "PASS" ]]; then
-    local artifact component_name relpath expected_hash actual_hash absolute
-
-    while IFS=$'\t' read -r artifact component_name relpath expected_hash; do
-      [[ -n "$artifact" ]] || continue
-
-      case "$component_name" in
-        sister) absolute="$release/components/SisTer/$relpath" ;;
-        nexo) absolute="$release/components/sister-nexo/$relpath" ;;
-        praxis) absolute="$release/components/sister-praxis/$relpath" ;;
-        *) die "manifesto contém componente de artefato desconhecido: $component_name" ;;
-      esac
-
-      [[ -x "$absolute" ]] || \
-        die "release corrompida: artefato ausente/não executável: $artifact"
-
-      actual_hash="$(sha256sum "$absolute" | awk '{print $1}')"
-
-      [[ "$actual_hash" == "$expected_hash" ]] || \
-        die "release corrompida: hash divergente para $artifact"
-    done < <(
-      jq -r '
-        .qualification.build.artifacts
-        | to_entries[]
-        | [.key, .value.component, .value.path, .value.sha256]
-        | @tsv
-      ' "$(manifest_path "$release")"
-    )
-  fi
-
-  pass "integridade da release $(basename "$release")"
+  declarative_release_integrity "$release"
 }
 
-write_source_workspace() {
-  local workspace="$1"
-
+sync_runtime_env() {
   ensure_dirs
-  printf '%s\n' "$(cd "$workspace" && pwd -P)" > "$SOURCE_WORKSPACE_FILE"
-  chmod 600 "$SOURCE_WORKSPACE_FILE"
-}
-
-ensure_runtime_env() {
-  ensure_dirs
-
-  if [[ ! -f "$RUNTIME_ENV" ]]; then
-    cat > "$RUNTIME_ENV" <<'EOF'
-NO_PROXY=localhost,127.0.0.1,::1,10.163.80.176,sister-gateway.test,nexo-gateway.test,praxis-gateway.test
-no_proxy=localhost,127.0.0.1,::1,10.163.80.176,sister-gateway.test,nexo-gateway.test,praxis-gateway.test
-EOF
-    chmod 600 "$RUNTIME_ENV"
-  fi
-}
-
-copy_operational_config() {
-  local workspace="$1"
-  local release="$2"
-
-  ensure_runtime_env
-
-  local source_infra source_nexo source_sister
-  source_infra="$(repo_path "$workspace" infra)"
-  source_nexo="$(repo_path "$workspace" nexo)"
-  source_sister="$(repo_path "$workspace" sister)"
-
-  # TLS é configuração persistente de implantação.
-  #
-  # Preserve o diretório Git-tracked secrets/ da release, inclusive
-  # secrets/.gitkeep. Material TLS entra arquivo a arquivo por symlink.
-  mkdir -p "$TLS_CONFIG"
-  chmod 700 "$TLS_CONFIG"
-
-  if [[ -d "$source_infra/secrets" ]]; then
-    if [[ -z "$(find "$TLS_CONFIG" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -print -quit 2>/dev/null)" ]]; then
-      local source_secret
-      local secret_name
-
-      while IFS= read -r -d '' source_secret; do
-        secret_name="$(basename "$source_secret")"
-        [[ "$secret_name" != ".gitkeep" ]] || continue
-        cp -p "$source_secret" "$TLS_CONFIG/$secret_name"
-      done < <(
-        find "$source_infra/secrets" \
-          -mindepth 1 \
-          -maxdepth 1 \
-          -type f \
-          -print0
-      )
-
-      chmod 700 "$TLS_CONFIG"
-      find "$TLS_CONFIG" -type f -name '*.key' -exec chmod 600 {} +
-      find "$TLS_CONFIG" -type f -name '*.pem' -exec chmod 600 {} +
-    fi
-  fi
-
-  local release_secrets="$release/components/sister-infra/secrets"
-  mkdir -p "$release_secrets"
-
-  local persisted_secret
-  local persisted_name
-  local tracked_path
-
-  while IFS= read -r -d '' persisted_secret; do
-    persisted_name="$(basename "$persisted_secret")"
-    [[ "$persisted_name" != ".gitkeep" ]] || continue
-
-    tracked_path="secrets/$persisted_name"
-
-    if git -C "$release/components/sister-infra" \
-        ls-files --error-unmatch "$tracked_path" >/dev/null 2>&1; then
-      die "configuração TLS colide com arquivo rastreado: $tracked_path"
-    fi
-
-    rm -f "$release_secrets/$persisted_name"
-    ln -s "$persisted_secret" "$release_secrets/$persisted_name"
-  done < <(
-    find "$TLS_CONFIG" \
-      -mindepth 1 \
-      -maxdepth 1 \
-      -type f \
-      ! -name '.gitkeep' \
-      -print0
-  )
-
-  # Nexo exige .env atualmente. Persista-o fora da release.
-  if [[ ! -f "$NEXO_ENV" ]]; then
-    if [[ -f "$source_nexo/.env" ]]; then
-      cp -p "$source_nexo/.env" "$NEXO_ENV"
-      chmod 600 "$NEXO_ENV"
-    elif [[ -f "$source_nexo/.env.example" ]]; then
-      cp -p "$source_nexo/.env.example" "$NEXO_ENV"
-      chmod 600 "$NEXO_ENV"
-      warn "Nexo não possuía .env; copiado .env.example para $NEXO_ENV"
-    fi
-  fi
-
-  if [[ -f "$NEXO_ENV" ]]; then
-    rm -f "$release/components/sister-nexo/.env"
-    ln -s "$NEXO_ENV" "$release/components/sister-nexo/.env"
-  fi
-
-  # SisTer segue a mesma política se existir .env local.
-  if [[ ! -f "$SISTER_ENV" && -f "$source_sister/.env" ]]; then
-    cp -p "$source_sister/.env" "$SISTER_ENV"
-    chmod 600 "$SISTER_ENV"
-  fi
-
-  if [[ -f "$SISTER_ENV" ]]; then
-    rm -f "$release/components/SisTer/.env"
-    ln -s "$SISTER_ENV" "$release/components/SisTer/.env"
-  fi
+  local release resolved values
+  release="$(current_release_path)" || die "nenhuma release current"
+  resolved="$(release_resolved_deployment "$release")"
+  values="$(jq -r '
+    ["localhost", "127.0.0.1", "::1"]
+    + [.components[] | select(.runtime.transport == "tcp") | .runtime.listen]
+    + [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(",")
+  ' "$resolved")"
+  {
+    printf 'NO_PROXY=%s\n' "$values"
+    printf 'no_proxy=%s\n' "$values"
+  } > "$RUNTIME_ENV"
+  chmod 600 "$RUNTIME_ENV"
 }
 
 clone_component() {
@@ -569,19 +355,14 @@ composition_candidate_integrity() {
   pass "integridade da candidata $(basename "$candidate")"
 }
 
-release_create_composition() {
+materialize_composition_candidate() {
   ensure_dirs
 
   local composition
   composition="$(composition_path "${1:-}")"
 
-  local workspace
-  workspace="$(source_workspace_guess)" || \
-    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
-  workspace="$(cd "$workspace" && pwd -P)"
-
   local infra
-  infra="$(repo_path "$workspace" infra)"
+  infra="$(cd "$CONTROL_PLANE_SOURCE" && pwd -P)"
   require_repo_clean "$infra" "sister-infra"
 
   local artifact_bundle
@@ -903,14 +684,8 @@ declarative_release_integrity() {
 }
 
 declarative_source_files() {
-  local workspace
-  workspace="$(source_workspace_guess)" || \
-    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
-  workspace="$(cd "$workspace" && pwd -P)"
-  write_source_workspace "$workspace"
-
   local control_plane
-  control_plane="$(repo_path "$workspace" infra)"
+  control_plane="$(cd "$CONTROL_PLANE_SOURCE" && pwd -P)"
   require_repo_clean "$control_plane" "sister-infra"
 
   local composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-}"
@@ -932,7 +707,7 @@ release_create_declarative() {
   IFS=$'\t' read -r composition deployment < <(declarative_source_files)
 
   local candidate_output candidate_id candidate
-  candidate_output="$(release_create_composition "$composition")"
+  candidate_output="$(materialize_composition_candidate "$composition")"
   printf '%s\n' "$candidate_output"
   candidate_id="$(printf '%s\n' "$candidate_output" | tail -n1)"
   candidate="$CANDIDATES_ROOT/$candidate_id"
@@ -1119,8 +894,8 @@ runtime_start() {
     components_action_reverse "$release" stop
     die "participante falhou no health após start"
   }
-  declarative_gateway_action "$release" declarative-up || {
-    declarative_gateway_action "$release" declarative-down || true
+  declarative_gateway_action "$release" up || {
+    declarative_gateway_action "$release" down || true
     components_action_reverse "$release" stop
     die "gateway declarativo não iniciou"
   }
@@ -1130,7 +905,7 @@ runtime_start() {
 runtime_stop() {
   local release
   release="$(current_release_path)" || die "nenhuma release current"
-  declarative_gateway_action "$release" declarative-down || \
+  declarative_gateway_action "$release" down || \
     warn "gateway declarativo reportou falha ao parar"
   components_action_reverse "$release" stop
   pass "runtime declarativo parado"
@@ -1141,7 +916,7 @@ runtime_status() {
   release="$(current_release_path)" || die "nenhuma release current"
   declarative_release_integrity "$release"
   components_action_forward "$release" status
-  declarative_gateway_action "$release" declarative-status
+  declarative_gateway_action "$release" status
 }
 
 runtime_verify() {
@@ -1149,294 +924,19 @@ runtime_verify() {
   release="$(current_release_path)" || die "nenhuma release current"
   declarative_release_integrity "$release"
   components_action_forward "$release" health
-  declarative_gateway_action "$release" declarative-verify
+  declarative_gateway_action "$release" verify
   pass "workstation declarativa verificada"
-}
-
-release_build_qualification() {
-  local workspace="$1"
-  local sister_commit="$2"
-  local nexo_commit="$3"
-  local praxis_commit="$4"
-  local evidence_dir="$5"
-
-  mkdir -p "$evidence_dir"
-
-  local short_root
-  short_root="$(mktemp -d /tmp/si-wsqual.XXXXXX)"
-
-  local component source commit clone build log
-
-  for component in sister nexo praxis; do
-    case "$component" in
-      sister)
-        source="$(repo_path "$workspace" sister)"
-        commit="$sister_commit"
-        ;;
-      nexo)
-        source="$(repo_path "$workspace" nexo)"
-        commit="$nexo_commit"
-        ;;
-      praxis)
-        source="$(repo_path "$workspace" praxis)"
-        commit="$praxis_commit"
-        ;;
-    esac
-
-    clone="$short_root/$component"
-    build="$clone/build"
-    log="$evidence_dir/${component}.log"
-
-    if ! {
-      git clone --no-hardlinks --quiet "$source" "$clone"
-      git -C "$clone" checkout --quiet --detach "$commit"
-      cmake -S "$clone" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release
-      cmake --build "$build"
-      ctest --test-dir "$build" --output-on-failure
-    } > >(tee "$log") 2>&1; then
-      rm -rf "$short_root"
-      die "build/test qualification falhou para $component"
-    fi
-
-    pass "source qualification: $component"
-  done
-
-  rm -rf "$short_root"
-}
-
-find_runtime_artifact() {
-  local component="$1"
-  local root="$2"
-  local candidate=""
-
-  case "$component" in
-    sister)
-      for candidate in "$root/build/apps/sisterd/sisterd" "$root/build/sisterd"; do
-        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-      done
-      find "$root/build" -type f -name sisterd -perm -u+x -print -quit 2>/dev/null
-      ;;
-    nexo)
-      for candidate in "$root/build/sister-nexo"; do
-        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-      done
-      find "$root/build" -type f -name sister-nexo -perm -u+x -print -quit 2>/dev/null
-      ;;
-    praxis)
-      for candidate in "$root/build/sister-praxis-http"; do
-        [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-      done
-      find "$root/build" -type f -name sister-praxis-http -perm -u+x -print -quit 2>/dev/null
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-materialize_release_build() {
-  local release="$1"
-  local component root
-
-  for component in sister nexo praxis; do
-    case "$component" in
-      sister) root="$release/components/SisTer" ;;
-      nexo) root="$release/components/sister-nexo" ;;
-      praxis) root="$release/components/sister-praxis" ;;
-    esac
-
-    cmake -S "$root" -B "$root/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
-    cmake --build "$root/build"
-    pass "release build: $component"
-  done
 }
 
 require_release_build_qualified() {
   local release="$1"
   local status
-
-  if jq -e '.schema == "sister.infra.workstation.release/3"' \
-      "$(manifest_path "$release")" >/dev/null; then
-    status="$(jq -r '
-      if .qualification.status == "PASS" and .deployment.status == "READY"
-      then "PASS" else "UNQUALIFIED" end
-    ' "$(manifest_path "$release")")"
-    [[ "$status" == "PASS" ]] || \
-      die "release declarativa não possui qualification PASS e deployment READY: $(basename "$release")"
-    return
-  fi
-
-  status="$(jq -r '.qualification.build.status // "UNQUALIFIED"' "$(manifest_path "$release")")"
-
+  status="$(jq -r '
+    if .qualification.status == "PASS" and .deployment.status == "READY"
+    then "PASS" else "UNQUALIFIED" end
+  ' "$(manifest_path "$release")")"
   [[ "$status" == "PASS" ]] || \
-    die "release não possui build qualification PASS: $(basename "$release")"
-}
-
-release_create_legacy() {
-  ensure_dirs
-
-  local workspace
-  workspace="$(source_workspace_guess)" || \
-    die "source workspace desconhecido; defina SISTER_SOURCE_WORKSPACE"
-
-  workspace="$(cd "$workspace" && pwd -P)"
-  write_source_workspace "$workspace"
-
-  local infra sister nexo praxis
-  infra="$(repo_path "$workspace" infra)"
-  sister="$(repo_path "$workspace" sister)"
-  nexo="$(repo_path "$workspace" nexo)"
-  praxis="$(repo_path "$workspace" praxis)"
-
-  require_repo_clean "$infra" "sister-infra"
-  require_repo_clean "$sister" "SisTer"
-  require_repo_clean "$nexo" "Nexo"
-  require_repo_clean "$praxis" "Praxis"
-
-  local infra_commit sister_commit nexo_commit praxis_commit
-  local infra_short sister_short nexo_short praxis_short
-
-  infra_commit="$(repo_head "$infra")"
-  sister_commit="$(repo_head "$sister")"
-  nexo_commit="$(repo_head "$nexo")"
-  praxis_commit="$(repo_head "$praxis")"
-
-  infra_short="$(repo_short "$infra")"
-  sister_short="$(repo_short "$sister")"
-  nexo_short="$(repo_short "$nexo")"
-  praxis_short="$(repo_short "$praxis")"
-
-  local timestamp id release tmp
-  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  id="ws-${timestamp}-${infra_short}-${sister_short}-${nexo_short}-${praxis_short}"
-  release="$RELEASES_ROOT/$id"
-  tmp="$RELEASES_ROOT/.creating-$id-$$"
-
-  [[ ! -e "$release" ]] || die "release já existe: $id"
-
-  rm -rf "$tmp"
-  mkdir -p "$tmp/components" "$tmp/evidence/build"
-
-  info "qualificando fontes da release $id"
-
-  release_build_qualification \
-    "$workspace" \
-    "$sister_commit" \
-    "$nexo_commit" \
-    "$praxis_commit" \
-    "$tmp/evidence/build"
-
-  info "materializando release $id"
-
-  clone_component "$infra" "$tmp/components/sister-infra" "$infra_commit"
-  clone_component "$sister" "$tmp/components/SisTer" "$sister_commit"
-  clone_component "$nexo" "$tmp/components/sister-nexo" "$nexo_commit"
-  clone_component "$praxis" "$tmp/components/sister-praxis" "$praxis_commit"
-
-  copy_operational_config "$workspace" "$tmp"
-  materialize_release_build "$tmp"
-
-  local sister_artifact nexo_artifact praxis_artifact
-  local sister_rel nexo_rel praxis_rel
-  local sister_hash nexo_hash praxis_hash
-
-  sister_artifact="$(find_runtime_artifact sister "$tmp/components/SisTer")"
-  nexo_artifact="$(find_runtime_artifact nexo "$tmp/components/sister-nexo")"
-  praxis_artifact="$(find_runtime_artifact praxis "$tmp/components/sister-praxis")"
-
-  [[ -x "$sister_artifact" ]] || die "artefato sisterd não materializado"
-  [[ -x "$nexo_artifact" ]] || die "artefato sister-nexo não materializado"
-  [[ -x "$praxis_artifact" ]] || die "artefato sister-praxis-http não materializado"
-
-  sister_rel="${sister_artifact#"$tmp/components/SisTer/"}"
-  nexo_rel="${nexo_artifact#"$tmp/components/sister-nexo/"}"
-  praxis_rel="${praxis_artifact#"$tmp/components/sister-praxis/"}"
-
-  sister_hash="$(sha256sum "$sister_artifact" | awk '{print $1}')"
-  nexo_hash="$(sha256sum "$nexo_artifact" | awk '{print $1}')"
-  praxis_hash="$(sha256sum "$praxis_artifact" | awk '{print $1}')"
-
-  python3 - "$tmp/manifest.json" \
-    "$id" "$timestamp" "$workspace" \
-    "$infra_commit" "$sister_commit" "$nexo_commit" "$praxis_commit" \
-    "$sister_rel" "$sister_hash" \
-    "$nexo_rel" "$nexo_hash" \
-    "$praxis_rel" "$praxis_hash" <<'PY_MANIFEST_OPS001C'
-import json
-import sys
-from pathlib import Path
-
-(
-    out, rid, created, workspace,
-    infra, sister, nexo, praxis,
-    sister_path, sister_hash,
-    nexo_path, nexo_hash,
-    praxis_path, praxis_hash,
-) = sys.argv[1:]
-
-payload = {
-    "schema": "sister.infra.workstation.release/2",
-    "release_id": rid,
-    "created_at_utc": created,
-    "source_workspace": workspace,
-    "deployment_class": "workstation",
-    "isolation": {
-        "source_code": "independent-local-clone",
-        "configuration": "persistent-outside-release",
-        "data_plane": "component-entrypoints-current-contracts",
-    },
-    "components": {
-        "infra": {"commit": infra},
-        "sister": {"commit": sister},
-        "nexo": {"commit": nexo},
-        "praxis": {"commit": praxis},
-    },
-    "qualification": {
-        "build": {
-            "status": "PASS",
-            "profile": "Release",
-            "source_tests": "PASS",
-            "artifacts": {
-                "sisterd": {
-                    "component": "sister",
-                    "path": sister_path,
-                    "sha256": sister_hash,
-                },
-                "sister-nexo": {
-                    "component": "nexo",
-                    "path": nexo_path,
-                    "sha256": nexo_hash,
-                },
-                "sister-praxis-http": {
-                    "component": "praxis",
-                    "path": praxis_path,
-                    "sha256": praxis_hash,
-                },
-            },
-        }
-    },
-}
-
-Path(out).write_text(json.dumps(payload, indent=2) + "\n")
-PY_MANIFEST_OPS001C
-
-  printf '%s\n' "$id" > "$tmp/RELEASE_ID"
-  printf '%s\n' "SISTER-INFRA-OPS-001C" > "$tmp/QUALIFICATION"
-
-  if ! ( release_integrity "$tmp" ); then
-    rm -rf "$tmp"
-    die "candidata de release falhou na validação de integridade"
-  fi
-
-  mv "$tmp" "$release"
-
-  release_integrity "$release"
-  require_release_build_qualified "$release"
-
-  printf '%s\n' "$id" > "$STATE_ROOT/last-created-release"
-
-  pass "release build-qualified criada: $id"
-  printf '%s\n' "$id"
+    die "release não possui qualification PASS e deployment READY: $(basename "$release")"
 }
 
 release_create() {
@@ -1451,16 +951,8 @@ render_unit() {
   # A unit instalada deriva exclusivamente do template pertencente à
   # release selecionada. O control plane não mantém uma segunda
   # representação do contrato systemd.
-  local template schema
-  schema="$(jq -r '.schema' "$CURRENT_LINK/manifest.json")"
-  if [[ "$schema" == "sister.infra.workstation.release/3" ]]; then
-    template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
-  else
-    template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation-legacy.service.in"
-    if [[ ! -f "$template" ]]; then
-      template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
-    fi
-  fi
+  local template
+  template="${CURRENT_LINK}/components/sister-infra/templates/systemd/sister-workstation.service.in"
 
   [[ -f "$template" ]] || \
     die "template systemd ausente na release current: $template"
@@ -1536,7 +1028,7 @@ install_release() {
   ln -sfn "$release" "$CURRENT_LINK"
 
   render_unit
-  ensure_runtime_env
+  sync_runtime_env
   ln -sfn "$CURRENT_LINK/components/sister-infra/bin/sister-infra" "$CLI_LINK"
 
   systemctl_user daemon-reload
@@ -1552,12 +1044,7 @@ verify_installed() {
   release_integrity "$release"
   require_release_build_qualified "$release"
 
-  if jq -e '.schema == "sister.infra.workstation.release/3"' \
-      "$release/manifest.json" >/dev/null; then
-    runtime_verify
-  else
-    "$release/components/sister-infra/bin/sister-infra" verify --profile lan
-  fi
+  runtime_verify
   pass "workstation verificado"
 }
 
@@ -1603,20 +1090,6 @@ activate_workstation() {
     return 0
   fi
 
-  local workspace=""
-  workspace="$(source_workspace_guess || true)"
-  local source_infra=""
-
-  if [[ -n "$workspace" && -x "$workspace/sister-infra/bin/sister-infra" ]]; then
-    source_infra="$workspace/sister-infra/bin/sister-infra"
-  fi
-
-  if [[ -n "$source_infra" ]]; then
-    info "handover: parando runtime LAN da árvore de desenvolvimento"
-    "$source_infra" down --profile lan || \
-      warn "runtime de desenvolvimento reportou falha ao parar"
-  fi
-
   if systemctl_user start "$UNIT_NAME"; then
     if verify_installed; then
       systemctl_user enable "$UNIT_NAME" >/dev/null
@@ -1629,12 +1102,7 @@ activate_workstation() {
   systemctl_user disable "$UNIT_NAME" >/dev/null 2>&1 || true
   systemctl_user stop "$UNIT_NAME" >/dev/null 2>&1 || true
 
-  if [[ -n "$source_infra" ]]; then
-    "$source_infra" up --profile lan || \
-      warn "não foi possível restaurar runtime de desenvolvimento automaticamente"
-  fi
-
-  die "handover falhou"
+  die "ativação falhou"
 }
 
 promote_release() {
@@ -1664,6 +1132,7 @@ promote_release() {
   ln -sfn "$new_release" "$CURRENT_LINK"
 
   render_unit
+  sync_runtime_env
   ln -sfn "$CURRENT_LINK/components/sister-infra/bin/sister-infra" "$CLI_LINK"
   systemctl_user daemon-reload
 
@@ -1725,6 +1194,7 @@ rollback_workstation() {
   ln -sfn "$current" "$PREVIOUS_LINK"
 
   render_unit
+  sync_runtime_env
   systemctl_user daemon-reload
 
   if [[ "$was_active" -eq 1 ]]; then
@@ -1755,7 +1225,7 @@ doctor() {
   local failures=0
   local cmd
 
-  for cmd in bash git python3 jq systemctl podman openssl curl; do
+  for cmd in bash git python3 jq systemctl openssl curl; do
     if command -v "$cmd" >/dev/null 2>&1; then
       pass "$cmd"
     else
@@ -1764,30 +1234,31 @@ doctor() {
     fi
   done
 
-  local workspace=""
-  workspace="$(source_workspace_guess || true)"
-
-  if [[ -z "$workspace" ]]; then
-    warn "source workspace ainda não registrado"
+  if [[ -d "$CONTROL_PLANE_SOURCE/.git" ]]; then
+    if [[ -z "$(git -C "$CONTROL_PLANE_SOURCE" status --porcelain)" ]]; then
+      pass "control plane clean @ $(repo_short "$CONTROL_PLANE_SOURCE")"
+    else
+      warn "control plane possui alterações; release-create será bloqueado"
+    fi
   else
-    pass "source workspace: $workspace"
+    printf '[FAIL] control plane ausente: %s\n' "$CONTROL_PLANE_SOURCE" >&2
+    failures=$((failures + 1))
+  fi
 
-    local kind repo
-
-    for kind in infra sister nexo praxis; do
-      repo="$(repo_path "$workspace" "$kind")"
-
-      if [[ -d "$repo/.git" ]]; then
-        if [[ -z "$(git -C "$repo" status --porcelain)" ]]; then
-          pass "$kind clean @ $(git -C "$repo" rev-parse --short HEAD)"
-        else
-          warn "$kind possui alterações; release-create será bloqueado"
-        fi
+  local composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONTROL_PLANE_SOURCE/config/compositions/workstation.json}"
+  local resolved=""
+  if resolved="$("$INFRA_ROOT/bin/sister-composition" resolve "$composition" --json)"; then
+    local component_id root
+    while IFS=$'\t' read -r component_id root; do
+      if [[ -d "$root/.git" && -z "$(git -C "$root" status --porcelain)" ]]; then
+        pass "$component_id clean @ $(repo_short "$root")"
       else
-        printf '[FAIL] %s ausente: %s\n' "$kind" "$repo" >&2
+        warn "$component_id ausente ou dirty: $root"
         failures=$((failures + 1))
       fi
-    done
+    done < <(jq -r '.components[] | [.component_id,.root] | @tsv' <<<"$resolved")
+  else
+    failures=$((failures + 1))
   fi
 
   if [[ "$TEST_MODE" == "1" ]] || systemctl --user show-environment >/dev/null 2>&1; then
@@ -1806,10 +1277,6 @@ doctor() {
 }
 
 plan() {
-  local workspace
-  workspace="$(source_workspace_guess)" || die "source workspace desconhecido"
-
-  printf 'Source workspace: %s\n' "$workspace"
   printf 'Current release:  %s\n' "$(current_release_id)"
   printf 'Previous release: %s\n' "$(previous_release_id)"
   printf '\n%-10s %-12s %-12s %s\n' "component" "source" "current" "change"
@@ -1817,16 +1284,19 @@ plan() {
   local release=""
   release="$(current_release_path || true)"
 
-  local kind repo source_short current_short change
+  local composition resolved component_id repo source_short current_short change
+  composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONTROL_PLANE_SOURCE/config/compositions/workstation.json}"
+  resolved="$("$INFRA_ROOT/bin/sister-composition" resolve "$composition" --json)"
 
-  for kind in infra sister nexo praxis; do
-    repo="$(repo_path "$workspace" "$kind")"
+  while IFS=$'\t' read -r component_id repo; do
     source_short="$(git -C "$repo" rev-parse --short=12 HEAD)"
     current_short="-"
     change="NEW"
 
     if [[ -n "$release" && -f "$release/manifest.json" ]]; then
-      current_short="$(jq -r ".components.$kind.commit" "$release/manifest.json" | cut -c1-12)"
+      current_short="$(jq -r --arg id "$component_id" \
+        '.components[] | select(.component_id == $id) | .commit' \
+        "$release/manifest.json" | cut -c1-12)"
 
       if [[ "$source_short" == "$current_short" ]]; then
         change="SAME"
@@ -1835,8 +1305,8 @@ plan() {
       fi
     fi
 
-    printf '%-10s %-12s %-12s %s\n' "$kind" "$source_short" "$current_short" "$change"
-  done
+    printf '%-10s %-12s %-12s %s\n' "$component_id" "$source_short" "$current_short" "$change"
+  done < <(jq -r '.components[] | [.component_id,.root] | @tsv' <<<"$resolved")
 
   printf '\nNo changes performed.\n'
 }
@@ -1860,12 +1330,7 @@ status() {
     release_integrity "$release"
 
     printf '\n--- ecosystem status ---\n'
-    if jq -e '.schema == "sister.infra.workstation.release/3"' \
-        "$release/manifest.json" >/dev/null; then
-      runtime_status || true
-    else
-      "$release/components/sister-infra/bin/sister-infra" status --profile lan || true
-    fi
+    runtime_status || true
   fi
 }
 
@@ -1874,7 +1339,7 @@ release_list() {
 
   local d
 
-  for d in "$RELEASES_ROOT"/ws-* "$RELEASES_ROOT"/wr-*; do
+  for d in "$RELEASES_ROOT"/wr-*; do
     [[ -d "$d" ]] || continue
 
     local id marker=""
@@ -1903,10 +1368,9 @@ main() {
   case "$command" in
     doctor) doctor ;;
     plan) plan ;;
-    release-create-composition) release_create_composition "${1:-}" ;;
+    candidate-create) materialize_composition_candidate "${1:-}" ;;
     candidate-verify) candidate_verify "${1:-}" ;;
     release-create) release_create ;;
-    release-create-legacy) release_create_legacy ;;
     runtime-start) runtime_start ;;
     runtime-stop) runtime_stop ;;
     runtime-status) runtime_status ;;

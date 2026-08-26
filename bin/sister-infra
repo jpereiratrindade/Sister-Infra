@@ -3,7 +3,6 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-WORKSPACE_DIR="$(dirname "$INFRA_ROOT")"
 RUN_ROOT="${SISTER_INFRA_RUN_ROOT:-$INFRA_ROOT/.run}"
 GATEWAY_RUN="$RUN_ROOT/gateway"
 LOG_ROOT="$RUN_ROOT/logs"
@@ -18,16 +17,11 @@ Uso:
   ./bin/sister-infra <comando> [--profile dev|lan|production]
 
 Comandos:
-  bootstrap   prepara diretórios e TLS do perfil
-  up          sobe Nexo, SisTer e o gateway único
-  down        derruba gateway e tenta parar SisTer/Nexo sem destruir dados
-  status      mostra saúde, processos e URLs
-  verify      valida configuração e endpoints
-  gateway     reinicia apenas o HAProxy do sister-infra
-  declarative-up      inicia gateway derivado do deployment resolvido
-  declarative-down    para o gateway declarativo
-  declarative-status  observa bindings e gateway declarativos
-  declarative-verify  valida bindings, TLS e gateway declarativos
+  bootstrap   prepara TLS e valida gateway do deployment resolvido
+  up          inicia gateway derivado do deployment resolvido
+  down        para o gateway declarativo
+  status      observa bindings e gateway declarativos
+  verify      valida bindings, TLS e gateway declarativos
 
 Exemplos:
   ./bin/sister-infra bootstrap --profile lan
@@ -72,25 +66,6 @@ load_profile() {
   GATEWAY_LOG="$LOG_ROOT/haproxy-${PROFILE}.log"
 }
 
-preflight_common() {
-  require_command curl
-  require_command jq
-  require_command sed
-  require_command openssl
-
-  [[ -d "$SISTER_DIR" ]] || die "SisTer não encontrado: $SISTER_DIR"
-  [[ -d "$NEXO_DIR" ]] || die "Nexo não encontrado: $NEXO_DIR"
-
-  if [[ ! -x "$HAPROXY_BIN" ]]; then
-    local detected
-    detected="$(command -v haproxy 2>/dev/null || true)"
-    [[ -n "$detected" ]] || die "HAProxy não encontrado em $HAPROXY_BIN nem no PATH"
-    HAPROXY_BIN="$detected"
-  fi
-
-  "$HAPROXY_BIN" -vv >/dev/null 2>&1 || die "HAProxy não executável: $HAPROXY_BIN"
-}
-
 production_preflight() {
   [[ "$PROFILE" == "production" ]] || return 0
 
@@ -102,8 +77,6 @@ production_preflight() {
 
   [[ "${TLS_MODE:-}" == "external" ]] || die "produção exige TLS_MODE=external"
   [[ -f "$TLS_PEM" ]] || die "TLS PEM de produção não encontrado: $TLS_PEM"
-  [[ -n "${SISTER_PRODUCTION_START_CMD:-}" ]] || die "SISTER_PRODUCTION_START_CMD não definido"
-  [[ -n "${NEXO_PRODUCTION_START_CMD:-}" ]] || die "NEXO_PRODUCTION_START_CMD não definido"
 
   if [[ -n "${PRODUCTION_GATE_CMD:-}" ]]; then
     log "Executando gate de produção..."
@@ -287,32 +260,6 @@ lab_tls_ca_fingerprint() {
     -sha256 2>/dev/null
 }
 
-migrate_existing_lab_tls() {
-  [[ "$PROFILE" != "production" ]] || return 0
-
-  # Material local existente deve ser avaliado, não sobrescrito.
-  [[ -f "$TLS_PEM" || -f "$CA_CERT" || -f "$CA_KEY" ]] && return 0
-
-  local old="$SISTER_DIR/.run/gateway"
-
-  if [[ -f "$old/gateway-lab.pem" && -f "$old/ca-lab.crt" ]]; then
-    log "Migrando TLS legado do SisTer para avaliação pelo sister-infra..."
-
-    cp -p "$old/gateway-lab.pem" "$TLS_PEM"
-    cp -p "$old/ca-lab.crt" "$CA_CERT"
-
-    if [[ -f "$old/ca-lab.key" ]]; then
-      cp -p "$old/ca-lab.key" "$CA_KEY"
-      chmod 600 "$CA_KEY"
-    fi
-
-    chmod 600 "$TLS_PEM"
-    chmod 644 "$CA_CERT"
-
-    pass "TLS legado copiado; lifecycle será validado antes do uso"
-  fi
-}
-
 generate_lab_ca() {
   log "Gerando nova CA de laboratório do sister-infra..."
 
@@ -436,8 +383,6 @@ CFG
 generate_lab_tls() {
   [[ "$PROFILE" != "production" ]] || return 0
   [[ "${TLS_MODE:-lab}" == "lab" ]] || return 0
-
-  migrate_existing_lab_tls
 
   local ca_ok=0
   local cert_ok=0
@@ -581,227 +526,8 @@ start_gateway() {
   pass "gateway ativo"
 }
 
-health_ok() {
-  local address="$1" port="$2" path="$3"
-  curl --noproxy '*' -fsS --max-time 2 "http://${address}:${port}${path}" >/dev/null 2>&1
-}
-
-wait_health() {
-  local name="$1" address="$2" port="$3" path="$4"
-  local deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
-  while (( SECONDS < deadline )); do
-    if health_ok "$address" "$port" "$path"; then
-      pass "$name saudável em ${address}:${port}"
-      return 0
-    fi
-    sleep 1
-  done
-  die "$name não respondeu em ${address}:${port}${path} após ${STARTUP_TIMEOUT_SECONDS}s"
-}
-
-start_praxis() {
-  if health_ok "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"; then
-    pass "SisTer-Praxis já estava ativo"
-    return 0
-  fi
-
-  [[ -d "$PRAXIS_DIR" ]] || die "SisTer-Praxis ausente: $PRAXIS_DIR"
-
-  if [[ "$PROFILE" == "production" ]]; then
-    [[ -n "${PRAXIS_PRODUCTION_START_CMD:-}" ]] ||
-      die "PRAXIS_PRODUCTION_START_CMD não definido"
-    log "Subindo SisTer-Praxis (produção)..."
-    (cd "$PRAXIS_DIR" && bash -lc "$PRAXIS_PRODUCTION_START_CMD")
-  else
-    [[ -f "$PRAXIS_DIR/scripts/http_service.sh" ]] ||
-      die "SisTer-Praxis sem scripts/http_service.sh"
-
-    if [[ ! -x "$PRAXIS_DIR/build/sister-praxis-http" ]]; then
-      log "Build HTTP do SisTer-Praxis ausente; verificando/construindo..."
-      (cd "$PRAXIS_DIR" && bash scripts/verify.sh)
-    fi
-
-    log "Subindo SisTer-Praxis..."
-    (
-      cd "$PRAXIS_DIR"
-      SISTER_PRAXIS_HTTP_BIND="$PRAXIS_ADDRESS" \
-      SISTER_PRAXIS_HTTP_PORT="$PRAXIS_PORT" \
-        bash scripts/http_service.sh start
-    )
-  fi
-
-  wait_health "SisTer-Praxis" \
-    "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"
-}
-
-start_nexo() {
-  if health_ok "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"; then
-    pass "Nexo já estava ativo"
-    return 0
-  fi
-
-  log "Subindo Nexo..."
-
-  # SISTER-INFRA-NEXO-LOOPBACK-BOUNDARY
-  # Subsistemas gerenciados não publicam borda própria na LAN.
-  if [[ "${SISTER_INFRA_RUNTIME_MODE:-development}" == "installed" ]]; then
-    [[ -x "$NEXO_DIR/scripts/runtime.sh" ]] || \
-      die "Nexo instalado sem scripts/runtime.sh executável"
-
-    (
-      cd "$NEXO_DIR"
-      export NEXO_HOST="$NEXO_ADDRESS"
-      export NEXO_PORT="$NEXO_PORT"
-      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-      ./scripts/runtime.sh start
-    )
-  else
-    [[ -x "$NEXO_DIR/scripts/run.sh" ]] || \
-      die "Nexo sem scripts/run.sh executável"
-
-    (
-      cd "$NEXO_DIR"
-      export NEXO_HOST="$NEXO_ADDRESS"
-      export NEXO_PORT="$NEXO_PORT"
-      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-      ./scripts/run.sh
-    )
-  fi
-
-  wait_health "Nexo" "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"
-}
-
-start_sister() {
-  if health_ok "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"; then
-    pass "SisTer já estava ativo"
-    return 0
-  fi
-
-  log "Subindo SisTer..."
-
-  if [[ "${SISTER_INFRA_RUNTIME_MODE:-development}" == "installed" ]]; then
-    [[ -x "$SISTER_DIR/scripts/runtime.sh" ]] || \
-      die "SisTer instalado sem scripts/runtime.sh executável"
-
-    (
-      cd "$SISTER_DIR"
-      export SISTER_RUNTIME_ENV="${SISTER_RUNTIME_ENV:-dev}"
-      export SISTER_RUNTIME_PORT="$SISTER_PORT"
-      export SISTER_NEXO_PORT="$NEXO_PORT"
-      export SISTER_NEXO_PUBLIC_URL="https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
-      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-      ./scripts/runtime.sh start
-    )
-  else
-    [[ -x "$SISTER_DIR/scripts/run_all.sh" ]] || \
-      die "SisTer sem scripts/run_all.sh executável"
-
-    (
-      cd "$SISTER_DIR"
-      export SISTER_NEXO_PORT="$NEXO_PORT"
-      export SISTER_NEXO_PUBLIC_URL="https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
-      export SISTER_PRAXIS_PUBLIC_URL="https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-      ./scripts/run_all.sh --profile "${SISTER_RUN_PROFILE:-dev-core}"
-    )
-  fi
-
-  wait_health "SisTer" "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"
-}
-
-stop_praxis() {
-  if [[ "$PROFILE" == "production" ]]; then
-    if [[ -n "${PRAXIS_PRODUCTION_STOP_CMD:-}" ]]; then
-      (cd "$PRAXIS_DIR" && bash -lc "$PRAXIS_PRODUCTION_STOP_CMD") ||
-        warn "falha ao parar SisTer-Praxis de produção"
-    else
-      warn "PRAXIS_PRODUCTION_STOP_CMD não definido; Praxis não foi parado"
-    fi
-    return
-  fi
-
-  if [[ -f "$PRAXIS_DIR/scripts/http_service.sh" ]]; then
-    (
-      cd "$PRAXIS_DIR"
-      SISTER_PRAXIS_HTTP_BIND="$PRAXIS_ADDRESS" \
-      SISTER_PRAXIS_HTTP_PORT="$PRAXIS_PORT" \
-        bash scripts/http_service.sh stop
-    ) || warn "SisTer-Praxis reportou erro ao parar"
-  fi
-}
-
-stop_sister() {
-  if [[ "${SISTER_INFRA_RUNTIME_MODE:-development}" == "installed" && -x "$SISTER_DIR/scripts/runtime.sh" ]]; then
-    (
-      cd "$SISTER_DIR"
-      export SISTER_RUNTIME_ENV="${SISTER_RUNTIME_ENV:-dev}"
-      export SISTER_RUNTIME_PORT="$SISTER_PORT"
-      ./scripts/runtime.sh stop
-    )
-    return 0
-  fi
-
-  if [[ "$PROFILE" == "production" ]]; then
-    if [[ -n "${SISTER_PRODUCTION_STOP_CMD:-}" ]]; then
-      (cd "$SISTER_DIR" && bash -lc "$SISTER_PRODUCTION_STOP_CMD") || warn "falha ao parar SisTer de produção"
-    else
-      warn "SISTER_PRODUCTION_STOP_CMD não definido; SisTer não foi parado"
-    fi
-    return
-  fi
-
-  if [[ -x "$SISTER_DIR/scripts/app/stop.sh" ]]; then
-    (cd "$SISTER_DIR" && ./scripts/app/stop.sh "${SISTER_ENVIRONMENT:-dev}") || warn "SisTer reportou erro ao parar"
-  else
-    warn "scripts/app/stop.sh não encontrado; SisTer não foi parado"
-  fi
-}
-
-stop_nexo() {
-  if [[ "${SISTER_INFRA_RUNTIME_MODE:-development}" == "installed" && -x "$NEXO_DIR/scripts/runtime.sh" ]]; then
-    (
-      cd "$NEXO_DIR"
-      export NEXO_HOST="$NEXO_ADDRESS"
-      export NEXO_PORT="$NEXO_PORT"
-      ./scripts/runtime.sh stop
-    )
-    return 0
-  fi
-
-  if [[ "$PROFILE" == "production" ]]; then
-    if [[ -n "${NEXO_PRODUCTION_STOP_CMD:-}" ]]; then
-      (cd "$NEXO_DIR" && bash -lc "$NEXO_PRODUCTION_STOP_CMD") || warn "falha ao parar Nexo de produção"
-    else
-      warn "NEXO_PRODUCTION_STOP_CMD não definido; Nexo não foi parado"
-    fi
-    return
-  fi
-
-  # Preferir script próprio do Nexo, caso exista em versões futuras.
-  if [[ -x "$NEXO_DIR/scripts/stop.sh" ]]; then
-    (cd "$NEXO_DIR" && ./scripts/stop.sh) || warn "Nexo reportou erro ao parar"
-    return
-  fi
-
-  # A versão atual conhecida executa nexo-app e nexo-db via Podman Compose.
-  # Removemos somente os containers conhecidos; volumes persistentes NÃO são removidos.
-  if command -v podman >/dev/null 2>&1; then
-    local app db
-    app="$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^sister-nexo-.*app$|^sister-nexo-dev-app$' | head -n1 || true)"
-    db="$(podman ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^sister-nexo-.*db$|^sister-nexo-dev-db$' | head -n1 || true)"
-    [[ -z "$app" ]] || podman stop "$app" >/dev/null 2>&1 || true
-    [[ -z "$db" ]]  || podman stop "$db"  >/dev/null 2>&1 || true
-    if [[ -n "$app$db" ]]; then
-      pass "containers Nexo parados; volumes preservados"
-    else
-      warn "containers Nexo não localizados; nada foi removido"
-    fi
-  else
-    warn "Podman ausente e scripts/stop.sh inexistente; Nexo não foi parado"
-  fi
-}
-
 bootstrap() {
-  preflight_common
+  runtime_preflight
   if [[ "$PROFILE" == "production" ]]; then
     [[ "${TLS_MODE:-}" == "external" ]] || die "produção exige TLS_MODE=external"
     [[ -f "$TLS_PEM" ]] || die "TLS de produção ausente: $TLS_PEM"
@@ -817,122 +543,7 @@ bootstrap() {
   fi
 }
 
-verify_gateway_urls() {
-  local cacert_args=()
-  if [[ "$PROFILE" != "production" && -f "$CA_CERT" ]]; then
-    cacert_args=(--cacert "$CA_CERT")
-  fi
-
-  curl --noproxy '*' -fsS --max-time 5 \
-    "${cacert_args[@]}" \
-    --resolve "$SISTER_HOST:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
-    "https://$SISTER_HOST:$GATEWAY_LISTEN_PORT$SISTER_HEALTH_PATH" >/dev/null \
-      && pass "SisTer via gateway" \
-      || die "SisTer não respondeu via gateway"
-
-  curl --noproxy '*' -fsS --max-time 5 \
-    "${cacert_args[@]}" \
-    --resolve "$NEXO_HOST:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
-    "https://$NEXO_HOST:$GATEWAY_LISTEN_PORT$NEXO_HEALTH_PATH" >/dev/null \
-      && pass "Nexo via gateway" \
-      || die "Nexo não respondeu via gateway"
-
-  curl --noproxy '*' -fsS --max-time 5 \
-    "${cacert_args[@]}" \
-    --resolve "$PRAXIS_HOST:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
-    "https://$PRAXIS_HOST:$GATEWAY_LISTEN_PORT$PRAXIS_HEALTH_PATH" >/dev/null \
-      && pass "SisTer-Praxis via gateway" \
-      || die "SisTer-Praxis não respondeu via gateway"
-}
-
-cmd_up() {
-  preflight_common
-  production_preflight
-  [[ "$PROFILE" == "production" ]] || generate_lab_tls
-
-  # Praxis é independente dos domínios e fornece a borda computacional comum.
-  start_praxis
-
-  # O Nexo sobe antes do SisTer porque o SisTer observa sua saúde no catálogo.
-  start_nexo
-  start_sister
-  start_gateway
-  verify_gateway_urls
-
-  echo
-  echo "Ecossistema ativo ($PROFILE)"
-  echo "  SisTer: https://${SISTER_HOST}:${GATEWAY_LISTEN_PORT}"
-  echo "  Nexo:   https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
-  echo "  Praxis: https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-  if [[ "$PROFILE" == "lan" ]]; then
-    echo "  Gateway LAN: ${GATEWAY_LISTEN_ADDRESS}:${GATEWAY_LISTEN_PORT}"
-  fi
-}
-
-cmd_down() {
-  preflight_common
-  stop_gateway
-  stop_sister
-  stop_praxis
-  stop_nexo
-  pass "encerramento solicitado; dados persistentes preservados"
-}
-
-cmd_status() {
-  preflight_common
-
-  echo "Perfil: $PROFILE"
-  echo "Infra:  $INFRA_ROOT"
-  echo "SisTer: $SISTER_DIR"
-  echo "Nexo:   $NEXO_DIR"
-  echo "Praxis: $PRAXIS_DIR"
-  echo
-
-  if health_ok "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"; then
-    pass "SisTer interno http://${SISTER_ADDRESS}:${SISTER_PORT}"
-  else
-    warn "SisTer interno OFFLINE"
-  fi
-
-  if health_ok "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"; then
-    pass "Nexo interno http://${NEXO_ADDRESS}:${NEXO_PORT}"
-  else
-    warn "Nexo interno OFFLINE"
-  fi
-
-  if health_ok "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"; then
-    pass "SisTer-Praxis interno http://${PRAXIS_ADDRESS}:${PRAXIS_PORT}"
-  else
-    warn "SisTer-Praxis interno OFFLINE"
-  fi
-
-  if pid_alive "$GATEWAY_PID"; then
-    pass "Gateway HAProxy PID $(cat "$GATEWAY_PID")"
-  else
-    warn "Gateway HAProxy OFFLINE"
-  fi
-
-  echo
-  echo "URLs esperadas:"
-  echo "  https://${SISTER_HOST}:${GATEWAY_LISTEN_PORT}"
-  echo "  https://${NEXO_HOST}:${GATEWAY_LISTEN_PORT}"
-  echo "  https://${PRAXIS_HOST}:${GATEWAY_LISTEN_PORT}"
-}
-
-cmd_verify() {
-  preflight_common
-  production_preflight
-  [[ "$PROFILE" == "production" ]] || generate_lab_tls
-  render_gateway
-  wait_health "SisTer" "$SISTER_ADDRESS" "$SISTER_PORT" "$SISTER_HEALTH_PATH"
-  wait_health "Nexo" "$NEXO_ADDRESS" "$NEXO_PORT" "$NEXO_HEALTH_PATH"
-  wait_health "SisTer-Praxis" "$PRAXIS_ADDRESS" "$PRAXIS_PORT" "$PRAXIS_HEALTH_PATH"
-  pid_alive "$GATEWAY_PID" || die "gateway não está ativo"
-  verify_gateway_urls
-  pass "ecossistema verificado"
-}
-
-declarative_preflight() {
+runtime_preflight() {
   require_command curl
   require_command jq
   require_command openssl
@@ -956,7 +567,7 @@ declarative_preflight() {
     die "HAProxy não executável: $HAPROXY_BIN"
 }
 
-declarative_component_health() {
+component_health() {
   local component_id="$1"
   local transport="$2"
   local endpoint_a="$3"
@@ -979,13 +590,13 @@ declarative_component_health() {
   esac
 }
 
-declarative_verify_components() {
+verify_components() {
   local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
   local component_id transport endpoint_a endpoint_b health_path
   while IFS=$'\t' read -r \
       component_id transport endpoint_a endpoint_b health_path; do
     [[ -n "$component_id" ]] || continue
-    declarative_component_health \
+    component_health \
       "$component_id" "$transport" "$endpoint_a" "$endpoint_b" "$health_path" \
       && pass "$component_id saudável" \
       || die "$component_id não respondeu ao probe declarativo"
@@ -1003,7 +614,7 @@ declarative_verify_components() {
   )
 }
 
-declarative_verify_gateway_urls() {
+verify_gateway_urls() {
   local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
   local -a cacert_args=()
   if [[ "$PROFILE" != "production" && -f "$CA_CERT" ]]; then
@@ -1028,39 +639,39 @@ declarative_verify_gateway_urls() {
   )
 }
 
-cmd_declarative_up() {
-  declarative_preflight
+cmd_up() {
+  runtime_preflight
   production_preflight
   [[ "$PROFILE" == "production" ]] || generate_lab_tls
   start_gateway
-  if ! declarative_verify_components || ! declarative_verify_gateway_urls; then
+  if ! verify_components || ! verify_gateway_urls; then
     stop_gateway
     die "verificação após start do gateway declarativo falhou"
   fi
   pass "gateway declarativo ativo"
 }
 
-cmd_declarative_down() {
-  declarative_preflight
+cmd_down() {
+  runtime_preflight
   stop_gateway
   pass "gateway declarativo parado"
 }
 
-cmd_declarative_status() {
-  declarative_preflight
-  declarative_verify_components
+cmd_status() {
+  runtime_preflight
+  verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo OFFLINE"
   pass "gateway declarativo PID $(cat "$GATEWAY_PID")"
 }
 
-cmd_declarative_verify() {
-  declarative_preflight
+cmd_verify() {
+  runtime_preflight
   production_preflight
   [[ "$PROFILE" == "production" ]] || generate_lab_tls
   render_gateway
-  declarative_verify_components
+  verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"
-  declarative_verify_gateway_urls
+  verify_gateway_urls
   pass "deployment declarativo verificado"
 }
 
@@ -1102,17 +713,6 @@ main() {
     down)      cmd_down ;;
     status)    cmd_status ;;
     verify)    cmd_verify ;;
-    declarative-up)     cmd_declarative_up ;;
-    declarative-down)   cmd_declarative_down ;;
-    declarative-status) cmd_declarative_status ;;
-    declarative-verify) cmd_declarative_verify ;;
-    gateway)
-      preflight_common
-      production_preflight
-      [[ "$PROFILE" == "production" ]] || generate_lab_tls
-      start_gateway
-      verify_gateway_urls
-      ;;
     help|-h|--help) usage ;;
     *) die "comando desconhecido: $COMMAND" ;;
   esac

@@ -36,15 +36,15 @@ DATA_ROOT="$TMP/sister-data"
 dev="$(
     "$CLI" show \
         --root "$DATA_ROOT" \
-        --class development
+        --class development \
+        --component alpha \
+        --component beta
 )"
 
 expect_line "$dev" "deployment_class=development"
 expect_line "$dev" "environment_root=$DATA_ROOT/development"
-expect_line "$dev" \
-    "sister_db_data_dir=$DATA_ROOT/development/sister/postgres"
-expect_line "$dev" \
-    "nexo_db_data_dir=$DATA_ROOT/development/nexo/postgres"
+expect_line "$dev" $'component_state_dir=alpha\t'"$DATA_ROOT/development/components/alpha"
+expect_line "$dev" $'component_state_dir=beta\t'"$DATA_ROOT/development/components/beta"
 
 [[ ! -e "$DATA_ROOT" ]] || \
     fail "resolvedor criou diretório durante show"
@@ -53,30 +53,30 @@ candidate="$(
     "$CLI" show \
         --root "$DATA_ROOT" \
         --class candidate \
-        --candidate-id rc-20260819
+        --candidate-id rc-20260819 \
+        --component alpha \
+        --component beta
 )"
 
 expect_line "$candidate" "deployment_class=candidate"
 expect_line "$candidate" \
     "environment_root=$DATA_ROOT/candidate/rc-20260819"
-expect_line "$candidate" \
-    "sister_db_data_dir=$DATA_ROOT/candidate/rc-20260819/sister/postgres"
-expect_line "$candidate" \
-    "nexo_db_data_dir=$DATA_ROOT/candidate/rc-20260819/nexo/postgres"
+expect_line "$candidate" $'component_state_dir=alpha\t'"$DATA_ROOT/candidate/rc-20260819/components/alpha"
+expect_line "$candidate" $'component_state_dir=beta\t'"$DATA_ROOT/candidate/rc-20260819/components/beta"
 
 operational="$(
     "$CLI" show \
         --root "$DATA_ROOT" \
-        --class operational
+        --class operational \
+        --component alpha \
+        --component beta
 )"
 
 expect_line "$operational" "deployment_class=operational"
 expect_line "$operational" \
     "environment_root=$DATA_ROOT/operational"
-expect_line "$operational" \
-    "sister_db_data_dir=$DATA_ROOT/operational/sister/postgres"
-expect_line "$operational" \
-    "nexo_db_data_dir=$DATA_ROOT/operational/nexo/postgres"
+expect_line "$operational" $'component_state_dir=alpha\t'"$DATA_ROOT/operational/components/alpha"
+expect_line "$operational" $'component_state_dir=beta\t'"$DATA_ROOT/operational/components/beta"
 
 if "$CLI" show \
     --root "$DATA_ROOT" \
