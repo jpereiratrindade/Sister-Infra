@@ -1,0 +1,19 @@
+{
+  "schema": "sister.infra.composition/1.0.0",
+  "composition_id": "workstation",
+  "deployment_class": "workstation",
+  "components": [
+    {
+      "source": "../../../SisTer"
+    },
+    {
+      "source": "../../../sister-nexo"
+    },
+    {
+      "source": "../../../sister-praxis"
+    },
+    {
+      "source": "../../../sister-urt"
+    }
+  ]
+}
