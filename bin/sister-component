@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +184,212 @@ def validate_descriptor(
     return descriptor
 
 
+
+def run_checked(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise ComponentError(
+            f"não foi possível executar {' '.join(command)}: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        details = []
+        if result.stdout.strip():
+            details.append(result.stdout.strip())
+        if result.stderr.strip():
+            details.append(result.stderr.strip())
+        suffix = "\n" + "\n".join(details) if details else ""
+        raise ComponentError(
+            "comando de qualificação falhou "
+            f"({result.returncode}): {' '.join(command)}{suffix}"
+        )
+
+    return result
+
+
+def git_commit_for_clean_root(root: Path) -> str:
+    top = run_checked(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
+    ).stdout.strip()
+
+    if Path(top).resolve() != root:
+        raise ComponentError(
+            "raiz do componente deve coincidir com a raiz do repositório Git: "
+            f"componente={root} git={Path(top).resolve()}"
+        )
+
+    dirty = run_checked(
+        ["git", "-C", str(root), "status", "--porcelain"]
+    ).stdout.strip()
+    if dirty:
+        raise ComponentError(
+            "qualificação recusada: repositório possui alterações locais"
+        )
+
+    return run_checked(
+        ["git", "-C", str(root), "rev-parse", "HEAD"]
+    ).stdout.strip()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_artifacts(root: Path, descriptor: dict[str, Any]) -> list[dict[str, Any]]:
+    verified = []
+
+    for artifact in descriptor["build"]["artifacts"]:
+        path = root / artifact["path"]
+        if not path.is_file():
+            raise ComponentError(
+                f"artefato declarado não foi materializado: {artifact['id']} -> {artifact['path']}"
+            )
+        if artifact["executable"] and not os.access(path, os.X_OK):
+            raise ComponentError(
+                f"artefato declarado não é executável: {artifact['id']} -> {artifact['path']}"
+            )
+
+        verified.append(
+            {
+                "id": artifact["id"],
+                "path": artifact["path"],
+                "executable": artifact["executable"],
+                "sha256": sha256_file(path),
+            }
+        )
+
+    return verified
+
+
+def qualify_component(
+    root: Path,
+    contracts: Path,
+    descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    commit = git_commit_for_clean_root(root)
+    build = descriptor["build"]
+    build_driver = build["driver"]
+    test_driver = build["tests"]["driver"]
+
+    with tempfile.TemporaryDirectory(prefix="sister-component-qualify-") as tmp_text:
+        tmp = Path(tmp_text)
+        source = tmp / "source"
+
+        run_checked(
+            [
+                "git",
+                "clone",
+                "--no-hardlinks",
+                "--quiet",
+                str(root),
+                str(source),
+            ]
+        )
+        run_checked(
+            ["git", "-C", str(source), "checkout", "--quiet", "--detach", commit]
+        )
+
+        qualified_descriptor = validate_descriptor(source, contracts)
+        if qualified_descriptor != descriptor:
+            raise ComponentError(
+                "descritor qualificado diverge do descritor validado na árvore fonte"
+            )
+
+        test_status = "SKIPPED"
+
+        if build_driver == "cmake-ninja/1":
+            build_dir = source / build["build_dir"]
+            source_dir = source / build["source"]
+
+            run_checked(
+                [
+                    "cmake",
+                    "-S",
+                    str(source_dir),
+                    "-B",
+                    str(build_dir),
+                    "-G",
+                    "Ninja",
+                    f"-DCMAKE_BUILD_TYPE={build['configuration']}",
+                ]
+            )
+            run_checked(["cmake", "--build", str(build_dir)])
+
+            if test_driver == "ctest/1":
+                run_checked(
+                    [
+                        "ctest",
+                        "--test-dir",
+                        str(build_dir),
+                        "--output-on-failure",
+                    ]
+                )
+                test_status = "PASS"
+            elif test_driver == "none/1":
+                test_status = "SKIPPED"
+            else:  # defensive; schema validation should catch this first
+                raise ComponentError(f"driver de teste não suportado: {test_driver}")
+
+        elif build_driver == "source-only/1":
+            if test_driver != "none/1":
+                raise ComponentError(
+                    "source-only/1 requer tests.driver=none/1"
+                )
+        else:  # defensive; schema validation should catch this first
+            raise ComponentError(f"driver de build não suportado: {build_driver}")
+
+        artifacts = verify_artifacts(source, qualified_descriptor)
+
+    return {
+        "schema": "sister.infra.component.qualification/1",
+        "status": "PASS",
+        "component_id": descriptor["component_id"],
+        "system_id": descriptor["system_id"],
+        "component_contract": descriptor["schema"],
+        "source": {
+            "commit": commit,
+            "clean": True,
+        },
+        "build": {
+            "driver": build_driver,
+            "configuration": build.get("configuration"),
+            "tests": {
+                "driver": test_driver,
+                "status": test_status,
+            },
+        },
+        "artifacts": artifacts,
+    }
+
+
+def print_qualification(report: dict[str, Any]) -> None:
+    print(f"status           {report['status']}")
+    print(f"component_id     {report['component_id']}")
+    print(f"system_id        {report['system_id']}")
+    print(f"commit           {report['source']['commit']}")
+    print(f"build.driver     {report['build']['driver']}")
+    print(f"tests.driver     {report['build']['tests']['driver']}")
+    print(f"tests.status     {report['build']['tests']['status']}")
+    print("artifacts")
+    for artifact in report["artifacts"]:
+        print(
+            f"  {artifact['id']:<14} {artifact['path']} "
+            f"sha256:{artifact['sha256']}"
+        )
+
+
 def print_description(root: Path, descriptor: dict[str, Any]) -> None:
     build = descriptor["build"]
     runtime = descriptor.get("runtime")
@@ -219,19 +428,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("inspect", "validate"):
+    for name in ("inspect", "validate", "qualify"):
         command = subparsers.add_parser(name)
         command.add_argument("component_root")
         command.add_argument(
             "--contracts-root",
             help="diretório contracts/ da fonte normativa SisTer",
         )
-        if name == "inspect":
+        if name in ("inspect", "qualify"):
             command.add_argument(
                 "--json",
                 action="store_true",
                 dest="as_json",
-                help="emite o descritor validado como JSON",
+                help=(
+                    "emite o descritor validado como JSON"
+                    if name == "inspect"
+                    else "emite a evidência de qualificação como JSON"
+                ),
             )
 
     return parser
@@ -253,6 +466,19 @@ def main(argv: list[str] | None = None) -> int:
             "[PASS] "
             f"{descriptor['component_id']} atende {descriptor['schema']}"
         )
+        return 0
+
+    if args.command == "qualify":
+        try:
+            report = qualify_component(root, contracts, descriptor)
+        except ComponentError as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 2
+
+        if args.as_json:
+            print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+        else:
+            print_qualification(report)
         return 0
 
     if args.as_json:

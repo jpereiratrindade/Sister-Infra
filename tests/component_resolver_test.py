@@ -28,6 +28,20 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+
+def git_init_commit(path: Path) -> str:
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "SisTer Test"], check=True)
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "fixture"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+
 def make_contracts(root: Path) -> Path:
     contracts = root / "contracts"
 
@@ -175,6 +189,24 @@ def make_component(root: Path) -> Path:
         },
     }
     write_json(component / ".sister/component.json", descriptor)
+    (component / "CMakeLists.txt").write_text(
+        """cmake_minimum_required(VERSION 3.20)
+project(example_component LANGUAGES CXX)
+enable_testing()
+add_executable(example-service main.cpp)
+add_test(NAME example_service_runs COMMAND example-service)
+""",
+        encoding="utf-8",
+    )
+    (component / "main.cpp").write_text(
+        "int main() { return 0; }\n",
+        encoding="utf-8",
+    )
+    runtime = component / "scripts/runtime.sh"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    runtime.chmod(0o755)
+    git_init_commit(component)
     return component
 
 
@@ -193,6 +225,21 @@ def make_control_plane(root: Path) -> Path:
         },
     }
     write_json(component / ".sister/component.json", descriptor)
+    (component / "README.md").write_text("control plane fixture\n", encoding="utf-8")
+    git_init_commit(component)
+    return component
+
+
+def make_missing_artifact_component(root: Path) -> Path:
+    component = make_component(root / "missing-artifact-fixture")
+    descriptor_path = component / ".sister/component.json"
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    descriptor["component_id"] = "missing_artifact"
+    descriptor["system_id"] = "sister_missing_artifact"
+    descriptor["build"]["artifacts"][0]["path"] = "build/not-produced"
+    write_json(descriptor_path, descriptor)
+    subprocess.run(["git", "-C", str(component), "add", ".sister/component.json"], check=True)
+    subprocess.run(["git", "-C", str(component), "commit", "-q", "-m", "missing artifact"], check=True)
     return component
 
 
@@ -264,6 +311,59 @@ def main() -> None:
         assert parsed["component_id"] == "example"
         assert parsed["system_id"] == "sister_example"
 
+        qualified = run(
+            "qualify",
+            str(component),
+            "--contracts-root",
+            str(contracts),
+            "--json",
+        )
+        assert qualified.returncode == 0, qualified.stderr
+        qualification = json.loads(qualified.stdout)
+        assert qualification["status"] == "PASS"
+        assert qualification["component_id"] == "example"
+        assert qualification["source"]["clean"] is True
+        assert len(qualification["source"]["commit"]) == 40
+        assert qualification["build"]["driver"] == "cmake-ninja/1"
+        assert qualification["build"]["tests"]["status"] == "PASS"
+        assert qualification["artifacts"][0]["id"] == "example-service"
+        assert len(qualification["artifacts"][0]["sha256"]) == 64
+
+        control_qualified = run(
+            "qualify",
+            str(control_plane),
+            "--contracts-root",
+            str(contracts),
+            "--json",
+        )
+        assert control_qualified.returncode == 0, control_qualified.stderr
+        control_report = json.loads(control_qualified.stdout)
+        assert control_report["status"] == "PASS"
+        assert control_report["build"]["driver"] == "source-only/1"
+        assert control_report["build"]["tests"]["status"] == "SKIPPED"
+        assert control_report["artifacts"] == []
+
+        missing_artifact = make_missing_artifact_component(tmp)
+        missing_qualified = run(
+            "qualify",
+            str(missing_artifact),
+            "--contracts-root",
+            str(contracts),
+        )
+        assert missing_qualified.returncode == 2
+        assert "artefato declarado não foi materializado" in missing_qualified.stderr
+
+        (component / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        dirty_qualified = run(
+            "qualify",
+            str(component),
+            "--contracts-root",
+            str(contracts),
+        )
+        assert dirty_qualified.returncode == 2
+        assert "alterações locais" in dirty_qualified.stderr
+        (component / "dirty.txt").unlink()
+
         descriptor_path = component / ".sister/component.json"
         invalid = json.loads(descriptor_path.read_text(encoding="utf-8"))
         invalid["binding"] = {"host": "127.0.0.1", "port": 9999}
@@ -288,7 +388,7 @@ def main() -> None:
         assert missing.returncode == 2
         assert "raiz de componente inexistente" in missing.stderr
 
-    print("[PASS] generic component resolver: discover + validate + describe")
+    print("[PASS] generic component resolver: discover + validate + describe + qualify")
 
 
 if __name__ == "__main__":
