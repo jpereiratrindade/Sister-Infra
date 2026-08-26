@@ -5,3 +5,5 @@ config/production.env
 *.pem
 *.key
 *.crt
+__pycache__/
+*.py[cod]

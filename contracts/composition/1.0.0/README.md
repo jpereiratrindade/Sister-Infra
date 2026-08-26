@@ -70,3 +70,32 @@ A resolução verifica:
 
 Ela não qualifica build nem artefatos. Qualificação de composição pertence ao
 incremento seguinte.
+
+## Qualificação da composição
+
+A qualificação é uma operação posterior à resolução:
+
+```bash
+./bin/sister-composition qualify composition.json
+./bin/sister-composition qualify composition.json --json
+```
+
+Ela não reimplementa build, testes, Git ou hashing. Para cada componente já
+resolvido, o `sister-composition` delega a evidência ao comando:
+
+```text
+sister-component qualify <root> --json
+```
+
+A composição somente:
+
+1. resolve e valida a participação;
+2. solicita a qualificação individual de cada componente;
+3. verifica que a identidade devolvida coincide com a identidade resolvida;
+4. agrega as evidências em `sister.infra.composition.qualification/1`.
+
+Se qualquer componente falhar, a composição inteira não é emitida como
+qualificada.
+
+A qualificação continua sem decidir binding, host, porta, TLS, gateway ou
+lifecycle da workstation.
