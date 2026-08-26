@@ -44,7 +44,7 @@ release (current / previous)
 | :--- | :--- | :--- |
 | **Componente** | Autodescrição de identidade, driver de build, testes, artefatos verificados e contrato de runtime (`scripts/runtime.sh`). | `sister.component/1.0.0` |
 | **Composição** | Seleção de participantes por referência (`source`) sem duplicar identidade, credenciais, portas ou caminhos. | `sister.infra.composition/1.0.0` |
-| **Qualificação** | Checkout isolado, compilação `Release`, execução de suíte de testes e exportação de bundles de artefatos com verificação SHA-256. | `sister.infra.composition.qualified/1` |
+| **Qualificação** | Checkout isolado, compilação `Release`, execução de suíte de testes e exportação de bundles de artefatos com verificação SHA-256. | `sister.infra.composition.qualification/1` |
 | **Candidata** | Materialização imutável do control plane, componentes e artefatos binários qualificados. | `sister.infra.workstation.candidate/1` |
 | **Deployment** | Resolução agnóstica de transporte (`tcp`, `unix`), portas de escuta, health probes e virtual hosts de borda. | `sister.infra.deployment/1.0.0` |
 | **Gateway & TLS** | Geração dinâmica da configuração do HAProxy e emissão/renovação de certificados com SAN estritamente derivados do deployment resolvido. | `sister.infra.deployment.resolved/1` |
@@ -92,7 +92,7 @@ Interface pública unificada sob `sister-infra workstation`:
 ./bin/sister-infra workstation install <release-id>
 ./bin/sister-infra workstation promote <release-id>
 ./bin/sister-infra workstation rollback
-./bin/sister-infra workstation list
+./bin/sister-infra workstation release-list
 
 # Observabilidade e saúde
 ./bin/sister-infra workstation current
