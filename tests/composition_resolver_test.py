@@ -19,6 +19,13 @@ SCHEMA = (
     / "1.0.0"
     / "composition.schema.json"
 )
+SCHEMA_V2_0 = (
+    ROOT
+    / "contracts"
+    / "composition"
+    / "2.0.0"
+    / "composition.schema.json"
+)
 
 
 def write_json(path: Path, document: dict) -> None:
@@ -280,6 +287,24 @@ def write_composition(
     write_json(path, document)
 
 
+def write_composition_v2_0(
+    path: Path,
+    sources: list[str],
+    composition_id: str = "example_composition",
+    **extra: object,
+) -> None:
+    document = {
+        "schema": "sister.infra.composition/2.0.0",
+        "composition_id": composition_id,
+        "components": [
+            {"source": source}
+            for source in sources
+        ],
+    }
+    document.update(extra)
+    write_json(path, document)
+
+
 def main() -> None:
     assert COMPONENT_CLI.is_file(), (
         "sister-component ausente; CR-01/CR-02 são pré-requisitos"
@@ -308,6 +333,14 @@ def main() -> None:
     assert '"host"' not in schema_text
     assert '"port"' not in schema_text
     assert '"binding"' not in schema_text
+
+    schema_v2_0_text = SCHEMA_V2_0.read_text(
+        encoding="utf-8"
+    ).lower()
+    assert '"host"' not in schema_v2_0_text
+    assert '"port"' not in schema_v2_0_text
+    assert '"binding"' not in schema_v2_0_text
+    assert '"deployment_class"' not in schema_v2_0_text
 
     with tempfile.TemporaryDirectory(
         prefix="sister-composition-resolver-"
@@ -383,6 +416,56 @@ def main() -> None:
             "sister_beta",
         ):
             assert expected in text.stdout, expected
+
+        # Test composition 2.0.0 without deployment_class
+        comp_v2_0 = deployment / "composition-2.0.0.json"
+        write_composition_v2_0(
+            comp_v2_0,
+            ["../sister-alpha", "../sister-beta"],
+            composition_id="env_neutral_comp",
+        )
+        resolved_v2_0 = run(
+            comp_v2_0,
+            contracts,
+            "--json",
+        )
+        assert resolved_v2_0.returncode == 0, resolved_v2_0.stderr
+        doc_v2_0 = json.loads(resolved_v2_0.stdout)
+        assert doc_v2_0["schema"] == "sister.infra.composition.resolved/2"
+        assert doc_v2_0["composition_id"] == "env_neutral_comp"
+        assert "deployment_class" not in doc_v2_0
+        assert len(doc_v2_0["components"]) == 2
+
+        text_v2_0 = run(comp_v2_0, contracts)
+        assert text_v2_0.returncode == 0, text_v2_0.stderr
+        assert "composition_id   env_neutral_comp" in text_v2_0.stdout
+        assert "class            " not in text_v2_0.stdout
+        assert "alpha" in text_v2_0.stdout
+
+        # Reject 2.0.0 if deployment_class is improperly supplied
+        invalid_v2_0_class = deployment / "invalid-v2-0-class.json"
+        write_composition_v2_0(
+            invalid_v2_0_class,
+            ["../sister-alpha"],
+            deployment_class="workstation",
+        )
+        rej_class = run(invalid_v2_0_class, contracts)
+        assert rej_class.returncode == 2
+        assert "composição rejeitada" in rej_class.stderr
+
+        # Reject unsupported version
+        unsupported_ver = deployment / "unsupported-version.json"
+        write_json(
+            unsupported_ver,
+            {
+                "schema": "sister.infra.composition/9.9.9",
+                "composition_id": "future",
+                "components": [{"source": "../sister-alpha"}],
+            },
+        )
+        rej_ver = run(unsupported_ver, contracts)
+        assert rej_ver.returncode == 2
+        assert "não suportada" in rej_ver.stderr
 
         invalid_binding = (
             deployment / "invalid-binding.json"

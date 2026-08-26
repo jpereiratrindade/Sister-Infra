@@ -12,6 +12,7 @@ from composition_resolver_test import (
     make_component,
     make_contracts,
     write_composition,
+    write_composition_v2_0,
 )
 
 
@@ -178,6 +179,27 @@ def main() -> None:
             beta_commit,
         ):
             assert expected in human.stdout, expected
+
+        # Test qualification of composition 2.0.0 (environment-neutral)
+        comp_v2_0 = deployment / "composition-2.0.0.json"
+        write_composition_v2_0(
+            comp_v2_0,
+            ["../sister-alpha", "../sister-beta"],
+            composition_id="env_neutral_qual",
+        )
+        qualified_v2_0 = run(comp_v2_0, contracts, "--json")
+        assert qualified_v2_0.returncode == 0, qualified_v2_0.stderr
+        doc_v2_0 = json.loads(qualified_v2_0.stdout)
+        assert doc_v2_0["schema"] == "sister.infra.composition.qualification/2"
+        assert doc_v2_0["status"] == "PASS"
+        assert doc_v2_0["composition_id"] == "env_neutral_qual"
+        assert "deployment_class" not in doc_v2_0
+        assert len(doc_v2_0["components"]) == 2
+
+        human_v2_0 = run(comp_v2_0, contracts)
+        assert human_v2_0.returncode == 0, human_v2_0.stderr
+        assert "composition_id   env_neutral_qual" in human_v2_0.stdout
+        assert "class            " not in human_v2_0.stdout
 
         (beta / "README.md").write_text(
             "dirty\n",

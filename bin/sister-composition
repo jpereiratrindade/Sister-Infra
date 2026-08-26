@@ -74,13 +74,18 @@ def parse_composition_version(document: dict[str, Any]) -> str:
 
 def schema_path_for(document: dict[str, Any]) -> Path:
     version = parse_composition_version(document)
-    return (
+    path = (
         INFRA_ROOT
         / "contracts"
         / "composition"
         / version
         / "composition.schema.json"
     )
+    if not path.is_file():
+        raise CompositionError(
+            f"versão de contrato de composição não suportada: {version!r}"
+        )
+    return path
 
 
 def validate_composition(document: dict[str, Any]) -> None:
@@ -298,13 +303,27 @@ def qualify(
             }
         )
 
-    return {
-        "schema": "sister.infra.composition.qualification/1",
+    resolved_schema = resolved["schema"]
+    if resolved_schema == "sister.infra.composition.resolved/1":
+        qual_schema = "sister.infra.composition.qualification/1"
+    elif resolved_schema == "sister.infra.composition.resolved/2":
+        qual_schema = "sister.infra.composition.qualification/2"
+    else:
+        raise CompositionError(
+            "schema de composição resolvida não suportado para qualificação: "
+            f"{resolved_schema!r}"
+        )
+
+    qualification: dict[str, Any] = {
+        "schema": qual_schema,
         "status": "PASS",
         "composition_id": resolved["composition_id"],
-        "deployment_class": resolved["deployment_class"],
         "components": components,
     }
+    if "deployment_class" in resolved:
+        qualification["deployment_class"] = resolved["deployment_class"]
+
+    return qualification
 
 
 def print_composition_qualification(
@@ -312,7 +331,8 @@ def print_composition_qualification(
 ) -> None:
     print(f"status           {document['status']}")
     print(f"composition_id   {document['composition_id']}")
-    print(f"class            {document['deployment_class']}")
+    if "deployment_class" in document:
+        print(f"class            {document['deployment_class']}")
     print()
     print("components")
 
@@ -366,6 +386,17 @@ def resolve(
     document = load_json(composition_path, "composição")
     validate_composition(document)
 
+    version = parse_composition_version(document)
+    if version == "1.0.0":
+        resolved_schema = "sister.infra.composition.resolved/1"
+    elif version == "2.0.0":
+        resolved_schema = "sister.infra.composition.resolved/2"
+    else:
+        raise CompositionError(
+            "versão de contrato de composição não suportada para resolução: "
+            f"{version!r}"
+        )
+
     components = [
         resolved_component(
             entry["source"],
@@ -377,17 +408,21 @@ def resolve(
 
     reject_duplicate_identities(components)
 
-    return {
-        "schema": "sister.infra.composition.resolved/1",
+    resolved: dict[str, Any] = {
+        "schema": resolved_schema,
         "composition_id": document["composition_id"],
-        "deployment_class": document["deployment_class"],
         "components": components,
     }
+    if version == "1.0.0":
+        resolved["deployment_class"] = document["deployment_class"]
+
+    return resolved
 
 
 def print_resolution(document: dict[str, Any]) -> None:
     print(f"composition_id   {document['composition_id']}")
-    print(f"class            {document['deployment_class']}")
+    if "deployment_class" in document:
+        print(f"class            {document['deployment_class']}")
     print()
     print("components")
 

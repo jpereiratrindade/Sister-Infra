@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sister.local/contracts/infra/composition/2.0.0/composition.schema.json",
+  "title": "SisTer Infra Composition 2.0.0",
+  "description": "Declara quais fontes de componentes participam de uma composição declarativa neutra de ambiente, sem declarar identidade duplicada, binding, host, porta, TLS ou qualificação.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "composition_id",
+    "components"
+  ],
+  "properties": {
+    "schema": {
+      "const": "sister.infra.composition/2.0.0"
+    },
+    "composition_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
