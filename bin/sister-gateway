@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SAFE_HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+SAFE_SOCKET = re.compile(r"^/[A-Za-z0-9._/+:-]+$")
+SAFE_PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
+
+
+class GatewayError(RuntimeError):
+    pass
+
+
+def load_resolved(path: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise GatewayError(
+            f"não foi possível ler deployment resolvido: {path}: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise GatewayError(
+            f"deployment resolvido contém JSON inválido: {exc}"
+        ) from exc
+
+    if not isinstance(document, dict):
+        raise GatewayError("deployment resolvido deve ser um objeto JSON")
+    if document.get("schema") != "sister.infra.deployment.resolved/1":
+        raise GatewayError("schema de deployment resolvido não suportado")
+    if document.get("status") != "READY":
+        raise GatewayError("deployment resolvido deve possuir status=READY")
+    if not isinstance(document.get("components"), list):
+        raise GatewayError("deployment resolvido deve possuir components[]")
+    return document
+
+
+def validate_listen(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise GatewayError("listen TCP inválido")
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        if not SAFE_HOST.fullmatch(value):
+            raise GatewayError(f"listen TCP inseguro: {value!r}")
+        return value
+    if parsed.version == 6:
+        return f"[{parsed.compressed}]"
+    return parsed.compressed
+
+
+def published_components(
+    document: dict[str, Any],
+) -> list[dict[str, str]]:
+    published = []
+    seen_hosts: set[str] = set()
+
+    for index, component in enumerate(document["components"]):
+        if not isinstance(component, dict):
+            raise GatewayError(f"components.{index} inválido")
+
+        component_id = component.get("component_id")
+        if not isinstance(component_id, str) or not SAFE_NAME.fullmatch(
+            component_id
+        ):
+            raise GatewayError(
+                f"component_id inseguro em components.{index}"
+            )
+
+        gateway = component.get("gateway")
+        if gateway is None:
+            continue
+        if not isinstance(gateway, dict):
+            raise GatewayError(f"gateway inválido para {component_id}")
+
+        host = gateway.get("host")
+        if not isinstance(host, str) or not SAFE_HOST.fullmatch(host):
+            raise GatewayError(f"gateway host inseguro para {component_id}")
+        normalized_host = host.lower()
+        if normalized_host in seen_hosts:
+            raise GatewayError(f"gateway host duplicado: {host}")
+        seen_hosts.add(normalized_host)
+
+        probe = component.get("probe")
+        if not isinstance(probe, dict):
+            raise GatewayError(
+                f"componente publicado sem probe: {component_id}"
+            )
+        health_path = probe.get("health_path")
+        if not isinstance(health_path, str) or not SAFE_PATH.fullmatch(
+            health_path
+        ):
+            raise GatewayError(f"health_path inseguro para {component_id}")
+
+        runtime = component.get("runtime")
+        if not isinstance(runtime, dict):
+            raise GatewayError(f"runtime inválido para {component_id}")
+        transport = runtime.get("transport")
+
+        if transport == "tcp":
+            listen = validate_listen(runtime.get("listen"))
+            port = runtime.get("port")
+            if not isinstance(port, int) or isinstance(port, bool) or not (
+                1 <= port <= 65535
+            ):
+                raise GatewayError(f"porta TCP inválida para {component_id}")
+            server = f"{listen}:{port}"
+        elif transport == "unix":
+            socket = runtime.get("socket")
+            if not isinstance(socket, str) or not SAFE_SOCKET.fullmatch(socket):
+                raise GatewayError(f"socket Unix inseguro para {component_id}")
+            server = f"unix@{socket}"
+        else:
+            raise GatewayError(
+                f"transporte não suportado para {component_id}: {transport!r}"
+            )
+
+        published.append(
+            {
+                "acl": f"published_{index}",
+                "backend": f"component_{index}_{component_id}",
+                "host": normalized_host,
+                "health_path": health_path,
+                "server": server,
+            }
+        )
+    return published
+
+
+def safe_global(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or any(
+        character.isspace() for character in value
+    ):
+        raise GatewayError(f"{label} inválido")
+    return value
+
+
+def render(
+    document: dict[str, Any],
+    listen_address: str,
+    listen_port: int,
+    tls_pem: str,
+) -> str:
+    listen = validate_listen(listen_address)
+    if not 1 <= listen_port <= 65535:
+        raise GatewayError("porta global do gateway inválida")
+    certificate = safe_global(tls_pem, "path TLS")
+    components = published_components(document)
+
+    lines = [
+        "global",
+        "    log stdout format raw local0",
+        "    maxconn 512",
+        "    ssl-default-bind-options ssl-min-ver TLSv1.2",
+        "",
+        "defaults",
+        "    mode http",
+        "    log global",
+        "    option httplog",
+        "    option dontlognull",
+        "    option http-keep-alive",
+        "    timeout connect 3s",
+        "    timeout client 30s",
+        "    timeout server 30s",
+        "    timeout http-request 10s",
+        "",
+        "frontend ecosystem_https",
+        f"    bind {listen}:{listen_port} ssl crt {certificate}",
+        "    http-request del-header Forwarded",
+        "    http-request del-header X-Forwarded-For",
+        "    http-request del-header X-Forwarded-Host",
+        "    http-request del-header X-Forwarded-Proto",
+        "    http-request del-header X-Sister-User",
+        "    http-request del-header X-Sister-Email",
+        "    http-request del-header X-Sister-Role",
+        "    http-request del-header X-Sister-Capabilities",
+        "    http-request set-header X-Forwarded-Proto https",
+        "    http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+    ]
+
+    for component in components:
+        lines.append(
+            f"    acl {component['acl']} hdr(host),lower -i "
+            f"{component['host']} {component['host']}:{listen_port}"
+        )
+
+    allowed = " or ".join(component["acl"] for component in components)
+    if allowed:
+        lines.append(
+            f"    http-request deny deny_status 421 unless {allowed}"
+        )
+    else:
+        lines.append("    http-request deny deny_status 421")
+
+    for component in components:
+        lines.append(
+            f"    use_backend {component['backend']} "
+            f"if {component['acl']}"
+        )
+
+    for component in components:
+        lines.extend(
+            [
+                "",
+                f"backend {component['backend']}",
+                f"    option httpchk GET {component['health_path']}",
+                "    http-check expect status 200",
+                f"    server runtime {component['server']} "
+                "check inter 2s fall 3 rise 2",
+            ]
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Renderiza HAProxy a partir de deployment resolvido"
+    )
+    subcommands = result.add_subparsers(dest="command", required=True)
+    render_parser = subcommands.add_parser("render")
+    render_parser.add_argument("resolved_deployment")
+    render_parser.add_argument("--listen-address", required=True)
+    render_parser.add_argument("--listen-port", required=True, type=int)
+    render_parser.add_argument("--tls-pem", required=True)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        document = load_resolved(Path(args.resolved_deployment).resolve())
+        output = render(
+            document,
+            args.listen_address,
+            args.listen_port,
+            args.tls_pem,
+        )
+    except GatewayError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    print(output, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

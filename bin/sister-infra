@@ -518,33 +518,16 @@ generate_lab_tls() {
 render_gateway() {
   [[ -f "$TLS_PEM" ]] || die "TLS PEM ausente: $TLS_PEM"
 
-  sed \
-    -e "s|__LISTEN_ADDRESS__|$GATEWAY_LISTEN_ADDRESS|g" \
-    -e "s|__LISTEN_PORT__|$GATEWAY_LISTEN_PORT|g" \
-    -e "s|__TLS_PEM__|$TLS_PEM|g" \
-    -e "s|__SISTER_HOST__|$SISTER_HOST|g" \
-    -e "s|__NEXO_HOST__|$NEXO_HOST|g" \
-    -e "s|__PRAXIS_HOST__|$PRAXIS_HOST|g" \
-    -e "s|__URT_HOST__|$URT_HOST|g" \
-    -e "s|__SISTER_ADDRESS__|$SISTER_ADDRESS|g" \
-    -e "s|__SISTER_PORT__|$SISTER_PORT|g" \
-    -e "s|__NEXO_ADDRESS__|$NEXO_ADDRESS|g" \
-    -e "s|__NEXO_PORT__|$NEXO_PORT|g" \
-    -e "s|__PRAXIS_ADDRESS__|$PRAXIS_ADDRESS|g" \
-    -e "s|__PRAXIS_PORT__|$PRAXIS_PORT|g" \
-    -e "s|__URT_ADDRESS__|$URT_ADDRESS|g" \
-    -e "s|__URT_PORT__|$URT_PORT|g" \
-    -e "s|__SISTER_HEALTH_PATH__|$SISTER_HEALTH_PATH|g" \
-    -e "s|__NEXO_HEALTH_PATH__|$NEXO_HEALTH_PATH|g" \
-    -e "s|__PRAXIS_HEALTH_PATH__|$PRAXIS_HEALTH_PATH|g" \
-    -e "s|__URT_HEALTH_PATH__|$URT_HEALTH_PATH|g" \
-    "$INFRA_ROOT/gateway/haproxy.cfg.in" > "$GATEWAY_CFG"
+  local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
+  [[ -n "$resolved" && -f "$resolved" ]] || \
+    die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
 
-  if grep -Eq '__[A-Z0-9_]+__' "$GATEWAY_CFG"; then
-    echo "[FAIL] placeholders não resolvidos na configuração HAProxy:" >&2
-    grep -oE '__[A-Z0-9_]+__' "$GATEWAY_CFG" | sort -u >&2
-    die "configuração HAProxy contém placeholders não resolvidos"
-  fi
+  "$INFRA_ROOT/bin/sister-gateway" render \
+    "$resolved" \
+    --listen-address "$GATEWAY_LISTEN_ADDRESS" \
+    --listen-port "$GATEWAY_LISTEN_PORT" \
+    --tls-pem "$TLS_PEM" \
+    > "$GATEWAY_CFG" || die "falha ao renderizar gateway declarativo"
 
   "$HAPROXY_BIN" -c -f "$GATEWAY_CFG" >/dev/null || die "configuração HAProxy inválida"
   pass "configuração HAProxy válida"
