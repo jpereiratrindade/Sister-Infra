@@ -92,30 +92,35 @@ Integração comprovada de recursos derivados ao ciclo transacional de
 
 ### OPS-05 — DEV Preview
 
-**NEXT (PLANNED)**
+**DONE**
 
-Experiência pretendida:
+Disponibilização de:
 
 ```bash
-sister-infra dev preview atmos
+sister-infra dev preview <component>
 ```
 
-Objetivo:
+como sessão temporária de desenvolvimento de um componente que declara runtime
+operacional, sem alterar o LAB instalado.
 
-testar um participante no contexto do SisTer sem alterar o LAB instalado.
-Ainda não implementado.
+Propriedades comprovadas:
 
-Propriedades pretendidas:
-
-- isolamento;
-- portas temporárias;
-- release LAB intocada;
-- gateway opcional ou ausente;
-- lifecycle descartável.
+- descoberta normativa via `.sister/component.json`;
+- binding DEV autoritativo via `sister-deployment`;
+- sandbox efêmera;
+- portas dinâmicas com retry;
+- suporte explícito a source dirty restrito ao DEV Preview;
+- `source.clean=false` registrado como evidência;
+- rejeição de evidência dirty por composition/candidate;
+- lifecycle e health contratuais;
+- cleanup scoped;
+- zero resíduos após encerramento;
+- preservação integral do LAB;
+- prova factual com URT real em DEV Preview simultâneo ao URT instalado no LAB.
 
 ### OPS-06 — LAB UX Simplificada
 
-**PLANNED**
+**NEXT (PLANNED)**
 
 Objetivo:
 

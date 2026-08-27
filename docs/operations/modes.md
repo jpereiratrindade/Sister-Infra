@@ -36,39 +36,55 @@ O que muda entre os modos são as políticas e materializações permitidas.
 Permitir trabalhar em um componente sem alterar o ambiente operacional
 instalado.
 
-Experiência desejada:
-
-```bash
-sister-infra dev preview atmos
-```
-
-Semântica pretendida:
-
-> Quero observar Atmos integrado ao SisTer em um ambiente temporário e
-> isolado, sem modificar meu LAB instalado.
-
-Propriedades desejadas:
-
-- build isolado;
-- portas isoladas;
-- runtime temporário;
-- sem alteração de `current`;
-- sem alteração de `previous`;
-- sem restart do LAB;
-- gateway opcional;
-- descarte explícito ao final.
-
-### Estado atual
-
-**PLANEJADO.**
-
-O comando:
+Experiência disponível:
 
 ```bash
 sister-infra dev preview <component>
 ```
 
-ainda não constitui interface operacional disponível.
+Semântica:
+
+> Quero executar temporariamente um componente em desenvolvimento, em ambiente
+> isolado, sem modificar meu LAB instalado.
+
+DEV Preview não representa uma release efêmera nem um mini-LAB.
+
+```text
+DEV Preview
+    =
+sessão temporária de desenvolvimento
+de um componente que declara runtime operacional
+```
+
+A aplicabilidade decorre da natureza operacional declarada pelo componente:
+
+```text
+componente com runtime
+        → dev preview
+
+componente sem runtime
+        → qualify/test
+```
+
+Propriedades efetivamente comprovadas:
+
+- descoberta normativa via `.sister/component.json`;
+- binding DEV autoritativo via `sister-deployment`;
+- sandbox efêmera;
+- portas dinâmicas com retry;
+- runtime temporário;
+- suporte explícito a source dirty restrito ao DEV Preview;
+- evidência `source.clean=false` quando aplicável;
+- sem alteração de `current`;
+- sem alteração de `previous`;
+- sem restart ou perturbação do LAB;
+- lifecycle e health contratuais;
+- cleanup scoped;
+- zero resíduos após encerramento.
+
+### Estado atual
+
+**DISPONÍVEL (OPS-05).**
 
 ## 3. LAB
 
@@ -175,7 +191,7 @@ não devem ser confundidos automaticamente com a interface final desejada de
 
 | Modo | Intenção | Perturba LAB | Estado |
 |---|---|---:|---|
-| DEV | testar componente isoladamente | não | planejado (NEXT) |
+| DEV | testar componente isoladamente | não | disponível (OPS-05) |
 | LAB plan | observar diferença | não | disponível |
 | LAB apply | convergir incrementalmente | somente o necessário | disponível (OPS-03/OPS-04) |
 | PROD reconciliado | implantação governada | não se aplica | planejado |
