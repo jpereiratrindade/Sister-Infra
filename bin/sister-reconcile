@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+from typing import Any
+import urllib.error
+import urllib.request
+
+try:
+    import jsonschema
+except ImportError as exc:
+    raise SystemExit(
+        "[FAIL] sister-reconcile requer o módulo Python jsonschema"
+    ) from exc
+
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
+DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
+PLAN_SCHEMA = "sister.infra.reconcile.plan/1"
+
+
+class ReconcileError(RuntimeError):
+    pass
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ReconcileError(f"não foi possível ler {label}: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ReconcileError(
+            f"JSON inválido em {label}: {path}:{exc.lineno}:{exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ReconcileError(f"{label} deve ser um objeto JSON: {path}")
+    return value
+
+
+def probe_runtime_endpoint(
+    runtime: dict[str, Any],
+    probe: dict[str, Any] | None,
+    timeout_seconds: float = 1.0,
+) -> tuple[bool, str]:
+    transport = runtime.get("transport")
+    health_path = probe.get("health_path") if probe else None
+
+    if transport == "tcp":
+        listen = runtime.get("listen", "127.0.0.1")
+        port = runtime.get("port")
+        if not port or not isinstance(port, int):
+            return False, "invalid_or_missing_port"
+
+        if not health_path:
+            try:
+                with socket.create_connection((listen, port), timeout=timeout_seconds):
+                    return True, "port_open"
+            except OSError as exc:
+                return False, f"connection_refused: {exc}"
+        else:
+            url = f"http://{listen}:{port}{health_path}"
+            req = urllib.request.Request(url, headers={"User-Agent": "sister-reconcile"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                    if resp.status == 200:
+                        return True, "PASS (HTTP 200)"
+                    return False, f"HTTP {resp.status}"
+            except urllib.error.HTTPError as exc:
+                return False, f"HTTP {exc.code}"
+            except OSError as exc:
+                return False, f"connection_failed: {exc}"
+            except Exception as exc:
+                return False, f"probe_failed: {exc}"
+
+    elif transport == "unix":
+        socket_path = runtime.get("socket")
+        if not socket_path or not isinstance(socket_path, str):
+            return False, "missing_socket_path"
+        sock_p = Path(socket_path)
+        if not sock_p.exists():
+            return False, f"socket_absent: {socket_path}"
+
+        if not health_path:
+            return True, "socket_exists"
+
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout_seconds)
+            sock.connect(socket_path)
+            req = f"GET {health_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            sock.sendall(req.encode("utf-8"))
+            raw = sock.recv(4096)
+            sock.close()
+            if b"HTTP/1." in raw and (b" 200 " in raw or b" 200\r\n" in raw):
+                return True, "PASS (HTTP 200)"
+            return False, "HTTP response status is not 200"
+        except Exception as exc:
+            return False, f"socket_probe_failed: {exc}"
+
+    return False, f"unsupported_transport: {transport}"
+
+
+def load_current_state(
+    current_release_arg: str | None,
+    probe_runtime: bool = True,
+    probe_override: dict[str, tuple[bool, str]] | None = None,
+) -> dict[str, Any] | None:
+    current_dir: Path | None = None
+
+    if current_release_arg:
+        path = Path(current_release_arg).expanduser().resolve()
+        if path.is_file() and path.name == "manifest.json":
+            current_dir = path.parent
+        elif path.is_dir():
+            current_dir = path
+        else:
+            raise ReconcileError(f"release current indicada inexistente: {path}")
+    else:
+        env_release = os.environ.get("SISTER_CURRENT_RELEASE")
+        if env_release:
+            current_dir = Path(env_release).expanduser().resolve()
+        else:
+            install_root = os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT")
+            if install_root:
+                cand = Path(install_root).expanduser() / "current"
+                if cand.is_symlink() or cand.is_dir():
+                    current_dir = cand.resolve()
+            else:
+                default_cand = Path.home() / ".local" / "share" / "sister" / "current"
+                if default_cand.is_symlink() or default_cand.is_dir():
+                    current_dir = default_cand.resolve()
+
+    if not current_dir or not current_dir.exists():
+        return None
+
+    manifest_file = current_dir / "manifest.json"
+    if not manifest_file.is_file():
+        raise ReconcileError(f"manifest.json ausente na release current: {current_dir}")
+
+    manifest = load_json(manifest_file, "manifesto da release current")
+
+    # Localiza o deployment resolvido da release atual
+    deployment_evidence_rel = manifest.get("deployment", {}).get("evidence")
+    if not deployment_evidence_rel:
+        raise ReconcileError(f"manifesto current sem evidência de deployment: {manifest_file}")
+
+    resolved_file = current_dir / deployment_evidence_rel
+    if not resolved_file.is_file():
+        raise ReconcileError(f"deployment resolvido ausente em current: {resolved_file}")
+
+    resolved = load_json(resolved_file, "deployment resolvido da release current")
+
+    # Mapeia componentes do deployment resolvido
+    resolved_by_id: dict[str, dict[str, Any]] = {}
+    for comp in resolved.get("components", []):
+        cid = comp.get("component_id")
+        if cid:
+            resolved_by_id[cid] = comp
+
+    # Observação factual do runtime
+    observed_components: dict[str, dict[str, Any]] = {}
+    for comp in manifest.get("components", []):
+        cid = comp.get("component_id")
+        if not cid:
+            continue
+
+        resolved_comp = resolved_by_id.get(cid, {})
+        runtime = resolved_comp.get("runtime", comp.get("runtime", {}))
+        probe = resolved_comp.get("probe")
+
+        if probe_override and cid in probe_override:
+            healthy, detail = probe_override[cid]
+        elif probe_runtime:
+            healthy, detail = probe_runtime_endpoint(runtime, probe)
+        else:
+            healthy, detail = None, "probe_unobserved"
+
+        observed_components[cid] = {
+            "component_id": cid,
+            "system_id": comp.get("system_id"),
+            "commit": comp.get("commit"),
+            "path": comp.get("path"),
+            "artifacts": comp.get("artifacts", []),
+            "runtime": runtime,
+            "probe": probe,
+            "gateway": resolved_comp.get("gateway"),
+            "factual_healthy": healthy,
+            "factual_detail": detail,
+        }
+
+    return {
+        "release_id": manifest.get("release_id", current_dir.name),
+        "manifest": manifest,
+        "resolved_deployment": resolved,
+        "components": observed_components,
+    }
+
+
+def validate_resolved_deployment_compatibility(
+    resolved_doc: dict[str, Any],
+    candidate_manifest: dict[str, Any],
+) -> None:
+    if resolved_doc.get("status") != "READY":
+        raise ReconcileError(
+            f"deployment resolvido deve possuir status=READY (atual: {resolved_doc.get('status')!r})"
+        )
+
+    dep_cand_id = resolved_doc.get("candidate_id")
+    cand_id = candidate_manifest.get("candidate_id")
+    if not dep_cand_id:
+        raise ReconcileError("deployment resolvido inválido: candidate_id ausente")
+    if not cand_id:
+        raise ReconcileError("candidata desejada inválida: candidate_id ausente")
+    if dep_cand_id != cand_id:
+        raise ReconcileError(
+            f"incompatibilidade: resolved deployment pertence à candidata {dep_cand_id!r}, "
+            f"mas a candidata desejada é {cand_id!r}"
+        )
+
+    dep_comp_id = resolved_doc.get("composition_id")
+    cand_comp_id = candidate_manifest.get("composition", {}).get("composition_id")
+    if not dep_comp_id:
+        raise ReconcileError("deployment resolvido inválido: composition_id ausente")
+    if not cand_comp_id:
+        raise ReconcileError("candidata desejada inválida: composition.composition_id ausente")
+    if dep_comp_id != cand_comp_id:
+        raise ReconcileError(
+            f"incompatibilidade: resolved deployment composition_id ({dep_comp_id!r}) "
+            f"difere da candidata ({cand_comp_id!r})"
+        )
+
+    cand_sys_ids = sorted(
+        c.get("system_id") for c in candidate_manifest.get("components", []) if c.get("system_id")
+    )
+    dep_sys_ids = sorted(
+        c.get("system_id") for c in resolved_doc.get("components", []) if c.get("system_id")
+    )
+    if cand_sys_ids != dep_sys_ids:
+        raise ReconcileError(
+            f"incompatibilidade: sistemas da candidata ({cand_sys_ids}) "
+            f"divergem do deployment resolvido ({dep_sys_ids})"
+        )
+
+    cand_cids = sorted(
+        c.get("component_id") for c in candidate_manifest.get("components", []) if c.get("component_id")
+    )
+    dep_cids = sorted(
+        c.get("component_id") for c in resolved_doc.get("components", []) if c.get("component_id")
+    )
+    if cand_cids != dep_cids:
+        raise ReconcileError(
+            f"incompatibilidade: componentes da candidata ({cand_cids}) "
+            f"divergem do deployment resolvido ({dep_cids})"
+        )
+
+
+def extract_normalized_projection(
+    components: dict[str, dict[str, Any]],
+) -> dict[str, tuple[Any, ...]]:
+    projection = {}
+    for cid, c in components.items():
+        rt = c.get("runtime") or {}
+        pr = c.get("probe") or {}
+        gw = c.get("gateway") or {}
+        projection[cid] = (
+            c.get("system_id"),
+            rt.get("transport"),
+            rt.get("listen"),
+            rt.get("port"),
+            rt.get("socket"),
+            pr.get("health_path"),
+            gw.get("host"),
+            gw.get("public_url"),
+        )
+    return projection
+
+
+def verify_candidate_authority(
+    candidate_dir: Path,
+    candidate_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    schema = candidate_manifest.get("schema")
+    if schema == "sister.infra.candidate/1":
+        if not CANDIDATE_CLI.is_file():
+            raise ReconcileError(
+                f"autoridade sister-candidate não encontrada em {CANDIDATE_CLI}"
+            )
+        res = subprocess.run(
+            [sys.executable, str(CANDIDATE_CLI), "verify", str(candidate_dir), "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            raise ReconcileError(
+                f"candidata desejada falhou na verificação autoritativa fail-closed:\n{err}"
+            )
+        try:
+            return json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            raise ReconcileError(
+                f"saída JSON inválida de sister-candidate verify: {exc}"
+            ) from exc
+    elif schema == "sister.infra.workstation.candidate/1":
+        if candidate_manifest.get("qualification", {}).get("status") != "PASS":
+            raise ReconcileError("candidata legado sem qualificação PASS")
+        return candidate_manifest
+    else:
+        raise ReconcileError(f"schema de candidata não suportado: {schema!r}")
+
+
+def load_desired_state(
+    candidate_arg: str,
+    deployment_arg: str,
+) -> dict[str, Any]:
+    cand_path = Path(candidate_arg).expanduser().resolve()
+    if cand_path.is_file() and cand_path.name == "manifest.json":
+        candidate_dir = cand_path.parent
+        cand_manifest_file = cand_path
+    elif cand_path.is_dir():
+        candidate_dir = cand_path
+        cand_manifest_file = candidate_dir / "manifest.json"
+    else:
+        raise ReconcileError(f"candidata desejada inexistente: {cand_path}")
+
+    if not cand_manifest_file.is_file():
+        raise ReconcileError(f"manifest.json ausente na candidata: {cand_manifest_file}")
+
+    raw_manifest = load_json(cand_manifest_file, "manifesto da candidata desejada")
+    candidate_manifest = verify_candidate_authority(candidate_dir, raw_manifest)
+
+    dep_path = Path(deployment_arg).expanduser().resolve()
+    if not dep_path.is_file():
+        raise ReconcileError(f"arquivo de deployment desejado inexistente: {dep_path}")
+
+    dep_doc = load_json(dep_path, "deployment desejado")
+
+    # Se o deployment informado já estiver resolvido (READY), utiliza diretamente.
+    if dep_doc.get("schema") == "sister.infra.deployment.resolved/1":
+        resolved_deployment = dep_doc
+    elif dep_doc.get("schema") == "sister.infra.deployment/1.0.0":
+        # Resolve utilizando sister-deployment
+        res = subprocess.run(
+            [sys.executable, str(DEPLOYMENT_CLI), "resolve", str(cand_manifest_file), str(dep_path), "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            raise ReconcileError(f"falha ao resolver deployment desejado:\n{err}")
+        try:
+            resolved_deployment = json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            raise ReconcileError(f"resolução de deployment produziu JSON inválido: {exc}") from exc
+    else:
+        raise ReconcileError(f"schema de deployment não reconhecido: {dep_doc.get('schema')}")
+
+    # Validação fail-closed de compatibilidade entre deployment resolvido e candidata
+    validate_resolved_deployment_compatibility(resolved_deployment, candidate_manifest)
+
+    resolved_by_id: dict[str, dict[str, Any]] = {}
+    for comp in resolved_deployment.get("components", []):
+        cid = comp.get("component_id")
+        if cid:
+            resolved_by_id[cid] = comp
+
+    desired_components: dict[str, dict[str, Any]] = {}
+    for comp in candidate_manifest.get("components", []):
+        cid = comp.get("component_id")
+        if not cid:
+            continue
+        resolved_comp = resolved_by_id.get(cid, {})
+        desired_components[cid] = {
+            "component_id": cid,
+            "system_id": comp.get("system_id"),
+            "commit": comp.get("commit"),
+            "path": comp.get("path"),
+            "artifacts": comp.get("artifacts", []),
+            "runtime": resolved_comp.get("runtime", comp.get("runtime", {})),
+            "probe": resolved_comp.get("probe"),
+            "gateway": resolved_comp.get("gateway"),
+        }
+
+    return {
+        "candidate_id": candidate_manifest.get("candidate_id", candidate_dir.name),
+        "candidate_manifest": candidate_manifest,
+        "resolved_deployment": resolved_deployment,
+        "components": desired_components,
+    }
+
+
+def compute_plan(
+    current: dict[str, Any] | None,
+    desired: dict[str, Any],
+    mode: str = "lab",
+    probe_runtime: bool = True,
+) -> dict[str, Any]:
+    curr_components = current["components"] if current else {}
+    des_components = desired["components"]
+
+    all_cids = sorted(set(curr_components.keys()) | set(des_components.keys()))
+
+    changes = []
+    summary_counts = {
+        "keep": 0,
+        "add": 0,
+        "update": 0,
+        "remove": 0,
+        "reconfigure": 0,
+        "repair": 0,
+    }
+
+    for cid in all_cids:
+        in_curr = cid in curr_components
+        in_des = cid in des_components
+
+        if in_des and not in_curr:
+            # ADD
+            des_c = des_components[cid]
+            d_commit = des_c.get("commit") or "-"
+            changes.append({
+                "component_id": cid,
+                "system_id": des_c.get("system_id"),
+                "current_commit": "-",
+                "desired_commit": d_commit,
+                "action": "ADD",
+                "factual_status": "unobserved",
+                "reason": "desired participant absent from current state",
+            })
+            summary_counts["add"] += 1
+
+        elif in_curr and not in_des:
+            # REMOVE
+            curr_c = curr_components[cid]
+            c_commit = curr_c.get("commit") or "-"
+            f_healthy = curr_c.get("factual_healthy")
+            f_status = "healthy" if f_healthy is True else ("unhealthy" if f_healthy is False else "unobserved")
+            changes.append({
+                "component_id": cid,
+                "system_id": curr_c.get("system_id"),
+                "current_commit": c_commit,
+                "desired_commit": "-",
+                "action": "REMOVE",
+                "factual_status": f_status,
+                "reason": "participant absent from desired candidate",
+            })
+            summary_counts["remove"] += 1
+
+        else:
+            # Presente em ambos
+            curr_c = curr_components[cid]
+            des_c = des_components[cid]
+            c_commit = curr_c.get("commit") or "-"
+            d_commit = des_c.get("commit") or "-"
+            factual_healthy = curr_c.get("factual_healthy")
+            factual_detail = curr_c.get("factual_detail", "")
+            f_status = "healthy" if factual_healthy is True else ("unhealthy" if factual_healthy is False else "unobserved")
+
+            c_artifacts = {a["id"]: a.get("sha256") for a in curr_c.get("artifacts", [])}
+            d_artifacts = {a["id"]: a.get("sha256") for a in des_c.get("artifacts", [])}
+
+            c_binding = curr_c.get("runtime", {})
+            d_binding = des_c.get("runtime", {})
+            c_probe = curr_c.get("probe", {})
+            d_probe = des_c.get("probe", {})
+            c_gw = curr_c.get("gateway", {})
+            d_gw = des_c.get("gateway", {})
+
+            # 1. Alteração desejada de código/commit
+            if c_commit != d_commit:
+                action = "UPDATE"
+                c_short = c_commit[:12] if len(c_commit) >= 12 else c_commit
+                d_short = d_commit[:12] if len(d_commit) >= 12 else d_commit
+                reason = f"desired commit differs (current={c_short}, desired={d_short})"
+                summary_counts["update"] += 1
+
+            # 2. Alteração desejada de hashes de artefatos
+            elif c_artifacts != d_artifacts:
+                action = "UPDATE"
+                reason = "component artifact hashes differ"
+                summary_counts["update"] += 1
+
+            # 3. Alteração desejada de configuração física/runtime/gateway (precedência estrita sobre REPAIR)
+            elif c_binding != d_binding or c_probe != d_probe or c_gw != d_gw:
+                action = "RECONFIGURE"
+                reason = "runtime transport, endpoint or gateway configuration changed"
+                summary_counts["reconfigure"] += 1
+
+            # 4. Estado estrutural desejado == atual, mas observação factual divergiu (REPAIR estrito)
+            elif factual_healthy is False:
+                action = "REPAIR"
+                reason = f"declared current matches desired structurally, but factual health probe failed ({factual_detail})"
+                summary_counts["repair"] += 1
+
+            # 5. Estado estrutural desejado == atual e observação factual não divergente (KEEP)
+            else:
+                action = "KEEP"
+                if factual_healthy is True:
+                    reason = "desired and current identity, commit, artifacts and binding match; runtime probe healthy"
+                else:
+                    reason = "desired and current identity, commit, artifacts and binding match; runtime probe unobserved (--no-probe-runtime)"
+                summary_counts["keep"] += 1
+
+            changes.append({
+                "component_id": cid,
+                "system_id": des_c.get("system_id", curr_c.get("system_id")),
+                "current_commit": c_commit,
+                "desired_commit": d_commit,
+                "action": action,
+                "factual_status": f_status,
+                "reason": reason,
+            })
+
+    # Gateway diff
+    curr_gw_routes = {}
+    if current and "resolved_deployment" in current:
+        for c in current["resolved_deployment"].get("components", []):
+            if c.get("gateway"):
+                curr_gw_routes[c["component_id"]] = c["gateway"]
+
+    des_gw_routes = {}
+    for c in desired["resolved_deployment"].get("components", []):
+        if c.get("gateway"):
+            des_gw_routes[c["component_id"]] = c["gateway"]
+
+    if curr_gw_routes == des_gw_routes:
+        gw_action = "KEEP"
+        gw_reason = "gateway routes and listeners unchanged"
+    else:
+        gw_action = "RECONFIGURE"
+        gw_reason = "gateway routing or published hosts differ"
+
+    # Ecosystem projection diff (normalizado pelos campos efetivamente projetados)
+    curr_proj = extract_normalized_projection(curr_components)
+    des_proj = extract_normalized_projection(des_components)
+    if curr_proj == des_proj:
+        proj_action = "KEEP"
+        proj_reason = "ecosystem projection unchanged"
+    else:
+        proj_action = "REFRESH"
+        proj_reason = "ecosystem participants or runtime projections changed"
+
+    plan = {
+        "schema": PLAN_SCHEMA,
+        "mode": mode,
+        "runtime_observation": "active" if probe_runtime else "unobserved",
+        "current": {
+            "release_id": current.get("release_id", "-") if current else "-",
+            "deployment_id": (
+                current.get("resolved_deployment", {}).get("deployment_id", "-")
+                if current else "-"
+            ),
+        },
+        "desired": {
+            "candidate_id": desired.get("candidate_id", "-"),
+            "deployment_id": (
+                desired.get("resolved_deployment", {}).get("deployment_id", "-")
+            ),
+        },
+        "changes": changes,
+        "gateway": {
+            "action": gw_action,
+            "reason": gw_reason,
+        },
+        "projection": {
+            "action": proj_action,
+            "reason": proj_reason,
+        },
+        "summary": summary_counts,
+    }
+
+    return plan
+
+
+def render_human_plan(plan: dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"=== SisTer Infra — Reconcile Plan ({plan['mode']}) ===")
+    lines.append(f"Current release:    {plan['current']['release_id']}")
+    lines.append(f"Desired candidate:  {plan['desired']['candidate_id']}")
+    lines.append(f"Desired deployment: {plan['desired']['deployment_id']}")
+    lines.append("")
+
+    header = f"{'COMPONENT':<12} {'CURRENT':<14} {'DESIRED':<14} {'ACTION':<12} {'REASON'}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for item in plan["changes"]:
+        cid = item["component_id"]
+        c_short = item["current_commit"]
+        if c_short != "-" and len(c_short) > 12:
+            c_short = c_short[:12]
+        d_short = item["desired_commit"]
+        if d_short != "-" and len(d_short) > 12:
+            d_short = d_short[:12]
+        action = item["action"]
+        reason = item["reason"]
+
+        lines.append(f"{cid:<12} {c_short:<14} {d_short:<14} {action:<12} {reason}")
+
+    lines.append("")
+    lines.append(f"{'DERIVED RESOURCE':<18} {'ACTION':<12} {'REASON'}")
+    lines.append("-" * 50)
+    lines.append(f"{'gateway':<18} {plan['gateway']['action']:<12} {plan['gateway']['reason']}")
+    lines.append(f"{'projection':<18} {plan['projection']['action']:<12} {plan['projection']['reason']}")
+
+    s = plan["summary"]
+    lines.append("")
+    lines.append(
+        f"Summary: {s['keep']} KEEP, {s['add']} ADD, {s['update']} UPDATE, "
+        f"{s['remove']} REMOVE, {s['reconfigure']} RECONFIGURE, {s['repair']} REPAIR"
+    )
+    lines.append("Plan only: no operational changes performed.")
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-reconcile",
+        description="Calcula e explica o plano determinístico de reconciliação entre o estado atual e o desejado",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan_p = sub.add_parser("plan", help="Emite o plano declarativo de reconciliação (read-only)")
+    plan_p.add_argument(
+        "--desired-candidate",
+        required=True,
+        help="Diretório da candidata desejada verificada ou caminho de seu manifest.json",
+    )
+    plan_p.add_argument(
+        "--desired-deployment",
+        required=True,
+        help="Caminho do arquivo de deployment desejado (resolvido ou declarativo)",
+    )
+    plan_p.add_argument(
+        "--current-release",
+        help="Caminho da release ativa instalada ou seu manifest.json",
+    )
+    plan_p.add_argument(
+        "--mode",
+        default="lab",
+        choices=["dev", "lab", "production"],
+        help="Contexto operacional do plano (padrão: lab)",
+    )
+    plan_p.add_argument(
+        "--probe-runtime",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ativa ou desativa sondagem factual de rede nos componentes atuais (padrão: ativa)",
+    )
+    plan_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emite o plano no formato JSON padronizado",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        current = load_current_state(
+            args.current_release,
+            probe_runtime=args.probe_runtime,
+        )
+        desired = load_desired_state(
+            args.desired_candidate,
+            args.desired_deployment,
+        )
+        plan = compute_plan(
+            current,
+            desired,
+            mode=args.mode,
+            probe_runtime=args.probe_runtime,
+        )
+
+        if args.json:
+            print(json.dumps(plan, indent=2, sort_keys=True))
+        else:
+            print(render_human_plan(plan))
+
+        return 0
+
+    except ReconcileError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

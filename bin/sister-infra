@@ -15,15 +15,24 @@ SisTer Infra — harness operacional do ecossistema
 
 Uso:
   ./bin/sister-infra <comando> [--profile dev|lan|production]
+  ./bin/sister-infra lab <comando> [opções]
+  ./bin/sister-infra workstation <comando> [opções]
+  ./bin/sister-infra candidate <comando> [opções]
 
-Comandos:
+Comandos gerais:
   bootstrap   prepara TLS e valida gateway do deployment resolvido
   up          inicia gateway derivado do deployment resolvido
   down        para o gateway declarativo
   status      observa bindings e gateway declarativos
   verify      valida bindings, TLS e gateway declarativos
 
+Modos operacionais:
+  lab         operações do ambiente LAB (ex.: ./bin/sister-infra lab plan)
+  workstation gerenciador de releases de workstation
+  candidate   materialização e verificação de candidatas
+
 Exemplos:
+  ./bin/sister-infra lab plan --desired-candidate <dir> --desired-deployment <file>
   ./bin/sister-infra bootstrap --profile lan
   ./bin/sister-infra up --profile lan
   ./bin/sister-infra status --profile lan
@@ -757,7 +766,44 @@ main() {
   esac
 }
 
+cmd_lab() {
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    plan)
+      exec "$INFRA_ROOT/bin/sister-reconcile" plan --mode lab "$@"
+      ;;
+    help|-h|--help)
+      cat <<'EOF'
+SisTer Infra — lab control plane
+
+Uso:
+  sister-infra lab plan [opções]
+
+Opções:
+  --desired-candidate <dir>     diretório da candidata desejada verificada ou manifest.json
+  --desired-deployment <file>   deployment resolvido ou declarativo desejado
+  --current-release <dir>       diretório da release ativa (opcional)
+  --no-probe-runtime            desativa sondagem factual de rede
+  --json                        emite o plano em JSON
+  -h, --help                    esta ajuda
+EOF
+      exit 0
+      ;;
+    *)
+      die "comando lab desconhecido: $subcmd (comandos disponíveis: plan)"
+      ;;
+  esac
+}
+
 # SISTER-INFRA-DISPATCH
+if [[ "${1:-}" == "lab" ]]; then
+  shift
+  cmd_lab "$@"
+  exit $?
+fi
+
 if [[ "${1:-}" == "candidate" ]]; then
   shift
   exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-candidate" "$@"
