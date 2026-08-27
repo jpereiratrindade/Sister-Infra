@@ -16,25 +16,24 @@ class LabUxError(RuntimeError):
     pass
 
 def canonical_paths() -> tuple[Path, Path]:
-    home = Path.home()
-    config_root = Path(
+    control_plane = Path(
         os.environ.get(
-            "SISTER_WORKSTATION_CONFIG_ROOT",
-            str(home / ".config" / "sister" / "workstation"),
+            "SISTER_WORKSTATION_CONTROL_PLANE_SOURCE",
+            str(INFRA_ROOT),
         )
     ).expanduser()
 
     composition = Path(
         os.environ.get(
             "SISTER_WORKSTATION_COMPOSITION_FILE",
-            str(config_root / "composition.json"),
+            str(control_plane / "config" / "compositions" / "workstation.json"),
         )
     ).expanduser()
 
     deployment = Path(
         os.environ.get(
             "SISTER_WORKSTATION_DEPLOYMENT_FILE",
-            str(config_root / "deployment.json"),
+            str(control_plane / "config" / "deployments" / "workstation-lab.json"),
         )
     ).expanduser()
 

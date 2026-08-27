@@ -114,7 +114,8 @@ raise SystemExit(int(os.environ.get("OPS06_RECONCILE_RC", "0")))
         env = os.environ.copy()
         env.update(
             {
-                "SISTER_WORKSTATION_CONFIG_ROOT": str(cfg),
+                "SISTER_WORKSTATION_COMPOSITION_FILE": str(composition),
+                "SISTER_WORKSTATION_DEPLOYMENT_FILE": str(deployment),
                 "SISTER_LAB_TMPDIR": str(tmp_root),
                 "SISTER_LAB_CANDIDATE_CLI": str(fake_candidate),
                 "SISTER_LAB_RECONCILE_CLI": str(fake_reconcile),
@@ -222,6 +223,38 @@ raise SystemExit(int(os.environ.get("OPS06_RECONCILE_RC", "0")))
         json.loads(res.stdout)
         assert "candidate-noise" not in res.stdout
         print("[PASS] Gate I — stdout JSON permanece puro")
+
+        control_plane = root / "control-plane"
+        official_composition = (
+            control_plane / "config" / "compositions" / "workstation.json"
+        )
+        official_deployment = (
+            control_plane / "config" / "deployments" / "workstation-lab.json"
+        )
+        official_composition.parent.mkdir(parents=True)
+        official_deployment.parent.mkdir(parents=True)
+        official_composition.write_text(
+            '{"schema":"fixture.official.composition"}\n',
+            encoding="utf-8",
+        )
+        official_deployment.write_text(
+            '{"schema":"fixture.official.deployment"}\n',
+            encoding="utf-8",
+        )
+
+        default_env = env.copy()
+        default_env.pop("SISTER_WORKSTATION_COMPOSITION_FILE", None)
+        default_env.pop("SISTER_WORKSTATION_DEPLOYMENT_FILE", None)
+        default_env["SISTER_WORKSTATION_CONTROL_PLANE_SOURCE"] = str(control_plane)
+
+        res = run([str(INFRA_CLI), "lab", "plan", "--json"], default_env)
+        json.loads(res.stdout)
+        candidate_call = read_jsonl(candidate_log)[-1]
+        reconcile_call = read_jsonl(reconcile_log)[-1]
+        assert str(official_composition.resolve()) in candidate_call["args"]
+        assert Path(reconcile_call["deployment"]) == official_deployment.resolve()
+        assert not list(tmp_root.iterdir())
+        print("[PASS] Gate J — defaults oficiais derivados do control plane")
 
     print("[PASS] OPS-06 LAB UX resolver")
     return 0
