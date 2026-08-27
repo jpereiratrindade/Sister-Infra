@@ -18,18 +18,55 @@ APPLY
 VERIFY
 ```
 
+No LAB:
+
+```text
+CURRENT
+  = release instalada + estado factual observado
+
+DESIRED
+  = composition + deployment canônicos do control plane
+```
+
+A camada `sister-lab` resolve a UX. O motor `sister-reconcile` permanece
+genérico e continua recebendo candidata + deployment explicitamente.
+
 ## 2. Plan
 
 `plan` é observacional.
 
-Ele pode:
+UX canônica:
+
+```bash
+sister-infra lab plan
+```
+
+Por padrão:
+
+```text
+composition
+  → config/compositions/workstation.json
+
+deployment
+  → config/deployments/workstation-lab.json
+```
+
+Overrides explícitos continuam válidos:
+
+```bash
+sister-infra lab plan \
+  --desired-candidate <candidate> \
+  --desired-deployment <deployment>
+```
+
+O plan pode:
 
 - ler manifests;
 - verificar candidatas;
 - resolver ou verificar deployments;
 - observar runtimes;
 - comparar estado;
-- produzir reasons.
+- produzir `reason`s.
 
 Ele não deve:
 
@@ -39,13 +76,10 @@ Ele não deve:
 - alterar links;
 - recarregar gateway;
 - reemitir certificados;
-- atualizar projeções.
+- atualizar projeções persistentes.
 
-No LAB:
-
-```bash
-sister-infra lab plan   --desired-candidate <candidate>   --desired-deployment <deployment>
-```
+Uma candidata derivada implicitamente pela UX LAB é efêmera e deve ser removida
+ao final, inclusive em falha.
 
 Saída conceitual:
 
@@ -54,8 +88,7 @@ COMPONENT    CURRENT    DESIRED    ACTION    REASON
 
 sister       A          A          KEEP      unchanged and healthy
 nexo         B          B          KEEP      unchanged and healthy
-urt          C          C          KEEP      unchanged and healthy
-atmos        -          D          ADD       desired participant absent
+urt          C          D          UPDATE    desired commit differs
 ```
 
 ## 3. Apply
@@ -63,15 +96,21 @@ atmos        -          D          ADD       desired participant absent
 `apply` constitui autorização explícita para executar o change-set permitido
 pelo modo operacional.
 
-No LAB:
+UX canônica:
 
 ```bash
-sister-infra lab apply   --desired-candidate <candidate>   --desired-deployment <deployment>
+sister-infra lab apply
 ```
 
-O apply deve recalcular o estado factual imediatamente antes da transformação.
+Override avançado:
 
-Conceitualmente:
+```bash
+sister-infra lab apply \
+  --desired-candidate <candidate> \
+  --desired-deployment <deployment>
+```
+
+O apply recalcula o estado factual imediatamente antes da transformação.
 
 ```text
 LOCK
@@ -82,7 +121,7 @@ PLAN
  ↓
 PREFLIGHT / AUTHORITY
  ↓
-MATERIALIZE
+MATERIALIZE TARGET_RELEASE
  ↓
 ACT
  ↓
@@ -92,6 +131,9 @@ COMMIT
  ↓
 FINAL VERIFY
 ```
+
+O `sister-reconcile` não conhece os paths canônicos da workstation. Essa
+resolução pertence à camada de UX `sister-lab`.
 
 ## 4. Idempotência
 
@@ -137,74 +179,71 @@ REPAIR
 
 e não `KEEP`.
 
-## 6. Recursos derivados (Implementado no LAB)
+## 6. Recursos derivados
 
-Além dos componentes participantes, o plano modela explicitamente os
-recursos derivados:
-
-```text
-gateway       (HAProxy)
-projection    (ecosystem_projection.tsv)
-```
-
-No plano (`plan`), esses dois recursos são observados, explicados e
-possuem ações próprias:
+Além dos componentes participantes, o plano modela explicitamente:
 
 ```text
-gateway      RECONFIGURE   published route set changed
-projection   REFRESH       ecosystem projection changed
+gateway
+projection
 ```
 
-O certificado TLS leaf LAB, por sua vez, não é modelado como uma ação
-independente do plano: sua reconciliação é uma transformação derivada
-executada durante o `apply`, quando a publicação do gateway e o conjunto de
-hosts/SANs exigem reemissão do certificado.
+No plano, esses recursos possuem ações e `reason`s próprios.
 
-No `apply`, o OPS-04 implementou e comprovou operacionalmente:
+O certificado TLS leaf LAB não é uma ação independente do plano: sua
+reconciliação é transformação derivada durante `apply`, quando a publicação do
+gateway e o conjunto de hosts/SANs exigem reemissão.
 
-- **HAProxy Gateway**:
-  - renderização determinística via `sister-gateway render`;
-  - validação sintática prévia com `haproxy -c` antes de qualquer reload;
-  - graceful reload via `-sf <pid_old>` preservando conexões ativas;
-  - em caso de falha posterior, rollback gracioso restaurando a configuração
-    anterior sobre o processo TARGET ativo;
-- **Ecosystem Projection**:
-  - resolução autoritativa do caminho via `SISTER_ECOSYSTEM_PROJECTION_FILE`,
-    configuração de runtime ou convenção padrão (fail-closed se indeterminado);
-  - substituição atômica no mesmo filesystem via `tmp + rename(2)`;
-  - restauração atômica do conteúdo anterior em caso de rollback;
-- **Certificado TLS Leaf LAB**:
-  - reconciliação controlada do leaf quando a publicação do gateway/SANs exigir;
-  - preservação estrita dos bytes de `CA_CERT` e `CA_KEY` (a rotação da CA é
-    fail-closed e exige ação de autoridade explícita, como bootstrap);
-  - restauração atômica do leaf anterior na transação em caso de rollback;
-- **Rollback Integrado e Invertido**:
-  - desfaz todas as etapas de forma rigorosamente inversa (re-comuta links se
-    necessário, restaura projeção, recarrega gateway anterior, restaura leaf
-    e encerra novos processos), garantindo zero arquivos temporários e zero
-    processos ou listeners órfãos.
+O LAB já comprova:
+
+### Gateway HAProxy
+
+- renderização determinística via `sister-gateway render`;
+- validação prévia com `haproxy -c`;
+- graceful reload via `-sf <pid_old>`;
+- rollback gracioso da configuração anterior.
+
+### Ecosystem Projection
+
+- resolução autoritativa do caminho;
+- substituição atômica via arquivo temporário + `rename(2)`;
+- restauração atômica em rollback.
+
+### TLS leaf LAB
+
+- reconciliação controlada quando SANs exigem;
+- preservação estrita de `CA_CERT` e `CA_KEY`;
+- rotação da CA fail-closed;
+- restauração do leaf anterior em rollback.
+
+### Rollback integrado
+
+- ordem inversa;
+- zero duplicidade;
+- zero resíduos transitórios;
+- restauração de participantes e recursos derivados.
 
 ## 7. Lock operacional
 
-Transformações concorrentes sobre o lifecycle da workstation não devem
-executar simultaneamente.
+Transformações concorrentes sobre o lifecycle da workstation não podem executar
+simultaneamente.
 
-O domínio de exclusão deve abranger operações que possam alterar:
+O domínio de exclusão abrange operações que possam alterar:
 
 - releases;
 - `current`;
 - `previous`;
 - participantes;
-- recursos derivados.
+- gateway;
+- projection;
+- TLS derivado.
 
-O objetivo não é apenas evitar corrupção de arquivos, mas impedir duas
-autoridades operacionais simultâneas sobre o mesmo estado factual.
+O lock protege a autoridade operacional sobre o mesmo estado factual, não apenas
+arquivos individuais.
 
 ## 8. Releases e commit operacional
 
-Mudanças de versão não devem reescrever a release corrente.
-
-A sequência correta é:
+Mudanças de versão não reescrevem a release corrente.
 
 ```text
 OLD_RELEASE
@@ -223,8 +262,7 @@ O `current` é o commit point operacional.
 
 ## 9. Rollback
 
-O rollback é parte da transformação, não uma operação improvisada após uma
-falha.
+Rollback faz parte da transformação.
 
 Antes do commit operacional:
 
@@ -240,7 +278,7 @@ restaurar participantes anteriores
 preservar current
 ```
 
-O rollback deve respeitar:
+Invariantes:
 
 - ordem inversa;
 - ausência de duplicidade;
@@ -250,13 +288,33 @@ O rollback deve respeitar:
 
 ## 10. Probes e proxy ambiental
 
-Health probes sobre o plano de dados local devem observar diretamente o runtime
-e não podem ser desviados por configuração ambiental de proxy HTTP/HTTPS.
+Health probes do plano de dados local devem observar diretamente o runtime e não
+podem ser desviados por `HTTP_PROXY`, `HTTPS_PROXY` ou `ALL_PROXY`.
 
-Isso é particularmente importante em ambientes institucionais nos quais
-variáveis como `HTTP_PROXY`, `HTTPS_PROXY` e `ALL_PROXY` podem estar presentes.
+Isso é especialmente importante em ambientes institucionais.
 
-## 11. Evidência
+## 11. Autoridade e modos
+
+`plan` pode calcular diferenças em contextos diferentes, mas `apply` somente
+executa modos explicitamente autorizados.
+
+No estado atual:
+
+```text
+DEV
+  preview efêmero de componente
+
+LAB
+  plan + apply reconciliados
+
+PROD
+  interface reconciliada ainda planejada (OPS-07)
+```
+
+A política de produção não deve ser simulada reutilizando silenciosamente a
+autoridade LAB.
+
+## 12. Evidência
 
 Uma operação reflexiva deve ser capaz de responder:
 
@@ -269,4 +327,5 @@ O que foi efetivamente executado?
 O que foi verificado depois?
 ```
 
-Essa sequência constitui a base para evidências operacionais futuras.
+Essa sequência constitui a base para evidências operacionais e futuras
+authority gates.
