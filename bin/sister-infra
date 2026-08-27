@@ -35,8 +35,8 @@ Modos operacionais:
 
 Exemplos:
   ./bin/sister-infra dev preview <component> [--port <porta>] [--duration <seg>]
-  ./bin/sister-infra lab plan --desired-candidate <dir> --desired-deployment <file>
-  ./bin/sister-infra lab apply --desired-candidate <dir> --desired-deployment <file>
+  ./bin/sister-infra lab plan
+  ./bin/sister-infra lab apply
   ./bin/sister-infra bootstrap --profile lan
   ./bin/sister-infra up --profile lan
   ./bin/sister-infra status --profile lan
@@ -773,38 +773,7 @@ main() {
 }
 
 cmd_lab() {
-  local subcmd="${1:-help}"
-  shift || true
-
-  case "$subcmd" in
-    plan)
-      exec "$INFRA_ROOT/bin/sister-reconcile" plan --mode lab "$@"
-      ;;
-    apply)
-      exec "$INFRA_ROOT/bin/sister-reconcile" apply --mode lab "$@"
-      ;;
-    help|-h|--help)
-      cat <<'EOF'
-SisTer Infra — lab control plane
-
-Uso:
-  sister-infra lab plan [opções]
-  sister-infra lab apply [opções]
-
-Opções:
-  --desired-candidate <dir>     diretório da candidata desejada verificada ou manifest.json
-  --desired-deployment <file>   deployment desejado (plan: declarativo ou resolved; apply: declarativo obrigatório quando houver materialização de TARGET_RELEASE)
-  --current-release <dir>       diretório da release ativa (opcional)
-  --no-probe-runtime            desativa sondagem factual de rede (somente plan)
-  --json                        emite o resultado em JSON
-  -h, --help                    esta ajuda
-EOF
-      exit 0
-      ;;
-    *)
-      die "comando lab desconhecido: $subcmd (comandos disponíveis: plan, apply)"
-      ;;
-  esac
+  exec "$INFRA_ROOT/bin/sister-lab" "$@"
 }
 
 cmd_dev() {

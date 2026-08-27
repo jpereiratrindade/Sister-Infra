@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""LAB UX resolver for sister-infra (OPS-06)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+INFRA_ROOT = Path(__file__).resolve().parent.parent
+
+class LabUxError(RuntimeError):
+    pass
+
+def canonical_paths() -> tuple[Path, Path]:
+    home = Path.home()
+    config_root = Path(
+        os.environ.get(
+            "SISTER_WORKSTATION_CONFIG_ROOT",
+            str(home / ".config" / "sister" / "workstation"),
+        )
+    ).expanduser()
+
+    composition = Path(
+        os.environ.get(
+            "SISTER_WORKSTATION_COMPOSITION_FILE",
+            str(config_root / "composition.json"),
+        )
+    ).expanduser()
+
+    deployment = Path(
+        os.environ.get(
+            "SISTER_WORKSTATION_DEPLOYMENT_FILE",
+            str(config_root / "deployment.json"),
+        )
+    ).expanduser()
+
+    return composition, deployment
+
+def candidate_cli() -> Path:
+    return Path(
+        os.environ.get(
+            "SISTER_LAB_CANDIDATE_CLI",
+            str(INFRA_ROOT / "bin" / "sister-candidate"),
+        )
+    ).expanduser()
+
+def reconcile_cli() -> Path:
+    return Path(
+        os.environ.get(
+            "SISTER_LAB_RECONCILE_CLI",
+            str(INFRA_ROOT / "bin" / "sister-reconcile"),
+        )
+    ).expanduser()
+
+def existing_path(value: str, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.exists():
+        raise LabUxError(f"{label} ausente: {path}")
+    return path.resolve()
+
+def create_ephemeral_candidate(composition: Path, out_dir: Path) -> Path:
+    cli = candidate_cli()
+    if not cli.is_file():
+        raise LabUxError(f"autoridade sister-candidate não encontrada: {cli}")
+
+    cmd = [
+        str(cli),
+        "create",
+        str(composition),
+        "--out",
+        str(out_dir),
+    ]
+
+    contracts_root = os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT", "").strip()
+    if contracts_root:
+        cmd.extend(["--contracts-root", contracts_root])
+
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit={proc.returncode}"
+        raise LabUxError(
+            "não foi possível derivar candidata da composição canônica: "
+            f"{detail}"
+        )
+
+    manifest = out_dir / "manifest.json"
+    if not manifest.is_file():
+        raise LabUxError(
+            "sister-candidate retornou sucesso sem materializar manifest.json"
+        )
+
+    return out_dir.resolve()
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-infra lab",
+        description=(
+            "LAB control plane: usa declaração canônica quando "
+            "--desired-candidate/--desired-deployment são omitidos"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan = sub.add_parser(
+        "plan",
+        help="calcula o plano LAB; sem --desired-* deriva a intenção canônica",
+    )
+    plan.add_argument(
+        "--desired-candidate",
+        help=(
+            "override: candidata desejada verificada; se omitido, uma candidata "
+            "efêmera é derivada da composition canônica"
+        ),
+    )
+    plan.add_argument(
+        "--desired-deployment",
+        help=(
+            "override: deployment desejado; se omitido, usa o deployment "
+            "canônico da workstation"
+        ),
+    )
+    plan.add_argument(
+        "--current-release",
+        help="override opcional da release atual; se omitido, o reconciliador autodetecta",
+    )
+    plan.add_argument(
+        "--probe-runtime",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="ativa/desativa sondagem factual; padrão permanece o do reconciliador",
+    )
+    plan.add_argument(
+        "--json",
+        action="store_true",
+        help="emite o plano JSON do reconciliador",
+    )
+
+    apply = sub.add_parser(
+        "apply",
+        help="aplica transacionalmente a intenção LAB canônica ou overrides explícitos",
+    )
+    apply.add_argument(
+        "--desired-candidate",
+        help=(
+            "override: candidata desejada verificada; se omitido, uma candidata "
+            "efêmera é derivada da composition canônica"
+        ),
+    )
+    apply.add_argument(
+        "--desired-deployment",
+        help=(
+            "override: deployment desejado; se omitido, usa o deployment "
+            "canônico da workstation"
+        ),
+    )
+    apply.add_argument(
+        "--current-release",
+        help="override opcional da release atual; se omitido, o reconciliador autodetecta",
+    )
+    apply.add_argument(
+        "--json",
+        action="store_true",
+        help="emite o resultado JSON do reconciliador",
+    )
+
+    return parser
+
+def invoke_reconcile(
+    args: argparse.Namespace,
+    desired_candidate: Path,
+    desired_deployment: Path,
+) -> int:
+    cli = reconcile_cli()
+    if not cli.is_file():
+        raise LabUxError(f"motor sister-reconcile não encontrado: {cli}")
+
+    cmd = [
+        str(cli),
+        args.command,
+        "--mode",
+        "lab",
+        "--desired-candidate",
+        str(desired_candidate),
+        "--desired-deployment",
+        str(desired_deployment),
+    ]
+
+    if args.current_release:
+        cmd.extend(["--current-release", args.current_release])
+
+    if args.command == "plan" and args.probe_runtime is not None:
+        cmd.append("--probe-runtime" if args.probe_runtime else "--no-probe-runtime")
+
+    if args.json:
+        cmd.append("--json")
+
+    proc = subprocess.run(cmd, check=False)
+    return proc.returncode
+
+def run(args: argparse.Namespace) -> int:
+    canonical_composition, canonical_deployment = canonical_paths()
+
+    explicit_candidate = None
+    if args.desired_candidate:
+        explicit_candidate = existing_path(
+            args.desired_candidate,
+            "candidata desejada explícita",
+        )
+
+    if args.desired_deployment:
+        desired_deployment = existing_path(
+            args.desired_deployment,
+            "deployment desejado explícito",
+        )
+    else:
+        if not canonical_deployment.is_file():
+            raise LabUxError(
+                "deployment LAB canônico ausente: "
+                f"{canonical_deployment}; declare a intenção LAB ou use "
+                "--desired-deployment"
+            )
+        desired_deployment = canonical_deployment.resolve()
+
+    if explicit_candidate is not None:
+        return invoke_reconcile(args, explicit_candidate, desired_deployment)
+
+    if not canonical_composition.is_file():
+        raise LabUxError(
+            "composition LAB canônica ausente: "
+            f"{canonical_composition}; declare a intenção LAB ou use "
+            "--desired-candidate"
+        )
+
+    tmp_parent = os.environ.get("SISTER_LAB_TMPDIR")
+    if tmp_parent:
+        tmp_parent_path = Path(tmp_parent).expanduser()
+        tmp_parent_path.mkdir(parents=True, exist_ok=True)
+        tmp_dir_arg = str(tmp_parent_path)
+    else:
+        tmp_dir_arg = None
+
+    with tempfile.TemporaryDirectory(
+        prefix="sister-lab-",
+        dir=tmp_dir_arg,
+    ) as temp_root:
+        candidate_dir = Path(temp_root) / "candidate"
+        desired_candidate = create_ephemeral_candidate(
+            canonical_composition.resolve(),
+            candidate_dir,
+        )
+        return invoke_reconcile(args, desired_candidate, desired_deployment)
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return run(args)
+    except LabUxError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
+
+if __name__ == "__main__":
+    raise SystemExit(main())
