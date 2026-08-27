@@ -276,6 +276,13 @@ def qualify_component(
             f"status={report.get('status')!r}"
         )
 
+    if report.get("source", {}).get("clean") is not True:
+        raise CompositionError(
+            "qualificação de composição exige código estritamente limpo "
+            f"(source.clean=true) para {component['component_id']}; "
+            "evidências geradas com --allow-dirty não são aceitas para composição formal."
+        )
+
     return report
 
 

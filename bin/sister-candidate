@@ -100,6 +100,14 @@ def verify_candidate_directory(candidate_dir: Path) -> dict[str, Any]:
             f"esperado={expected_qual_hash} atual={actual_qual_hash}"
         )
 
+    qual_doc = load_json(qual_file, "evidência de qualificação")
+    for comp in qual_doc.get("components", []):
+        if comp.get("qualification", {}).get("source", {}).get("clean") is not True:
+            raise CandidateError(
+                "candidata inválida: componente qualificado com código não limpo "
+                f"(source.clean=false) para {comp.get('component_id')}"
+            )
+
     # 2. Valida componentes e artefatos
     for comp in manifest["components"]:
         comp_dir = candidate_dir / comp["path"]
@@ -173,6 +181,14 @@ def create_candidate(
 
         if qual_doc.get("status") != "PASS":
             raise CandidateError(f"qualificação não aprovada: status={qual_doc.get('status')!r}")
+
+        for comp in qual_doc.get("components", []):
+            if comp.get("qualification", {}).get("source", {}).get("clean") is not True:
+                raise CandidateError(
+                    "candidata rejeitada: qualificação contém componente com código não limpo "
+                    f"(source.clean=false) para {comp.get('component_id')}. "
+                    "A flag --allow-dirty é de uso exclusivo em DEV."
+                )
 
         qual_bytes = (
             json.dumps(qual_doc, indent=2, ensure_ascii=False, sort_keys=True) + "\n"

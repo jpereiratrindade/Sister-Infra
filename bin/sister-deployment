@@ -393,6 +393,72 @@ def verify_resolved_deployment(
     }
 
 
+def generate_dev_binding(
+    component_id: str,
+    system_id: str,
+    port: int,
+    listen: str = "127.0.0.1",
+    transport: str = "tcp",
+    probe_path: str | None = None,
+) -> dict[str, Any]:
+    if not component_id or not isinstance(component_id, str) or not component_id.strip():
+        raise DeploymentError("component_id não pode ser vazio")
+    if not system_id or not isinstance(system_id, str) or not system_id.strip():
+        raise DeploymentError("system_id não pode ser vazio")
+    if transport != "tcp":
+        raise DeploymentError(f"transporte não suportado no MVP: {transport} (esperado 'tcp')")
+    if listen != "127.0.0.1":
+        raise DeploymentError(f"endereço de escuta não suportado no MVP: {listen} (esperado '127.0.0.1')")
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        raise DeploymentError(f"porta inválida: {port} (esperado 1..65535)")
+
+    comp_entry: dict[str, Any] = {
+        "component_id": component_id.strip(),
+        "system_id": system_id.strip(),
+        "runtime": {
+            "transport": transport,
+            "listen": listen,
+            "port": port,
+        },
+    }
+    if probe_path:
+        if not probe_path.startswith("/"):
+            raise DeploymentError(f"probe_path inválido: {probe_path} (deve iniciar com '/')")
+        comp_entry["probe"] = {
+            "health_path": probe_path,
+        }
+
+    document = {
+        "schema": "sister.infra.runtime.binding/1.0.0",
+        "components": [comp_entry],
+    }
+
+    schema_file = (
+        INFRA_ROOT
+        / "contracts"
+        / "runtime-binding"
+        / "1.0.0"
+        / "runtime-binding.schema.json"
+    )
+    if schema_file.is_file():
+        schema = load_json(schema_file, "schema de runtime-binding")
+        try:
+            validator = jsonschema.Draft202012Validator(schema)
+            errors = sorted(
+                validator.iter_errors(document),
+                key=lambda e: tuple(str(p) for p in e.absolute_path),
+            )
+            if errors:
+                raise DeploymentError(
+                    "runtime-binding rejeitado pelo schema: "
+                    + "; ".join(e.message for e in errors)
+                )
+        except jsonschema.SchemaError as exc:
+            raise DeploymentError(f"schema de runtime-binding inválido: {exc}") from exc
+
+    return document
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Resolve e verifica bindings de deployment para uma candidata"
@@ -413,12 +479,64 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("resolved_deployment")
     verify_parser.add_argument("--json", action="store_true")
 
+    dev_parser = subcommands.add_parser(
+        "dev-binding",
+        help="Emite runtime binding efêmero para desenvolvimento (DEV Preview)",
+    )
+    dev_parser.add_argument(
+        "--component-id", required=True, help="Identificador do componente"
+    )
+    dev_parser.add_argument(
+        "--system-id", required=True, help="Identificador do sistema"
+    )
+    dev_parser.add_argument(
+        "--port", required=True, type=int, help="Porta TCP de escuta (1..65535)"
+    )
+    dev_parser.add_argument(
+        "--listen", default="127.0.0.1", help="Endereço de escuta (padrão: 127.0.0.1)"
+    )
+    dev_parser.add_argument(
+        "--transport", default="tcp", help="Transporte (padrão: tcp)"
+    )
+    dev_parser.add_argument(
+        "--probe-path", help="Caminho de probe de health (opcional, ex: /api/health)"
+    )
+    dev_parser.add_argument(
+        "--out", help="Caminho do arquivo de saída para gravar o documento JSON"
+    )
+    dev_parser.add_argument(
+        "--json", action="store_true", help="Emite o resultado em JSON na saída padrão"
+    )
+
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "dev-binding":
+            result = generate_dev_binding(
+                component_id=args.component_id,
+                system_id=args.system_id,
+                port=args.port,
+                listen=args.listen,
+                transport=args.transport,
+                probe_path=args.probe_path,
+            )
+            raw = json.dumps(result, indent=2, sort_keys=True) + "\n"
+            if args.out:
+                out_path = Path(args.out).expanduser().resolve()
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(raw, encoding="utf-8")
+            if args.json or not args.out:
+                print(raw, end="")
+            else:
+                print(
+                    f"[PASS] runtime binding emitido: {args.system_id} -> "
+                    f"{args.listen}:{args.port}"
+                )
+            return 0
+
         candidate_path = existing_file(
             args.candidate_manifest, "manifesto de candidata"
         )

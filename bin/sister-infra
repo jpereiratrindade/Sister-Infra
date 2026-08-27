@@ -15,6 +15,7 @@ SisTer Infra — harness operacional do ecossistema
 
 Uso:
   ./bin/sister-infra <comando> [--profile dev|lan|production]
+  ./bin/sister-infra dev <comando> [opções]
   ./bin/sister-infra lab <comando> [opções]
   ./bin/sister-infra workstation <comando> [opções]
   ./bin/sister-infra candidate <comando> [opções]
@@ -27,11 +28,13 @@ Comandos gerais:
   verify      valida bindings, TLS e gateway declarativos
 
 Modos operacionais:
+  dev         operações do ambiente DEV (ex.: ./bin/sister-infra dev preview <component>)
   lab         operações do ambiente LAB (ex.: ./bin/sister-infra lab plan)
   workstation gerenciador de releases de workstation
   candidate   materialização e verificação de candidatas
 
 Exemplos:
+  ./bin/sister-infra dev preview <component> [--port <porta>] [--duration <seg>]
   ./bin/sister-infra lab plan --desired-candidate <dir> --desired-deployment <file>
   ./bin/sister-infra lab apply --desired-candidate <dir> --desired-deployment <file>
   ./bin/sister-infra bootstrap --profile lan
@@ -804,7 +807,42 @@ EOF
   esac
 }
 
+cmd_dev() {
+  local subcmd="${1:-help}"
+  shift || true
+
+  case "$subcmd" in
+    preview)
+      exec "$INFRA_ROOT/bin/sister-dev" preview "$@"
+      ;;
+    help|-h|--help)
+      cat <<'EOF'
+SisTer Infra — dev control plane
+
+Uso:
+  sister-infra dev preview <component> [opções]
+
+Opções:
+  --port <porta>         Porta TCP local (padrão: porta efêmera com retry)
+  --duration <segundos>  Executa durante N segundos e encerra graciosamente
+  --json                 Emite o resultado em JSON
+  -h, --help             Esta ajuda
+EOF
+      exit 0
+      ;;
+    *)
+      die "comando dev desconhecido: $subcmd (comandos disponíveis: preview)"
+      ;;
+  esac
+}
+
 # SISTER-INFRA-DISPATCH
+if [[ "${1:-}" == "dev" ]]; then
+  shift
+  cmd_dev "$@"
+  exit $?
+fi
+
 if [[ "${1:-}" == "lab" ]]; then
   shift
   cmd_lab "$@"

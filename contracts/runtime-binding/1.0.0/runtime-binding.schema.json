@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sister.local/contracts/infra/runtime-binding/1.0.0/runtime-binding.schema.json",
+  "title": "SisTer Infra Runtime Binding 1.0.0",
+  "description": "Contrato explícito de runtime binding efêmero de desenvolvimento (DEV Preview), projetando os bindings necessários aos entrypoints sem fingir um deployment operacional de release.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "components"
+  ],
+  "properties": {
+    "schema": {
+      "const": "sister.infra.runtime.binding/1.0.0"
+    },
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "component_id",
+          "system_id",
+          "runtime"
+        ],
+        "properties": {
+          "component_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "system_id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "runtime": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "transport",
+              "listen",
+              "port"
+            ],
+            "properties": {
+              "transport": {
+                "const": "tcp"
+              },
+              "listen": {
+                "const": "127.0.0.1"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              }
+            }
+          },
+          "probe": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "health_path"
+            ],
+            "properties": {
+              "health_path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^/"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

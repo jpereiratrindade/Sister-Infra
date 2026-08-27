@@ -216,7 +216,10 @@ def run_checked(command: list[str], cwd: Path | None = None) -> subprocess.Compl
     return result
 
 
-def git_commit_for_clean_root(root: Path) -> str:
+def git_commit_for_clean_root(
+    root: Path,
+    allow_dirty: bool = False,
+) -> tuple[str, bool]:
     top = run_checked(
         ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
     ).stdout.strip()
@@ -230,14 +233,16 @@ def git_commit_for_clean_root(root: Path) -> str:
     dirty = run_checked(
         ["git", "-C", str(root), "status", "--porcelain"]
     ).stdout.strip()
-    if dirty:
+    if dirty and not allow_dirty:
         raise ComponentError(
             "qualificação recusada: repositório possui alterações locais"
         )
 
-    return run_checked(
+    commit = run_checked(
         ["git", "-C", str(root), "rev-parse", "HEAD"]
     ).stdout.strip()
+
+    return commit, not bool(dirty)
 
 
 def sha256_file(path: Path) -> str:
@@ -318,8 +323,9 @@ def qualify_component(
     contracts: Path,
     descriptor: dict[str, Any],
     artifacts_out: Path | None = None,
+    allow_dirty: bool = False,
 ) -> dict[str, Any]:
-    commit = git_commit_for_clean_root(root)
+    commit, is_clean = git_commit_for_clean_root(root, allow_dirty=allow_dirty)
     build = descriptor["build"]
     build_driver = build["driver"]
     test_driver = build["tests"]["driver"]
@@ -342,8 +348,39 @@ def qualify_component(
             ["git", "-C", str(source), "checkout", "--quiet", "--detach", commit]
         )
 
+        if not is_clean:
+            # Sincroniza alterações locais não commitadas para a árvore de qualificação
+            diff_files = run_checked(
+                ["git", "-C", str(root), "diff", "--name-only", "HEAD"]
+            ).stdout.splitlines()
+            for rel in diff_files:
+                rel = rel.strip()
+                if not rel:
+                    continue
+                src_file = root / rel
+                dst_file = source / rel
+                if src_file.is_file():
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+                elif dst_file.is_file():
+                    dst_file.unlink()
+
+            untracked = run_checked(
+                ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"]
+            ).stdout.splitlines()
+            build_dir_name = build.get("build_dir", "build")
+            for rel in untracked:
+                rel = rel.strip()
+                if not rel or rel == build_dir_name or rel.startswith(build_dir_name + "/"):
+                    continue
+                src_file = root / rel
+                dst_file = source / rel
+                if src_file.is_file():
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+
         qualified_descriptor = validate_descriptor(source, contracts)
-        if qualified_descriptor != descriptor:
+        if qualified_descriptor != descriptor and is_clean:
             raise ComponentError(
                 "descritor qualificado diverge do descritor validado na árvore fonte"
             )
@@ -408,7 +445,7 @@ def qualify_component(
         "component_contract": descriptor["schema"],
         "source": {
             "commit": commit,
-            "clean": True,
+            "clean": is_clean,
         },
         "build": {
             "driver": build_driver,
@@ -427,6 +464,7 @@ def print_qualification(report: dict[str, Any]) -> None:
     print(f"component_id     {report['component_id']}")
     print(f"system_id        {report['system_id']}")
     print(f"commit           {report['source']['commit']}")
+    print(f"source.clean     {report['source']['clean']}")
     print(f"build.driver     {report['build']['driver']}")
     print(f"tests.driver     {report['build']['tests']['driver']}")
     print(f"tests.status     {report['build']['tests']['status']}")
@@ -503,6 +541,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "preservando seus paths relativos"
                 ),
             )
+            command.add_argument(
+                "--allow-dirty",
+                action="store_true",
+                help="permite qualificação de repositório com alterações locais não commitadas",
+            )
 
     return parser
 
@@ -538,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
                 contracts,
                 descriptor,
                 artifacts_out,
+                allow_dirty=getattr(args, "allow_dirty", False),
             )
         except ComponentError as exc:
             print(f"[FAIL] {exc}", file=sys.stderr)

@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+SisTer Infra — DEV Preview Control Plane (OPS-05)
+
+Orquestra sessões efêmeras de desenvolvimento para um componente individual:
+- Validação e qualificação via sister-component qualify;
+- Emissão de runtime binding efêmero via sister-deployment dev-binding;
+- Sandbox temporária isolada com zero perturbação do LAB;
+- Lifecycle gerenciado (prepare -> start -> verify -> expose -> stop -> cleanup).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+INFRA_ROOT = Path(__file__).resolve().parents[1]
+COMPONENT_CLI = INFRA_ROOT / "bin" / "sister-component"
+DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
+DESCRIPTOR_REL_PATH = Path(".sister/component.json")
+
+
+class DevError(RuntimeError):
+    pass
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise DevError(f"não foi possível ler {label}: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise DevError(f"JSON inválido em {label}: {path}: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise DevError(f"{label} deve ser um objeto JSON: {path}")
+    return data
+
+
+def discover_component(
+    target: str,
+    repos_root: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    target_path = Path(target).expanduser().resolve()
+    if target_path.is_dir():
+        desc_path = target_path / DESCRIPTOR_REL_PATH
+        if not desc_path.is_file():
+            raise DevError(
+                f"repositório encontrado em '{target_path}', mas não declara .sister/component.json;\n"
+                "DEV Preview requer um componente reconhecido pelo contrato sister.component/1.0.0 "
+                "e com runtime operacional declarado."
+            )
+        desc = load_json(desc_path, "descritor de componente")
+        if "runtime" not in desc or not isinstance(desc["runtime"], dict) or not desc["runtime"].get("entrypoint"):
+            cid = desc.get("component_id", target_path.name)
+            raise DevError(
+                f"componente '{cid}' em '{target_path}' não declara runtime operacional;\n"
+                "DEV Preview requer um componente reconhecido pelo contrato sister.component/1.0.0 "
+                "e com runtime operacional declarado."
+            )
+        return target_path, desc
+
+    # Resolução por identificador lógico (component_id ou system_id)
+    if not repos_root:
+        env_root = os.environ.get("SISTER_REPOSITORIES_ROOT")
+        if env_root:
+            repos_root = Path(env_root).expanduser().resolve()
+        else:
+            repos_root = INFRA_ROOT.parent.resolve()
+
+    if not repos_root.is_dir():
+        raise DevError(f"raiz de repositórios inexistente: {repos_root}")
+
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    unregistered_repos: list[Path] = []
+
+    for entry in sorted(repos_root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        desc_path = entry / DESCRIPTOR_REL_PATH
+        if not desc_path.is_file():
+            if entry.name in (target, f"sister-{target}", f"sister_{target}"):
+                unregistered_repos.append(entry.resolve())
+            continue
+        try:
+            desc = load_json(desc_path, "descritor de componente")
+        except DevError:
+            continue
+
+        cid = desc.get("component_id", "")
+        sid = desc.get("system_id", "")
+        if target in (cid, sid, f"sister_{cid}", f"sister-{cid}"):
+            matches.append((entry.resolve(), desc))
+
+    if not matches:
+        if unregistered_repos:
+            repo = unregistered_repos[0]
+            raise DevError(
+                f"repositório encontrado em '{repo}', mas não declara .sister/component.json;\n"
+                "DEV Preview requer um componente reconhecido pelo contrato sister.component/1.0.0 "
+                "e com runtime operacional declarado."
+            )
+        raise DevError(
+            f"diretório ou componente correspondente a '{target}' não encontrado em {repos_root}"
+        )
+
+    if len(matches) > 1:
+        paths = "\n  - ".join(str(p) for p, _ in matches)
+        raise DevError(
+            f"ambiguidade: múltiplos componentes correspondem a '{target}':\n  - {paths}\n"
+            "Forneça o caminho explícito do diretório."
+        )
+
+    comp_path, desc = matches[0]
+    if "runtime" not in desc or not isinstance(desc["runtime"], dict) or not desc["runtime"].get("entrypoint"):
+        cid = desc.get("component_id", comp_path.name)
+        raise DevError(
+            f"componente '{cid}' em '{comp_path}' não declara runtime operacional;\n"
+            "DEV Preview requer um componente reconhecido pelo contrato sister.component/1.0.0 "
+            "e com runtime operacional declarado."
+        )
+
+    return comp_path, desc
+
+
+def acquire_dev_lock(component_root: Path) -> tuple[Any, Path]:
+    raw_hash = hashlib.sha256(str(component_root.resolve()).encode("utf-8")).hexdigest()[:16]
+    runtime_dir = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/tmp/sister-runtime-{os.getuid()}")
+    )
+    lock_dir = runtime_dir / "sister" / "dev-preview" / "locks"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        lock_dir = Path(tempfile.gettempdir()) / "sister" / "dev-preview" / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_file = lock_dir / f"{raw_hash}.lock"
+    import fcntl
+
+    try:
+        fd = open(lock_file, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd, lock_file
+    except OSError as exc:
+        raise DevError(
+            f"outra sessão DEV está em execução para o componente em {component_root} (lock: {lock_file})"
+        ) from exc
+
+
+def allocate_ephemeral_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.3)
+        res = sock.connect_ex((host, port))
+        return res == 0
+
+
+def qualify_component(component_root: Path) -> None:
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(COMPONENT_CLI),
+            "qualify",
+            str(component_root),
+            "--allow-dirty",
+            "--artifacts-out",
+            str(component_root),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if res.returncode != 0:
+        err = res.stderr.strip() or res.stdout.strip()
+        raise DevError(f"qualificação do componente falhou:\n{err}")
+
+
+def generate_dev_binding_file(
+    out_file: Path,
+    component_id: str,
+    system_id: str,
+    port: int,
+    probe_path: str | None = None,
+) -> dict[str, Any]:
+    cmd = [
+        sys.executable,
+        str(DEPLOYMENT_CLI),
+        "dev-binding",
+        "--component-id",
+        component_id,
+        "--system-id",
+        system_id,
+        "--port",
+        str(port),
+        "--out",
+        str(out_file),
+        "--json",
+    ]
+    if probe_path:
+        cmd.extend(["--probe-path", probe_path])
+
+    res = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if res.returncode != 0:
+        err = res.stderr.strip() or res.stdout.strip()
+        raise DevError(f"falha ao emitir binding DEV via sister-deployment:\n{err}")
+
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise DevError(f"saída inválida de sister-deployment dev-binding: {exc}") from exc
+
+
+def invoke_entrypoint_action(
+    component_root: Path,
+    entrypoint_rel: str,
+    action: str,
+    env_overrides: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    entrypoint = component_root / entrypoint_rel
+    if not entrypoint.is_file():
+        raise DevError(f"entrypoint ausente: {entrypoint}")
+    if not os.access(entrypoint, os.X_OK):
+        raise DevError(f"entrypoint não executável: {entrypoint}")
+
+    env = dict(os.environ)
+    env.update(env_overrides)
+
+    return subprocess.run(
+        [str(entrypoint), action],
+        cwd=str(component_root),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def find_scoped_processes(sandbox_run: Path, component_root: Path) -> list[int]:
+    scoped_pids: list[int] = []
+    sandbox_run_str = str(sandbox_run.resolve())
+    comp_root_str = str(component_root.resolve())
+
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return scoped_pids
+
+    for p in proc.iterdir():
+        if not p.is_dir() or not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        if pid == os.getpid():
+            continue
+
+        try:
+            environ_path = p / "environ"
+            if not environ_path.is_file():
+                continue
+            env_bytes = environ_path.read_bytes()
+            env_items = env_bytes.split(b"\x00")
+            env_dict: dict[str, str] = {}
+            for item in env_items:
+                if b"=" in item:
+                    k, v = item.split(b"=", 1)
+                    env_dict[k.decode("utf-8", errors="ignore")] = v.decode(
+                        "utf-8", errors="ignore"
+                    )
+
+            target_run = env_dict.get("SISTER_RUNTIME_RUN_DIR")
+            if not target_run or Path(target_run).resolve() != Path(sandbox_run_str):
+                continue
+
+            # Valida cwd pertencente ao component_root
+            cwd_link = p / "cwd"
+            if cwd_link.is_symlink():
+                cwd_resolved = str(cwd_link.resolve())
+                if (
+                    cwd_resolved == comp_root_str
+                    or cwd_resolved.startswith(comp_root_str + "/")
+                    or sandbox_run_str in cwd_resolved
+                ):
+                    scoped_pids.append(pid)
+        except (OSError, PermissionError):
+            continue
+
+    return scoped_pids
+
+
+def safe_cleanup_processes(
+    component_root: Path,
+    entrypoint_rel: str,
+    env_overrides: dict[str, str],
+    sandbox_run: Path,
+) -> None:
+    # 1. Executa primeiro o entrypoint stop
+    try:
+        invoke_entrypoint_action(
+            component_root, entrypoint_rel, "stop", env_overrides
+        )
+    except Exception:
+        pass
+
+    # 2. Polling de verificação de saída
+    for _ in range(10):
+        scoped = find_scoped_processes(sandbox_run, component_root)
+        if not scoped:
+            return
+        time.sleep(0.2)
+
+    # 3. Fallback SIGTERM apenas em processos comprovadamente scoped
+    scoped = find_scoped_processes(sandbox_run, component_root)
+    for pid in scoped:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # Aguarda até 3 segundos
+    for _ in range(15):
+        scoped = find_scoped_processes(sandbox_run, component_root)
+        if not scoped:
+            return
+        time.sleep(0.2)
+
+    # 4. Fallback SIGKILL em persistentes
+    scoped = find_scoped_processes(sandbox_run, component_root)
+    for pid in scoped:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def http_probe(host: str, port: int, path: str, timeout: float = 2.0) -> bool:
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{host}:{port}{path}"
+    req = urllib.request.Request(url, headers={"User-Agent": "sister-dev-preview"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return 200 <= response.status < 400
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def run_dev_preview(
+    target: str,
+    requested_port: int | None = None,
+    duration: float | None = None,
+    as_json: bool = False,
+    repos_root: Path | None = None,
+) -> int:
+    component_root, descriptor = discover_component(target, repos_root=repos_root)
+    cid = descriptor["component_id"]
+    sid = descriptor["system_id"]
+    entrypoint_rel = descriptor.get("runtime", {}).get(
+        "entrypoint", "scripts/runtime.sh"
+    )
+
+    # 1. Adquire lock DEV fora do repositório
+    lock_fd, lock_path = acquire_dev_lock(component_root)
+
+    sandbox_dir = Path(
+        tempfile.mkdtemp(prefix=f"sister-dev-preview-{cid}-")
+    ).resolve()
+    sandbox_state = sandbox_dir / "state"
+    sandbox_run = sandbox_dir / "run"
+    sandbox_env = sandbox_dir / "env"
+    sandbox_state.mkdir(parents=True, exist_ok=True)
+    sandbox_run.mkdir(parents=True, exist_ok=True)
+    sandbox_env.mkdir(parents=True, exist_ok=True)
+
+    config_file = sandbox_env / f"{cid}.env"
+    repo_env = component_root / ".env"
+    if repo_env.is_file():
+        shutil.copy2(repo_env, config_file)
+    else:
+        config_file.write_text(
+            f"# DEV preview runtime config for {cid}\n", encoding="utf-8"
+        )
+
+    binding_file = sandbox_dir / "binding.json"
+
+    # Extrai probe declarativo se existir
+    probe_path: str | None = None
+    if "probe" in descriptor and isinstance(descriptor["probe"], dict):
+        probe_path = descriptor["probe"].get("health_path")
+
+    # 2. Qualificação via sister-component qualify
+    qualify_component(component_root)
+
+    # 3. Alocação de porta com retry limitado por colisão
+    max_attempts = 1 if requested_port is not None else 3
+    port = requested_port if requested_port is not None else allocate_ephemeral_port()
+    started = False
+    last_error = ""
+
+    env_overrides: dict[str, str] = {}
+
+    for attempt in range(max_attempts):
+        if requested_port is None and attempt > 0:
+            port = allocate_ephemeral_port()
+
+        # Gera o runtime binding efêmero via sister-deployment dev-binding
+        generate_dev_binding_file(
+            out_file=binding_file,
+            component_id=cid,
+            system_id=sid,
+            port=port,
+            probe_path=probe_path,
+        )
+
+        env_overrides = {
+            "SISTER_RESOLVED_DEPLOYMENT_FILE": str(binding_file),
+            "SISTER_COMPONENT_CONFIG_FILE": str(config_file),
+            "SISTER_RUNTIME_STATE_DIR": str(sandbox_state),
+            "SISTER_RUNTIME_RUN_DIR": str(sandbox_run),
+        }
+
+        # Invoca start
+        res_start = invoke_entrypoint_action(
+            component_root, entrypoint_rel, "start", env_overrides
+        )
+        if res_start.returncode == 0:
+            # Aguarda o health reportar sucesso
+            healthy = False
+            for _ in range(25):
+                res_health = invoke_entrypoint_action(
+                    component_root, entrypoint_rel, "health", env_overrides
+                )
+                if res_health.returncode == 0:
+                    if probe_path:
+                        if http_probe("127.0.0.1", port, probe_path):
+                            healthy = True
+                            break
+                    else:
+                        healthy = True
+                        break
+                time.sleep(0.2)
+
+            if healthy:
+                started = True
+                break
+            else:
+                last_error = (
+                    f"health check falhou após start na porta {port}. "
+                    f"Stdout: {res_health.stdout.strip()} Stderr: {res_health.stderr.strip()}"
+                )
+        else:
+            err_msg = res_start.stderr.strip() or res_start.stdout.strip()
+            last_error = f"start falhou na porta {port}: {err_msg}"
+
+        # Analisa se foi evidência factual de colisão de porta
+        is_collision = False
+        log_files = list(sandbox_run.glob("*.log")) + list(sandbox_run.glob("*/*.log"))
+        log_content = ""
+        for lf in log_files:
+            try:
+                log_content += lf.read_text(encoding="utf-8", errors="ignore") + "\n"
+            except Exception:
+                pass
+
+        full_output = f"{last_error}\n{log_content}".lower()
+        if (
+            "address already in use" in full_output
+            or "eaddrinuse" in full_output
+            or "bind: address" in full_output
+        ):
+            is_collision = True
+
+        safe_cleanup_processes(
+            component_root, entrypoint_rel, env_overrides, sandbox_run
+        )
+
+        if not is_collision and requested_port is not None:
+            break
+        if not is_collision and attempt == max_attempts - 1:
+            break
+
+    if not started:
+        safe_cleanup_processes(
+            component_root, entrypoint_rel, env_overrides, sandbox_run
+        )
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
+        raise DevError(f"não foi possível iniciar DEV Preview: {last_error}")
+
+    # Descobre PID registrado pelo componente (se houver pidfile) ou scoped
+    pids = find_scoped_processes(sandbox_run, component_root)
+    primary_pid = pids[0] if pids else None
+
+    session_info = {
+        "status": "READY",
+        "component_id": cid,
+        "system_id": sid,
+        "port": port,
+        "listen": "127.0.0.1",
+        "endpoint": f"http://127.0.0.1:{port}",
+        "pid": primary_pid,
+        "sandbox": str(sandbox_dir),
+        "binding_file": str(binding_file),
+    }
+
+    if as_json and duration is None:
+        print(json.dumps(session_info, indent=2, sort_keys=True))
+    elif not as_json:
+        print(f"[PASS] DEV Preview ativo para {cid} ({sid})")
+        print(f"Endpoint direto : http://127.0.0.1:{port}")
+        if primary_pid:
+            print(f"PID            : {primary_pid}")
+        print(f"Sandbox        : {sandbox_dir}")
+        print(f"Logs           : {sandbox_run}")
+
+    # Configura trap de encerramento seguro
+    interrupted = False
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    prev_sigint = signal.signal(signal.SIGINT, handle_signal)
+    prev_sigterm = signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        if duration is not None:
+            start_t = time.time()
+            while time.time() - start_t < duration:
+                if interrupted:
+                    break
+                time.sleep(0.1)
+        else:
+            if not as_json:
+                print("\nPressione Ctrl+C para encerrar o DEV Preview.")
+            while not interrupted:
+                time.sleep(0.2)
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+
+        # Cleanup final garantido
+        safe_cleanup_processes(
+            component_root, entrypoint_rel, env_overrides, sandbox_run
+        )
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
+
+    if as_json and duration is not None:
+        session_info["status"] = "TERMINATED"
+        print(json.dumps(session_info, indent=2, sort_keys=True))
+    elif not as_json:
+        print(f"[PASS] DEV Preview para {cid} encerrado com sucesso.")
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sister-dev",
+        description="SisTer Infra — DEV Preview Control Plane (OPS-05)",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    preview_p = sub.add_parser(
+        "preview",
+        help="Inicia sessão efêmera de desenvolvimento de um componente",
+    )
+    preview_p.add_argument(
+        "component",
+        help="Identificador do componente ou caminho do repositório",
+    )
+    preview_p.add_argument(
+        "--port",
+        type=int,
+        help="Porta TCP local (padrão: porta efêmera com retry)",
+    )
+    preview_p.add_argument(
+        "--duration",
+        type=float,
+        help="Executa durante N segundos e encerra graciosamente (para testes e automação)",
+    )
+    preview_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emite saída estruturada em JSON",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "preview":
+            return run_dev_preview(
+                target=args.component,
+                requested_port=args.port,
+                duration=args.duration,
+                as_json=args.json,
+            )
+        else:
+            raise DevError(f"comando desconhecido: {args.command}")
+    except DevError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
