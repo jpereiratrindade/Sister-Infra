@@ -17,10 +17,30 @@ sister-infra workstation verify
 
 ## 3. Planejar uma convergência
 
-A forma explícita atual utiliza candidata e deployment:
+A forma canônica disponível é:
 
 ```bash
-sister-infra lab plan   --desired-candidate <candidate-dir>   --desired-deployment <deployment.json>
+sister-infra lab plan
+```
+
+Por padrão, a intenção LAB é derivada das declarações canônicas versionadas no
+control plane:
+
+```text
+config/compositions/workstation.json
+config/deployments/workstation-lab.json
+```
+
+A resolução é responsabilidade da camada `sister-lab`; o motor
+`sister-reconcile` continua recebendo candidata e deployment explicitamente e
+permanece genérico.
+
+Para auditoria, testes ou operação avançada, os overrides continuam disponíveis:
+
+```bash
+sister-infra lab plan \
+  --desired-candidate <candidate-dir> \
+  --desired-deployment <deployment.json>
 ```
 
 O comando é read-only.
@@ -53,7 +73,16 @@ Nesse caso o resumo esperado é equivalente a:
 Após revisar o plano:
 
 ```bash
-sister-infra lab apply   --desired-candidate <candidate-dir>   --desired-deployment <deployment.json>
+sister-infra lab apply
+```
+
+A forma explícita também permanece válida quando o operador precisa substituir
+a intenção canônica:
+
+```bash
+sister-infra lab apply \
+  --desired-candidate <candidate-dir> \
+  --desired-deployment <deployment.json>
 ```
 
 Um estado já convergido deve resultar em:
@@ -165,15 +194,18 @@ qual arquivo do gateway reescrever
 Essas decisões pertencem ao control plane quando puderem ser derivadas de
 contratos e estado factual.
 
-## 10. Interfaces ainda não disponíveis
+## 10. Interface ainda não disponível
 
 Não confundir visão desejada com estado factual.
 
-Atualmente não documentamos como disponível:
+O DEV Preview já está disponível desde o OPS-05:
 
 ```bash
-sister-infra dev preview atmos
-sister-infra production apply
+sister-infra dev preview <component>
 ```
 
-Essas interfaces pertencem ao roadmap.
+A interface reconciliada de produção ainda permanece no roadmap:
+
+```bash
+sister-infra production apply
+```

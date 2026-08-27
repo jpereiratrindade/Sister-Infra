@@ -120,25 +120,54 @@ Propriedades comprovadas:
 
 ### OPS-06 — LAB UX Simplificada
 
-**NEXT (PLANNED)**
+**DONE**
 
-Objetivo:
-
-reduzir a necessidade de fornecer manualmente caminhos de candidata e
-deployment.
-
-Experiência pretendida:
+Disponibilização da experiência operacional:
 
 ```bash
 sister-infra lab plan
 sister-infra lab apply
 ```
 
-com o desired state derivado de uma declaração operacional canônica.
+sem necessidade de fornecer manualmente caminhos de candidata e deployment.
+
+O desired state LAB passa a ser derivado das declarações canônicas versionadas
+no control plane:
+
+```text
+config/compositions/workstation.json
+config/deployments/workstation-lab.json
+```
+
+com precedência explícita dos overrides:
+
+```text
+SISTER_WORKSTATION_COMPOSITION_FILE
+SISTER_WORKSTATION_DEPLOYMENT_FILE
+SISTER_WORKSTATION_CONTROL_PLANE_SOURCE
+```
+
+Propriedades comprovadas:
+
+- camada de UX separada em `sister-lab`;
+- `sister-reconcile` permanece motor genérico, sem conhecer defaults da workstation;
+- candidata implícita materializada apenas em sandbox efêmera;
+- cleanup obrigatório em sucesso e falha;
+- `lab plan` preserva ausência de mutação persistente;
+- overrides explícitos permanecem retrocompatíveis;
+- ausência de declaração necessária falha fechado;
+- stdout JSON permanece puro;
+- defaults oficiais são derivados do control plane;
+- regressões de `reconcile plan` e `reconcile apply` preservadas;
+- prova factual real de `sister-infra lab plan` sem argumentos manuais.
+
+Na prova real de fechamento, o plano observou `sister`, `nexo` e `praxis` como
+`KEEP` e `urt` como `UPDATE`, mantendo gateway e ecosystem projection como
+`KEEP`.
 
 ### OPS-07 — Production Adapter / Authority Gates
 
-**PLANNED**
+**NEXT (PLANNED)**
 
 Objetivo:
 

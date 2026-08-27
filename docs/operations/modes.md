@@ -93,12 +93,26 @@ Propriedades efetivamente comprovadas:
 Executar o ambiente cotidiano compartilhado de desenvolvimento integrado e uso
 experimental.
 
-Experiência:
+Experiência disponível:
 
 ```bash
-sister-infra lab plan ...
-sister-infra lab apply ...
+sister-infra lab plan
+sister-infra lab apply
 ```
+
+A UX LAB resolve automaticamente o desired state a partir das declarações
+canônicas versionadas no control plane:
+
+```text
+config/compositions/workstation.json
+config/deployments/workstation-lab.json
+```
+
+Argumentos `--desired-candidate` e `--desired-deployment` permanecem disponíveis
+como overrides explícitos e retrocompatíveis.
+
+O `sister-lab` atua apenas como camada de resolução de UX. O
+`sister-reconcile` permanece o motor genérico de comparação e aplicação.
 
 O LAB deve convergir incrementalmente para o estado desejado, preservando os
 participantes classificados como `KEEP`.
@@ -129,7 +143,9 @@ salvo quando uma dependência material real tornar isso necessário.
 
 ### Estado atual
 
-`lab plan` está disponível e consolidado.
+`lab plan` e `lab apply` estão disponíveis com UX simplificada (OPS-06),
+derivando por padrão composition e deployment canônicos do control plane e
+preservando overrides explícitos.
 
 `lab apply` está disponível no ambiente LAB com as seguintes capacidades
 efetivamente comprovadas:
@@ -192,8 +208,8 @@ não devem ser confundidos automaticamente com a interface final desejada de
 | Modo | Intenção | Perturba LAB | Estado |
 |---|---|---:|---|
 | DEV | testar componente isoladamente | não | disponível (OPS-05) |
-| LAB plan | observar diferença | não | disponível |
-| LAB apply | convergir incrementalmente | somente o necessário | disponível (OPS-03/OPS-04) |
+| LAB plan | observar diferença | não | disponível, UX canônica (OPS-06) |
+| LAB apply | convergir incrementalmente | somente o necessário | disponível, UX canônica (OPS-03/OPS-04/OPS-06) |
 | PROD reconciliado | implantação governada | não se aplica | planejado |
 
 ## 6. Regra de autoridade
