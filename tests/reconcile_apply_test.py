@@ -456,16 +456,16 @@ def main() -> None:
 
         try:
             # -------------------------------------------------------------
-            # GATE Q & R: Bloqueio fail-closed se gateway != KEEP ou projection != KEEP
+            # GATE Q: RECONFIGURE em nível de componente é bloqueado fail-closed
             # -------------------------------------------------------------
-            dep_diff_gw = tmp / "dep_diff_gw.json"
-            write_json(dep_diff_gw, {
+            dep_reconfig_comp = tmp / "dep_reconfig_comp.json"
+            write_json(dep_reconfig_comp, {
                 "schema": "sister.infra.deployment/1.0.0",
-                "deployment_id": "dep-diff-gw",
+                "deployment_id": "dep-reconfig",
                 "composition_id": "test_reconcile",
                 "gateway": {"protocol": "https", "port": 8443},
                 "bindings": [
-                    {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-MUTATED.test"}},
+                    {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha + 100}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
                     {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},
                     {"system_id": "sister_gamma", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_gamma}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "gamma-gateway.test"}},
                 ],
@@ -476,43 +476,33 @@ def main() -> None:
                 "apply",
                 "--current-release", str(install_root / "current"),
                 "--desired-candidate", str(cand_base),
-                "--desired-deployment", str(dep_diff_gw),
+                "--desired-deployment", str(dep_reconfig_comp),
                 "--json",
             ], env=env)
-            assert res_q.returncode != 0, "apply com gateway != KEEP deveria ter sido bloqueado!"
-            assert "gateway action" in res_q.stderr or "gateway action" in res_q.stdout
-            print("[PASS] Gate Q — gateway != KEEP bloqueia preventivamente antes de qualquer mutação")
+            assert res_q.returncode != 0, "apply com RECONFIGURE de componentes deveria ter sido bloqueado!"
+            assert "RECONFIGURE de componentes não é suportado" in res_q.stderr or "RECONFIGURE de componentes não é suportado" in res_q.stdout
+            print("[PASS] Gate Q — RECONFIGURE em nível de componente bloqueia fail-closed")
 
-            cand_add = create_qualified_candidate(
-                tmp, contracts,
-                ["../sister-alpha", "../sister-beta", "../sister-gamma", "../sister-delta"],
-                "cand-add",
-            )
-            dep_add = tmp / "dep_add.json"
-            write_json(dep_add, {
-                "schema": "sister.infra.deployment/1.0.0",
-                "deployment_id": "dep-add",
-                "composition_id": "test_reconcile",
-                "gateway": {"protocol": "https", "port": 8443},
-                "bindings": [
-                    {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
-                    {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},
-                    {"system_id": "sister_gamma", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_gamma}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "gamma-gateway.test"}},
-                    {"system_id": "sister_delta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_delta}, "probe": {"health_path": "/api/health"}},
-                ],
-            })
+            # -------------------------------------------------------------
+            # GATE R: Modos não-lab são rejeitados fail-closed no ciclo OPS-04
+            # -------------------------------------------------------------
             res_r = run_cmd([
-                str(INFRA_CLI),
-                "lab",
+                sys.executable,
+                str(ROOT / "bin" / "sister-reconcile"),
                 "apply",
+                "--mode", "production",
                 "--current-release", str(install_root / "current"),
-                "--desired-candidate", str(cand_add),
-                "--desired-deployment", str(dep_add),
+                "--desired-candidate", str(cand_base),
+                "--desired-deployment", str(dep_base_file),
                 "--json",
             ], env=env)
-            assert res_r.returncode != 0, "apply com projection != KEEP deveria ter sido bloqueado!"
-            assert "projection action" in res_r.stderr or "projection action" in res_r.stdout
-            print("[PASS] Gate R — projection != KEEP bloqueia preventivamente antes de qualquer mutação")
+            assert res_r.returncode != 0, "apply com modo production deveria ter sido bloqueado!"
+            assert (
+                "invalid choice" in res_r.stderr
+                or "não autorizado para apply" in res_r.stderr
+                or "não autorizado para apply" in res_r.stdout
+            )
+            print("[PASS] Gate R — modos não-lab bloqueados fail-closed")
 
             # -------------------------------------------------------------
             # GATE X: Exclusão mútua unificada (workstation-lifecycle.lock)

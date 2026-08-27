@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import http.client
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -29,6 +33,7 @@ INFRA_ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
 DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
 WORKSTATION_CLI = INFRA_ROOT / "bin" / "sister-workstation"
+GATEWAY_CLI = INFRA_ROOT / "bin" / "sister-gateway"
 PLAN_SCHEMA = "sister.infra.reconcile.plan/1"
 APPLY_SCHEMA = "sister.infra.reconcile.apply/1"
 
@@ -764,6 +769,462 @@ class ReconcileLock:
             self._fd = None
 
 
+class TransactionContext:
+    def __init__(self) -> None:
+        self.old_leaf_bytes: bytes | None = None
+        self.old_gateway_cfg: str | None = None
+        self.old_projection_tsv: str | None = None
+        self.pid_old_gateway: int | None = None
+        self.pid_target_gateway: int | None = None
+        self.switched_release: bool = False
+        self.components_rollback_stack: list[tuple[Any, ...]] = []
+
+
+def is_pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def get_tls_paths(config_root: Path) -> tuple[Path, Path, Path]:
+    tls_pem_str = os.environ.get("TLS_PEM")
+    ca_cert_str = os.environ.get("CA_CERT")
+    ca_key_str = os.environ.get("CA_KEY")
+
+    tls_pem = Path(tls_pem_str).expanduser().resolve() if tls_pem_str else (config_root / "tls" / "ecosystem-lab.pem")
+    ca_cert = Path(ca_cert_str).expanduser().resolve() if ca_cert_str else (config_root / "tls" / "ecosystem-lab-ca.crt")
+    ca_key = Path(ca_key_str).expanduser().resolve() if ca_key_str else (config_root / "tls" / "ecosystem-lab-ca.key")
+
+    if not tls_pem.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab.pem").is_file():
+        tls_pem = (INFRA_ROOT / "secrets" / "ecosystem-lab.pem").resolve()
+    if not ca_cert.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.crt").is_file():
+        ca_cert = (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.crt").resolve()
+    if not ca_key.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.key").is_file():
+        ca_key = (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.key").resolve()
+
+    return tls_pem, ca_cert, ca_key
+
+
+def check_ca_valid(ca_cert: Path, ca_key: Path, renew_before_sec: int = 2592000) -> bool:
+    if not ca_cert.is_file() or not ca_key.is_file():
+        return False
+    res = subprocess.run(
+        ["openssl", "x509", "-in", str(ca_cert), "-noout", "-checkend", str(renew_before_sec)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if res.returncode != 0:
+        return False
+    res1 = subprocess.run(
+        ["openssl", "x509", "-in", str(ca_cert), "-pubkey", "-noout"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    res2 = subprocess.run(
+        ["openssl", "pkey", "-in", str(ca_key), "-pubout"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if res1.returncode != 0 or res2.returncode != 0:
+        return False
+    return res1.stdout.strip() == res2.stdout.strip() and len(res1.stdout.strip()) > 0
+
+
+def get_cert_sans(tls_pem: Path) -> set[str]:
+    if not tls_pem.is_file():
+        return set()
+    res = subprocess.run(
+        ["openssl", "x509", "-in", str(tls_pem), "-noout", "-ext", "subjectAltName"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        return set()
+    sans = set()
+    for item in res.stdout.replace(",", "\n").splitlines():
+        item = item.strip()
+        if item.startswith("DNS:"):
+            sans.add(item[4:].strip())
+    return sans
+
+
+def generate_leaf_certificate(
+    tls_pem: Path,
+    ca_cert: Path,
+    ca_key: Path,
+    hosts: list[str],
+) -> None:
+    if not hosts:
+        raise ReconcileError("nenhum host configurado para emissão de certificado TLS")
+    tls_pem.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(dir=tls_pem.parent) as td:
+        tmp_dir = Path(td)
+        key_file = tmp_dir / "gateway.key"
+        csr_file = tmp_dir / "gateway.csr"
+        crt_file = tmp_dir / "gateway.crt"
+        ext_file = tmp_dir / "ext.cnf"
+        cnf_file = tmp_dir / "openssl.cnf"
+
+        res = subprocess.run(
+            ["openssl", "genrsa", "-out", str(key_file), "3072"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise ReconcileError(f"falha ao gerar chave privada TLS: {res.stderr.decode('utf-8', 'replace')}")
+
+        cnf_lines = [
+            "[req]",
+            "prompt = no",
+            "distinguished_name = dn",
+            "req_extensions = req_ext",
+            "",
+            "[dn]",
+            f"CN = {hosts[0]}",
+            "",
+            "[req_ext]",
+            "subjectAltName = @alt_names",
+            "",
+            "[alt_names]",
+        ]
+        for i, h in enumerate(hosts, start=1):
+            cnf_lines.append(f"DNS.{i} = {h}")
+        cnf_file.write_text("\n".join(cnf_lines) + "\n", encoding="utf-8")
+
+        res = subprocess.run(
+            ["openssl", "req", "-new", "-key", str(key_file), "-out", str(csr_file), "-config", str(cnf_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise ReconcileError(f"falha ao gerar CSR TLS: {res.stderr.decode('utf-8', 'replace')}")
+
+        san_str = ",".join(f"DNS:{h}" for h in hosts)
+        ext_lines = [
+            f"subjectAltName={san_str}",
+            "extendedKeyUsage=serverAuth",
+            "keyUsage=digitalSignature,keyEncipherment",
+        ]
+        ext_file.write_text("\n".join(ext_lines) + "\n", encoding="utf-8")
+
+        res = subprocess.run(
+            [
+                "openssl", "x509", "-req",
+                "-in", str(csr_file),
+                "-CA", str(ca_cert),
+                "-CAkey", str(ca_key),
+                "-CAcreateserial",
+                "-out", str(crt_file),
+                "-days", "825",
+                "-sha256",
+                "-extfile", str(ext_file),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise ReconcileError(f"falha ao assinar certificado TLS com a CA: {res.stderr.decode('utf-8', 'replace')}")
+
+        pem_content = crt_file.read_bytes() + b"\n" + key_file.read_bytes() + b"\n"
+
+        tmp_pem = tls_pem.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+        try:
+            tmp_pem.write_bytes(pem_content)
+            tmp_pem.chmod(0o600)
+            os.replace(tmp_pem, tls_pem)
+        finally:
+            if tmp_pem.exists():
+                try:
+                    tmp_pem.unlink()
+                except OSError:
+                    pass
+
+
+def get_gateway_paths(
+    state_root: Path,
+    config_root: Path,
+) -> tuple[Path, Path, str, int]:
+    cfg_p = Path(os.environ.get("GATEWAY_CFG", state_root / "control-plane" / "gateway" / "haproxy-lan.cfg")).expanduser().resolve()
+    pid_p = Path(os.environ.get("GATEWAY_PID", state_root / "control-plane" / "gateway" / "haproxy-lan.pid")).expanduser().resolve()
+    listen_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "127.0.0.1")
+    listen_port = int(os.environ.get("GATEWAY_LISTEN_PORT", "8443"))
+    return cfg_p, pid_p, listen_addr, listen_port
+
+
+def find_haproxy_bin() -> str:
+    for candidate in [
+        os.environ.get("HAPROXY_BIN"),
+        "/usr/local/sbin/haproxy-3.2.22",
+        shutil.which("haproxy"),
+    ]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ReconcileError("binário do HAProxy não encontrado em HAPROXY_BIN nem no PATH")
+
+
+def render_haproxy_config(
+    resolved_deployment_file: Path,
+    listen_address: str,
+    listen_port: int,
+    tls_pem: Path,
+) -> str:
+    res = subprocess.run([
+        sys.executable,
+        str(GATEWAY_CLI),
+        "render",
+        str(resolved_deployment_file),
+        "--listen-address", listen_address,
+        "--listen-port", str(listen_port),
+        "--tls-pem", str(tls_pem),
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res.returncode != 0:
+        raise ReconcileError(f"falha ao renderizar configuração HAProxy: {res.stderr.strip()}")
+    return res.stdout
+
+
+def validate_haproxy_config(haproxy_bin: str, cfg_content: str, parent_dir: Path) -> None:
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    tmp_cfg = parent_dir / f"haproxy.chk.{os.getpid()}_{time.time_ns()}.cfg"
+    try:
+        tmp_cfg.write_text(cfg_content, encoding="utf-8")
+        res = subprocess.run(
+            [haproxy_bin, "-c", "-f", str(tmp_cfg)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise ReconcileError(f"configuração HAProxy inválida (haproxy -c): {res.stderr.strip() or res.stdout.strip()}")
+    finally:
+        if tmp_cfg.exists():
+            try:
+                tmp_cfg.unlink()
+            except OSError:
+                pass
+
+
+def get_gateway_pid(pid_file: Path) -> int | None:
+    if pid_file.is_file():
+        try:
+            val = int(pid_file.read_text(encoding="utf-8").strip())
+            if is_pid_alive(val):
+                return val
+        except (ValueError, OSError):
+            pass
+    return None
+
+
+def reload_haproxy_gracefully(
+    haproxy_bin: str,
+    cfg_file: Path,
+    pid_file: Path,
+    pid_old: int | None = None,
+) -> int:
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [haproxy_bin, "-D", "-f", str(cfg_file), "-p", str(pid_file)]
+    if pid_old and is_pid_alive(pid_old):
+        cmd.extend(["-sf", str(pid_old)])
+
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res.returncode != 0:
+        raise ReconcileError(f"falha ao executar HAProxy reload: {res.stderr.strip() or res.stdout.strip()}")
+
+    deadline = time.monotonic() + 5.0
+    new_pid = None
+    while time.monotonic() < deadline:
+        candidate_pid = get_gateway_pid(pid_file)
+        if candidate_pid and (pid_old is None or candidate_pid != pid_old):
+            new_pid = candidate_pid
+            break
+        elif candidate_pid and is_pid_alive(candidate_pid):
+            new_pid = candidate_pid
+        time.sleep(0.05)
+
+    if not new_pid:
+        raise ReconcileError("HAProxy não permaneceu ativo após reload")
+    return new_pid
+
+
+def verify_gateway_urls(
+    resolved_doc: dict[str, Any],
+    listen_address: str,
+    listen_port: int,
+    ca_cert: Path,
+    timeout: float = 5.0,
+) -> tuple[bool, str]:
+    import http.client
+    import ssl
+
+    class SNIHTTPSConnection(http.client.HTTPSConnection):
+        def __init__(self, ip: str, port: int, server_hostname: str, context: ssl.SSLContext, timeout: float = 5.0):
+            super().__init__(ip, port=port, context=context, timeout=timeout)
+            self._sni_server_hostname = server_hostname
+
+        def connect(self):
+            super(http.client.HTTPSConnection, self).connect()
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=self._sni_server_hostname)
+
+    ssl_ctx = ssl.create_default_context(cafile=str(ca_cert))
+
+    for comp in resolved_doc.get("components", []):
+        cid = comp.get("component_id", "")
+        gw = comp.get("gateway")
+        probe = comp.get("probe")
+        if not gw or not probe:
+            continue
+        host = gw.get("host")
+        health_path = probe.get("health_path")
+        if not host or not health_path:
+            continue
+
+        try:
+            conn = SNIHTTPSConnection(
+                listen_address,
+                port=listen_port,
+                server_hostname=host,
+                context=ssl_ctx,
+                timeout=timeout,
+            )
+            conn.request("GET", health_path, headers={"Host": host, "User-Agent": "sister-reconcile", "Connection": "close"})
+            resp = conn.getresponse()
+            status = resp.status
+            conn.close()
+            if status != 200:
+                return False, f"componente '{cid}' via gateway https://{host}:{listen_port}{health_path} retornou HTTP {status}"
+        except Exception as exc:
+            return False, f"componente '{cid}' via gateway https://{host}:{listen_port}{health_path} falhou: {exc}"
+
+    return True, "OK"
+
+
+def resolve_projection_file_path(
+    state_root: Path,
+    config_root: Path,
+    current_components: dict[str, Any] | None = None,
+    desired_components: dict[str, Any] | None = None,
+) -> Path:
+    # 1. SISTER_ECOSYSTEM_PROJECTION_FILE no ambiente
+    env_p = os.environ.get("SISTER_ECOSYSTEM_PROJECTION_FILE")
+    if env_p:
+        return Path(env_p).expanduser().resolve()
+
+    # 2. Configuração operacional instalada (runtime.env)
+    runtime_env = config_root / "runtime.env"
+    if runtime_env.is_file():
+        for line in runtime_env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("SISTER_ECOSYSTEM_PROJECTION_FILE="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return Path(val).expanduser().resolve()
+
+    # 3. Default comprovadamente definido pelo runtime/contrato existente:
+    # Procura se algum componente participante possui run_dir com projection file
+    all_comps = {}
+    if current_components:
+        all_comps.update(current_components)
+    if desired_components:
+        all_comps.update(desired_components)
+
+    for cid in all_comps:
+        run_dir = state_root / "run" / cid
+        if (run_dir / "ecosystem_projection.tsv").is_file():
+            return (run_dir / "ecosystem_projection.tsv").resolve()
+
+    raise ReconcileError(
+        "autoridade da ecosystem projection não pôde ser determinada: "
+        "defina SISTER_ECOSYSTEM_PROJECTION_FILE no ambiente ou configure runtime.env"
+    )
+
+
+def render_ecosystem_projection(resolved_doc: dict[str, Any]) -> str:
+    comp_id = resolved_doc.get("composition_id", "")
+    dep_id = resolved_doc.get("deployment_id", "")
+    status = resolved_doc.get("status", "READY")
+    lines = [f"META\t{comp_id}\t{dep_id}\t{status}"]
+    for comp in resolved_doc.get("components", []):
+        cid = comp.get("component_id", "")
+        sid = comp.get("system_id", "")
+        rt = comp.get("runtime", {})
+        transport = rt.get("transport", "")
+        listen = rt.get("listen", "")
+        port = str(rt.get("port", 0)) if transport == "tcp" else ""
+        probe = comp.get("probe", {})
+        health_path = probe.get("health_path", "")
+        gw = comp.get("gateway") or {}
+        host = gw.get("host", "")
+        pub_url = gw.get("public_url", "")
+        lines.append(f"PARTICIPANT\t{cid}\t{sid}\t{transport}\t{listen}\t{port}\t{health_path}\t{host}\t{pub_url}")
+    return "\n".join(lines) + "\n"
+
+
+def refresh_ecosystem_projection(
+    projection_file: Path,
+    resolved_doc: dict[str, Any],
+) -> None:
+    tsv_content = render_ecosystem_projection(resolved_doc)
+    projection_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = projection_file.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+    try:
+        tmp_file.write_text(tsv_content, encoding="utf-8")
+        os.replace(tmp_file, projection_file)
+    finally:
+        if tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+
+
+def verify_ecosystem_observation(
+    current_components: dict[str, Any],
+    expected_participant_cids: set[str],
+) -> tuple[bool, str]:
+    for cid, comp in current_components.items():
+        rt = comp.get("runtime", {})
+        if rt.get("transport") != "tcp":
+            continue
+        listen = rt.get("listen", "127.0.0.1")
+        port = rt.get("port")
+        if not port:
+            continue
+
+        url = f"http://{listen}:{port}/api/ecosystem"
+        req = urllib.request.Request(url, headers={"User-Agent": "sister-reconcile"})
+        try:
+            with PROXYLESS_HTTP_OPENER.open(req, timeout=1.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    systems = data.get("systems", [])
+                    seen_cids = {s.get("componentId") for s in systems}
+                    if not expected_participant_cids.issubset(seen_cids):
+                        missing = expected_participant_cids - seen_cids
+                        return False, f"ecosystem view em '{cid}' não projetou os participantes esperados: faltando {missing}"
+                    return True, "OK"
+        except Exception:
+            continue
+
+    return True, "nenhum endpoint /api/ecosystem ativo encontrado; observação dispensada"
+
+
 def execute_apply(
     current_release_arg: str | None,
     desired_candidate_arg: str,
@@ -774,7 +1235,7 @@ def execute_apply(
 ) -> dict[str, Any]:
     if mode != "lab":
         raise ReconcileError(
-            f"modo '{mode}' não autorizado para apply no ciclo OPS-03 (somente 'lab' é suportado)"
+            f"modo '{mode}' não autorizado para apply no ciclo OPS-04 (somente 'lab' é suportado)"
         )
 
     if not state_root:
@@ -795,36 +1256,28 @@ def execute_apply(
         desired = load_desired_state(desired_candidate_arg, desired_deployment_arg)
         plan = compute_plan(current, desired, mode=mode, probe_runtime=True)
 
-        # 2. PREFLIGHT: Fail-closed se gateway ou projection exigirem mutações
-        if plan["gateway"]["action"] != "KEEP":
-            raise ReconcileError(
-                f"apply recusado: gateway action={plan['gateway']['action']} exige ciclos futuros OPS-04/OPS-05"
-            )
-
-        if plan["projection"]["action"] != "KEEP":
-            raise ReconcileError(
-                f"apply recusado: projection action={plan['projection']['action']} exige ciclos futuros OPS-04/OPS-05"
-            )
-
+        # 2. PREFLIGHT & AUTHORIZATION
         if plan["summary"]["reconfigure"] > 0:
             reconfig_cids = [c["component_id"] for c in plan["changes"] if c["action"] == "RECONFIGURE"]
             raise ReconcileError(
-                f"apply recusado: RECONFIGURE não é suportado no ciclo OPS-03 ({reconfig_cids})"
+                f"apply recusado: RECONFIGURE de componentes não é suportado ({reconfig_cids})"
             )
 
+        has_add = any(c["action"] == "ADD" for c in plan["changes"])
+        has_remove = any(c["action"] == "REMOVE" for c in plan["changes"])
         has_update = any(c["action"] == "UPDATE" for c in plan["changes"])
         has_repair = any(c["action"] == "REPAIR" for c in plan["changes"])
-        if has_update and has_repair:
+        if has_repair and (has_add or has_remove or has_update):
             raise ReconcileError(
                 "apply recusado: plano combina UPDATE e REPAIR no mesmo ciclo; "
-                "combinação não autorizada em OPS-03 (execute REPAIR primeiro ou isole o UPDATE)"
+                "combinação não autorizada (execute REPAIR primeiro ou isole o UPDATE)"
             )
 
         # 3. NO-OP CHECK
         active_changes = [c for c in plan["changes"] if c["action"] != "KEEP"]
         untouched = [c["component_id"] for c in plan["changes"] if c["action"] == "KEEP"]
 
-        if not active_changes:
+        if not active_changes and plan["gateway"]["action"] == "KEEP" and plan["projection"]["action"] == "KEEP":
             return {
                 "schema": APPLY_SCHEMA,
                 "status": "NO_OP",
@@ -832,20 +1285,32 @@ def execute_apply(
                 "executed_changes": [],
                 "untouched_components": untouched,
                 "summary": plan["summary"],
+                "gateway": plan["gateway"],
+                "projection": plan["projection"],
             }
 
         current_dir = Path(current["current_dir"])
         current_resolved_file = Path(current["resolved_file"])
+        current_resolved_doc = load_json(current_resolved_file, "deployment atual resolvido")
 
         target_release_dir: Path | None = None
         target_resolved_file: Path | None = None
+        target_resolved_doc: dict[str, Any] | None = None
 
-        # 4. MATERIALIZE: Se houver UPDATE, materializa TARGET_RELEASE imutável
-        if has_update:
+        needs_target_release = (
+            has_add
+            or has_remove
+            or has_update
+            or plan["gateway"]["action"] != "KEEP"
+            or plan["projection"]["action"] != "KEEP"
+        )
+
+        # 4. MATERIALIZE TARGET_RELEASE
+        if needs_target_release:
             dep_doc = load_json(Path(desired_deployment_arg), "deployment desejado")
             if dep_doc.get("schema") != "sister.infra.deployment/1.0.0":
                 raise ReconcileError(
-                    f"apply com UPDATE requer deployment declarativo 'sister.infra.deployment/1.0.0' (obtido: {dep_doc.get('schema')})"
+                    f"apply com mutação de topologia/recursos requer deployment declarativo 'sister.infra.deployment/1.0.0' (obtido: {dep_doc.get('schema')})"
                 )
 
             # 4a. Valida integridade da OLD_RELEASE
@@ -888,6 +1353,7 @@ def execute_apply(
 
             target_release_dir = Path(rel_info["release_path"])
             target_resolved_file = target_release_dir / "evidence" / "deployment" / "resolved.json"
+            target_resolved_doc = load_json(target_resolved_file, "deployment resolvido TARGET")
 
             # 4c. Valida integridade da TARGET_RELEASE recém-criada
             verify_target = subprocess.run(
@@ -902,21 +1368,70 @@ def execute_apply(
                 err = verify_target.stderr.strip() or verify_target.stdout.strip()
                 raise ReconcileError(f"TARGET_RELEASE recém-criada falhou na verificação de integridade: {err}")
 
-        # 5. ACT & VERIFY: Execução com Rollback Transacional do Change-set
-        rollback_stack: list[tuple[Any, ...]] = []
+        # 5. CONTEXTO TRANSACIONAL (em memória, sem backups persistentes implícitos no disco)
+        tx = TransactionContext()
         executed_changes = []
 
+        tls_pem, ca_cert, ca_key = get_tls_paths(config_root)
+        gateway_cfg, gateway_pid_file, gw_listen_addr, gw_listen_port = get_gateway_paths(state_root, config_root)
+        if target_resolved_doc and "gateway" in target_resolved_doc:
+            gw_listen_port = target_resolved_doc["gateway"].get("port", gw_listen_port)
+            gw_listen_addr = target_resolved_doc["gateway"].get("listen", gw_listen_addr)
+
+        projection_file: Path | None = None
+        if plan["projection"]["action"] != "KEEP":
+            projection_file = resolve_projection_file_path(state_root, config_root, current["components"], desired["components"])
+            if projection_file.is_file():
+                tx.old_projection_tsv = projection_file.read_text(encoding="utf-8")
+
+        haproxy_bin: str | None = None
+        if plan["gateway"]["action"] != "KEEP":
+            haproxy_bin = find_haproxy_bin()
+            if gateway_cfg.is_file():
+                tx.old_gateway_cfg = gateway_cfg.read_text(encoding="utf-8")
+            tx.pid_old_gateway = get_gateway_pid(gateway_pid_file)
+
         try:
-            # Executa ações ordenadas
+            # -------------------------------------------------------------
+            # FASE 1: EXPAND / ATIVAÇÃO DE RUNTIMES (ADD, UPDATE, REPAIR)
+            # -------------------------------------------------------------
             for item in plan["changes"]:
                 action = item["action"]
                 cid = item["component_id"]
 
-                if action == "UPDATE":
+                if action == "ADD":
+                    assert target_release_dir is not None
+                    assert target_resolved_file is not None
+                    des_comp = desired["components"][cid]
+                    start_res = invoke_component_action(
+                        target_release_dir, des_comp, "start", target_resolved_file,
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if start_res.returncode != 0:
+                        err = start_res.stderr.strip() or start_res.stdout.strip()
+                        raise ReconcileError(f"ADD falhou ao iniciar {cid} em TARGET_RELEASE: {err}")
+                    tx.components_rollback_stack.append(("STARTED_ADD", des_comp, target_release_dir, target_resolved_file))
+
+                    ok, detail = verify_component_health(
+                        target_release_dir, des_comp, target_resolved_file,
+                        des_comp["runtime"], des_comp.get("probe"),
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if not ok:
+                        raise ReconcileError(f"ADD falhou no health check de {cid}: {detail}")
+
+                    executed_changes.append({
+                        "component_id": cid,
+                        "action": "ADD",
+                        "status": "SUCCESS",
+                        "detail": "added to target release and verified healthy locally",
+                        "reason": item["reason"],
+                    })
+
+                elif action == "UPDATE":
                     curr_comp = current["components"][cid]
                     des_comp = desired["components"][cid]
 
-                    # Para versão anterior na OLD_RELEASE
                     stop_res = invoke_component_action(
                         current_dir, curr_comp, "stop", current_resolved_file,
                         state_root=state_root, config_root=config_root,
@@ -924,9 +1439,8 @@ def execute_apply(
                     if stop_res.returncode != 0:
                         err = stop_res.stderr.strip() or stop_res.stdout.strip()
                         raise ReconcileError(f"UPDATE falhou ao parar versão anterior de {cid}: {err}")
-                    rollback_stack.append(("STOPPED_OLD", curr_comp, current_dir, current_resolved_file))
+                    tx.components_rollback_stack.append(("STOPPED_OLD", curr_comp, current_dir, current_resolved_file))
 
-                    # Inicia nova versão a partir de TARGET_RELEASE (Gate T)
                     assert target_release_dir is not None
                     assert target_resolved_file is not None
                     start_res = invoke_component_action(
@@ -936,7 +1450,7 @@ def execute_apply(
                     if start_res.returncode != 0:
                         err = start_res.stderr.strip() or start_res.stdout.strip()
                         raise ReconcileError(f"UPDATE falhou ao iniciar nova versão de {cid} na TARGET_RELEASE: {err}")
-                    rollback_stack.append(("STARTED_NEW", des_comp, target_release_dir, target_resolved_file))
+                    tx.components_rollback_stack.append(("STARTED_NEW", des_comp, target_release_dir, target_resolved_file))
 
                     ok, detail = verify_component_health(
                         target_release_dir, des_comp, target_resolved_file,
@@ -980,14 +1494,107 @@ def execute_apply(
                         "reason": item["reason"],
                     })
 
-            # VERIFY: Checa que todos os componentes KEEP continuam saudáveis
+            # VERIFICA KEEP: componentes intocados preservam a saúde
             for cid in untouched:
                 curr_comp = current["components"][cid]
                 ok, detail = probe_runtime_endpoint(curr_comp["runtime"], curr_comp.get("probe"))
                 if not ok:
                     raise ReconcileError(f"violação crítica: componente KEEP '{cid}' perdeu a saúde após mutação: {detail}")
 
-            # 6. COMMIT OPERACIONAL (Comutação Atômica)
+            # -------------------------------------------------------------
+            # FASE 2: PREPARE TLS & VALIDATE
+            # -------------------------------------------------------------
+            if target_resolved_doc and plan["gateway"]["action"] != "KEEP":
+                desired_published_hosts = [
+                    c["gateway"]["host"] for c in target_resolved_doc.get("components", [])
+                    if c.get("gateway") and c["gateway"].get("host")
+                ]
+                current_sans = get_cert_sans(tls_pem)
+                if set(desired_published_hosts) != current_sans:
+                    if not check_ca_valid(ca_cert, ca_key):
+                        raise ReconcileError(
+                            "lab apply recusado: CA lab exige rotação (validade residual insuficiente ou CA ausente/inválida). "
+                            "A rotação da CA de laboratório requer ação explícita de autoridade (ex: sister-infra bootstrap)."
+                        )
+                    ca_cert_bytes = ca_cert.read_bytes()
+                    ca_key_bytes = ca_key.read_bytes()
+                    if tls_pem.is_file():
+                        tx.old_leaf_bytes = tls_pem.read_bytes()
+
+                    generate_leaf_certificate(tls_pem, ca_cert, ca_key, sorted(set(desired_published_hosts)))
+
+                    if ca_cert.read_bytes() != ca_cert_bytes or ca_key.read_bytes() != ca_key_bytes:
+                        raise ReconcileError("violação crítica: CA_CERT ou CA_KEY foi modificado durante renovação de folha")
+
+            # -------------------------------------------------------------
+            # FASE 3: PREPARE GATEWAY & RELOAD GRACEFULLY
+            # -------------------------------------------------------------
+            if plan["gateway"]["action"] != "KEEP":
+                assert target_resolved_file is not None
+                assert haproxy_bin is not None
+                target_cfg_content = render_haproxy_config(target_resolved_file, gw_listen_addr, gw_listen_port, tls_pem)
+                validate_haproxy_config(haproxy_bin, target_cfg_content, gateway_cfg.parent)
+
+                tmp_gw_file = gateway_cfg.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+                try:
+                    tmp_gw_file.write_text(target_cfg_content, encoding="utf-8")
+                    os.replace(tmp_gw_file, gateway_cfg)
+                finally:
+                    if tmp_gw_file.exists():
+                        try:
+                            tmp_gw_file.unlink()
+                        except OSError:
+                            pass
+
+                tx.pid_target_gateway = reload_haproxy_gracefully(
+                    haproxy_bin, gateway_cfg, gateway_pid_file, pid_old=tx.pid_old_gateway
+                )
+
+                assert target_resolved_doc is not None
+                ok, detail = verify_gateway_urls(target_resolved_doc, gw_listen_addr, gw_listen_port, ca_cert)
+                if not ok:
+                    raise ReconcileError(f"verificação do gateway após reload falhou: {detail}")
+
+            # -------------------------------------------------------------
+            # FASE 4: ATOMIC REFRESH PROJECTION & VERIFY ECOSYSTEM
+            # -------------------------------------------------------------
+            if plan["projection"]["action"] != "KEEP":
+                assert projection_file is not None
+                assert target_resolved_doc is not None
+                refresh_ecosystem_projection(projection_file, target_resolved_doc)
+
+                expected_cids = {c["component_id"] for c in target_resolved_doc.get("components", [])}
+                ok, detail = verify_ecosystem_observation(current["components"], expected_cids)
+                if not ok:
+                    raise ReconcileError(f"verificação da ecosystem projection em /api/ecosystem falhou: {detail}")
+
+            # -------------------------------------------------------------
+            # FASE 5: CONTRACT REMOVALS (Ordem Segura)
+            # -------------------------------------------------------------
+            for item in plan["changes"]:
+                if item["action"] == "REMOVE":
+                    cid = item["component_id"]
+                    curr_comp = current["components"][cid]
+                    stop_res = invoke_component_action(
+                        current_dir, curr_comp, "stop", current_resolved_file,
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if stop_res.returncode != 0:
+                        err = stop_res.stderr.strip() or stop_res.stdout.strip()
+                        raise ReconcileError(f"REMOVE falhou ao parar {cid}: {err}")
+                    tx.components_rollback_stack.append(("STOPPED_REMOVED", curr_comp, current_dir, current_resolved_file))
+
+                    executed_changes.append({
+                        "component_id": cid,
+                        "action": "REMOVE",
+                        "status": "SUCCESS",
+                        "detail": "unpublished from gateway/projection and stopped safely (data preserved)",
+                        "reason": item["reason"],
+                    })
+
+            # -------------------------------------------------------------
+            # FASE 6: COMMIT RELEASE (Comutação Atômica de Links)
+            # -------------------------------------------------------------
             if target_release_dir is not None:
                 switch_res = subprocess.run(
                     [str(WORKSTATION_CLI), "release-switch", "--target", str(target_release_dir)],
@@ -1000,6 +1607,16 @@ def execute_apply(
                 if switch_res.returncode != 0:
                     err = switch_res.stderr.strip() or switch_res.stdout.strip()
                     raise ReconcileError(f"falha no commit operacional ao comutar release via sister-workstation: {err}")
+                tx.switched_release = True
+
+            # -------------------------------------------------------------
+            # FASE 7: VERIFY FINAL (Sob lock até o fim)
+            # -------------------------------------------------------------
+            if target_resolved_doc is not None:
+                for comp in target_resolved_doc.get("components", []):
+                    ok, detail = probe_runtime_endpoint(comp["runtime"], comp.get("probe"))
+                    if not ok:
+                        raise ReconcileError(f"VERIFY FINAL falhou para componente '{comp['component_id']}': {detail}")
 
             return {
                 "schema": APPLY_SCHEMA,
@@ -1009,13 +1626,68 @@ def execute_apply(
                 "executed_changes": executed_changes,
                 "untouched_components": untouched,
                 "summary": plan["summary"],
+                "gateway": plan["gateway"],
+                "projection": plan["projection"],
             }
 
         except Exception:
-            # Rollback transacional de todas as ações em ordem estritamente inversa
-            for step in reversed(rollback_stack):
+            # Rollback integral em cascata
+            # 1. Se release-switch já tiver ocorrido, reverte links para OLD_RELEASE
+            if tx.switched_release:
+                try:
+                    subprocess.run(
+                        [str(WORKSTATION_CLI), "release-switch", "--target", str(current_dir)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                        close_fds=False,
+                    )
+                except Exception:
+                    pass
+
+            # 2. Se REMOVALS foram parados em Phase 5, reinicia na OLD_RELEASE
+            for step in reversed(tx.components_rollback_stack):
+                if step[0] == "STOPPED_REMOVED":
+                    _, rem_comp, cur_dir, cur_res_file = step
+                    try:
+                        invoke_component_action(cur_dir, rem_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
+                    except Exception:
+                        pass
+
+            # 3. Restaura projeção antiga se foi modificada
+            if tx.old_projection_tsv is not None and projection_file is not None:
+                try:
+                    tmp_p = projection_file.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+                    tmp_p.write_text(tx.old_projection_tsv, encoding="utf-8")
+                    os.replace(tmp_p, projection_file)
+                except Exception:
+                    pass
+
+            # 4. Restaura Gateway antigo: re-aplica old_gateway_cfg e faz graceful reload sobre pid_target_gateway
+            if tx.old_gateway_cfg is not None and tx.pid_target_gateway is not None and haproxy_bin is not None:
+                try:
+                    tmp_gw = gateway_cfg.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+                    tmp_gw.write_text(tx.old_gateway_cfg, encoding="utf-8")
+                    os.replace(tmp_gw, gateway_cfg)
+                    reload_haproxy_gracefully(haproxy_bin, gateway_cfg, gateway_pid_file, pid_old=tx.pid_target_gateway)
+                except Exception:
+                    pass
+
+            # 5. Restaura leaf TLS antigo se foi modificado
+            if tx.old_leaf_bytes is not None:
+                try:
+                    tmp_leaf = tls_pem.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
+                    tmp_leaf.write_bytes(tx.old_leaf_bytes)
+                    tmp_leaf.chmod(0o600)
+                    os.replace(tmp_leaf, tls_pem)
+                except Exception:
+                    pass
+
+            # 6. Reverte ADDs e UPDATEs (Fase 1)
+            for step in reversed(tx.components_rollback_stack):
                 step_type = step[0]
-                if step_type == "STARTED_NEW":
+                if step_type in ("STARTED_ADD", "STARTED_NEW"):
                     _, des_comp, tr_dir, tr_res_file = step
                     try:
                         invoke_component_action(tr_dir, des_comp, "stop", tr_res_file, state_root=state_root, config_root=config_root)
@@ -1028,6 +1700,7 @@ def execute_apply(
                     except Exception:
                         pass
 
+            # 7. Remove TARGET_RELEASE uncommitted
             if target_release_dir and target_release_dir.exists():
                 shutil.rmtree(target_release_dir, ignore_errors=True)
 

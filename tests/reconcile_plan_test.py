@@ -159,6 +159,8 @@ def main() -> None:
                 or "sister-candidate" in line
                 or "sister-deployment" in line
                 or "sister-workstation" in line
+                or "sister-gateway" in line
+                or "sister-infra" in line
                 or "sister_" in line
                 or (".local" in line and "sister" in line)
                 or (".config" in line and "sister" in line)

@@ -284,6 +284,8 @@ generate_lab_ca() {
     -sha256 \
     -days 3650 \
     -subj "/CN=SisTer Infra Lab CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -out "$CA_CERT" >/dev/null 2>&1
 
   chmod 644 "$CA_CERT"
