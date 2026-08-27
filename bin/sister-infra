@@ -790,7 +790,7 @@ Uso:
 
 Opções:
   --desired-candidate <dir>     diretório da candidata desejada verificada ou manifest.json
-  --desired-deployment <file>   deployment resolvido ou declarativo desejado
+  --desired-deployment <file>   deployment desejado (plan: declarativo ou resolved; apply: declarativo obrigatório quando houver materialização de TARGET_RELEASE)
   --current-release <dir>       diretório da release ativa (opcional)
   --no-probe-runtime            desativa sondagem factual de rede (somente plan)
   --json                        emite o resultado em JSON

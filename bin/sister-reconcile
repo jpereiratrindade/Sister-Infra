@@ -1749,7 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     apply_p = sub.add_parser(
         "apply",
-        help="Executa as alterações incrementais do plano (component-scoped)",
+        help="Executa transacionalmente alterações de componentes e recursos derivados",
     )
     apply_p.add_argument(
         "--desired-candidate",
@@ -1759,7 +1759,7 @@ def build_parser() -> argparse.ArgumentParser:
     apply_p.add_argument(
         "--desired-deployment",
         required=True,
-        help="Caminho do arquivo de deployment desejado (resolvido ou declarativo)",
+        help="Deployment desejado; mutações que materializam TARGET_RELEASE exigem sister.infra.deployment/1.0.0",
     )
     apply_p.add_argument(
         "--current-release",
