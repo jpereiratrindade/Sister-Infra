@@ -1235,7 +1235,7 @@ def execute_apply(
 ) -> dict[str, Any]:
     if mode != "lab":
         raise ReconcileError(
-            f"modo '{mode}' não autorizado para apply no ciclo OPS-04 (somente 'lab' é suportado)"
+            f"modo '{mode}' não autorizado para apply (somente 'lab' é suportado)"
         )
 
     if not state_root:

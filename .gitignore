@@ -7,3 +7,6 @@ config/production.env
 *.crt
 __pycache__/
 *.py[cod]
+*.p12
+*.pfx
+*.cer
