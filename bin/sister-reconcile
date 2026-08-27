@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from typing import Any
 import urllib.error
 import urllib.request
@@ -25,7 +28,15 @@ except ImportError as exc:
 INFRA_ROOT = Path(__file__).resolve().parents[1]
 CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
 DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
+WORKSTATION_CLI = INFRA_ROOT / "bin" / "sister-workstation"
 PLAN_SCHEMA = "sister.infra.reconcile.plan/1"
+APPLY_SCHEMA = "sister.infra.reconcile.apply/1"
+
+# Runtime probes observe the local data plane directly and must not
+# inherit ambient HTTP/HTTPS proxy configuration.
+PROXYLESS_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({})
+)
 
 
 class ReconcileError(RuntimeError):
@@ -70,7 +81,7 @@ def probe_runtime_endpoint(
             url = f"http://{listen}:{port}{health_path}"
             req = urllib.request.Request(url, headers={"User-Agent": "sister-reconcile"})
             try:
-                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                with PROXYLESS_HTTP_OPENER.open(req, timeout=timeout_seconds) as resp:
                     if resp.status == 200:
                         return True, "PASS (HTTP 200)"
                     return False, f"HTTP {resp.status}"
@@ -199,68 +210,41 @@ def load_current_state(
 
     return {
         "release_id": manifest.get("release_id", current_dir.name),
+        "current_dir": str(current_dir),
         "manifest": manifest,
         "resolved_deployment": resolved,
+        "resolved_file": str(resolved_file),
         "components": observed_components,
     }
 
 
-def validate_resolved_deployment_compatibility(
-    resolved_doc: dict[str, Any],
-    candidate_manifest: dict[str, Any],
-) -> None:
-    if resolved_doc.get("status") != "READY":
-        raise ReconcileError(
-            f"deployment resolvido deve possuir status=READY (atual: {resolved_doc.get('status')!r})"
-        )
-
-    dep_cand_id = resolved_doc.get("candidate_id")
-    cand_id = candidate_manifest.get("candidate_id")
-    if not dep_cand_id:
-        raise ReconcileError("deployment resolvido inválido: candidate_id ausente")
-    if not cand_id:
-        raise ReconcileError("candidata desejada inválida: candidate_id ausente")
-    if dep_cand_id != cand_id:
-        raise ReconcileError(
-            f"incompatibilidade: resolved deployment pertence à candidata {dep_cand_id!r}, "
-            f"mas a candidata desejada é {cand_id!r}"
-        )
-
-    dep_comp_id = resolved_doc.get("composition_id")
-    cand_comp_id = candidate_manifest.get("composition", {}).get("composition_id")
-    if not dep_comp_id:
-        raise ReconcileError("deployment resolvido inválido: composition_id ausente")
-    if not cand_comp_id:
-        raise ReconcileError("candidata desejada inválida: composition.composition_id ausente")
-    if dep_comp_id != cand_comp_id:
-        raise ReconcileError(
-            f"incompatibilidade: resolved deployment composition_id ({dep_comp_id!r}) "
-            f"difere da candidata ({cand_comp_id!r})"
-        )
-
-    cand_sys_ids = sorted(
-        c.get("system_id") for c in candidate_manifest.get("components", []) if c.get("system_id")
+def verify_resolved_deployment_authority(
+    candidate_manifest_path: Path,
+    resolved_deployment_path: Path,
+) -> dict[str, Any]:
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOYMENT_CLI),
+            "verify",
+            str(candidate_manifest_path),
+            str(resolved_deployment_path),
+            "--json",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
-    dep_sys_ids = sorted(
-        c.get("system_id") for c in resolved_doc.get("components", []) if c.get("system_id")
-    )
-    if cand_sys_ids != dep_sys_ids:
+    if res.returncode != 0:
+        err = res.stderr.strip() or res.stdout.strip()
         raise ReconcileError(
-            f"incompatibilidade: sistemas da candidata ({cand_sys_ids}) "
-            f"divergem do deployment resolvido ({dep_sys_ids})"
+            f"deployment resolvido falhou na verificação de compatibilidade:\n{err}"
         )
-
-    cand_cids = sorted(
-        c.get("component_id") for c in candidate_manifest.get("components", []) if c.get("component_id")
-    )
-    dep_cids = sorted(
-        c.get("component_id") for c in resolved_doc.get("components", []) if c.get("component_id")
-    )
-    if cand_cids != dep_cids:
-        raise ReconcileError(
-            f"incompatibilidade: componentes da candidata ({cand_cids}) "
-            f"divergem do deployment resolvido ({dep_cids})"
-        )
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReconcileError(f"saída inválida de sister-deployment verify: {exc}") from exc
 
 
 def extract_normalized_projection(
@@ -346,9 +330,12 @@ def load_desired_state(
 
     dep_doc = load_json(dep_path, "deployment desejado")
 
-    # Se o deployment informado já estiver resolvido (READY), utiliza diretamente.
+    # Se o deployment informado já estiver resolvido (READY), utiliza e verifica diretamente.
     if dep_doc.get("schema") == "sister.infra.deployment.resolved/1":
         resolved_deployment = dep_doc
+        resolved_file_path = dep_path
+        # Validação fail-closed de compatibilidade entre deployment resolvido e candidata
+        verify_resolved_deployment_authority(cand_manifest_file, dep_path)
     elif dep_doc.get("schema") == "sister.infra.deployment/1.0.0":
         # Resolve utilizando sister-deployment
         res = subprocess.run(
@@ -365,11 +352,9 @@ def load_desired_state(
             resolved_deployment = json.loads(res.stdout)
         except json.JSONDecodeError as exc:
             raise ReconcileError(f"resolução de deployment produziu JSON inválido: {exc}") from exc
+        resolved_file_path = None
     else:
         raise ReconcileError(f"schema de deployment não reconhecido: {dep_doc.get('schema')}")
-
-    # Validação fail-closed de compatibilidade entre deployment resolvido e candidata
-    validate_resolved_deployment_compatibility(resolved_deployment, candidate_manifest)
 
     resolved_by_id: dict[str, dict[str, Any]] = {}
     for comp in resolved_deployment.get("components", []):
@@ -396,8 +381,10 @@ def load_desired_state(
 
     return {
         "candidate_id": candidate_manifest.get("candidate_id", candidate_dir.name),
+        "candidate_dir": str(candidate_dir),
         "candidate_manifest": candidate_manifest,
         "resolved_deployment": resolved_deployment,
+        "resolved_file": str(resolved_file_path),
         "components": desired_components,
     }
 
@@ -626,6 +613,427 @@ def render_human_plan(plan: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_human_apply(result: dict[str, Any]) -> str:
+    lines = [
+        f"=== SisTer Infra — Reconcile Apply ({result.get('mode', 'lab')}) ===",
+        f"Status: {result.get('status')}",
+    ]
+    if result.get("status") == "NO_OP":
+        lines.append("[NO-OP] Todos os componentes estão KEEP. Nenhuma alteração necessária.")
+        return "\n".join(lines)
+
+    executed = result.get("executed_changes", [])
+    if executed:
+        lines.append("\nAções executadas:")
+        for ch in executed:
+            lines.append(
+                f"  [{ch['action']}] {ch['component_id']}: {ch['status']} ({ch.get('detail', '')})"
+            )
+
+    untouched = result.get("untouched_components", [])
+    if untouched:
+        lines.append(f"\nComponentes preservados (KEEP): {', '.join(untouched)}")
+
+    summ = result.get("summary", {})
+    lines.append(
+        f"\nResumo: {summ.get('add', 0)} ADD, {summ.get('update', 0)} UPDATE, "
+        f"{summ.get('remove', 0)} REMOVE, {summ.get('repair', 0)} REPAIR, "
+        f"{summ.get('keep', 0)} KEEP"
+    )
+    return "\n".join(lines)
+
+
+def invoke_component_action(
+    base_dir: Path,
+    comp: dict[str, Any],
+    action: str,
+    resolved_file: Path,
+    state_root: Path | None = None,
+    config_root: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cid = comp["component_id"]
+    comp_path = comp.get("path", f"components/{cid}")
+    root = base_dir / comp_path
+    entrypoint_rel = comp.get("runtime", {}).get("entrypoint", "scripts/runtime.sh")
+    entrypoint = root / entrypoint_rel
+
+    if not entrypoint.is_file():
+        raise ReconcileError(f"entrypoint ausente para componente '{cid}': {entrypoint}")
+    if not os.access(entrypoint, os.X_OK):
+        raise ReconcileError(f"entrypoint não executável para componente '{cid}': {entrypoint}")
+
+    if not state_root:
+        state_root = Path(
+            os.environ.get("SISTER_WORKSTATION_STATE_ROOT", "~/.local/state/sister/workstation")
+        ).expanduser().resolve()
+    if not config_root:
+        config_root = Path(
+            os.environ.get("SISTER_WORKSTATION_CONFIG_ROOT", "~/.config/sister/workstation")
+        ).expanduser().resolve()
+
+    comp_state_dir = state_root / "components" / cid
+    comp_run_dir = state_root / "run" / cid
+    comp_state_dir.mkdir(parents=True, exist_ok=True)
+    comp_run_dir.mkdir(parents=True, exist_ok=True)
+
+    config_file = config_root / f"{cid}.env"
+
+    env = dict(os.environ)
+    env["SISTER_RESOLVED_DEPLOYMENT_FILE"] = str(resolved_file)
+    env["SISTER_COMPONENT_CONFIG_FILE"] = str(config_file)
+    env["SISTER_RUNTIME_STATE_DIR"] = str(comp_state_dir)
+    env["SISTER_RUNTIME_RUN_DIR"] = str(comp_run_dir)
+
+    return subprocess.run(
+        [str(entrypoint), action],
+        cwd=str(root),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def verify_component_health(
+    base_dir: Path,
+    comp: dict[str, Any],
+    resolved_file: Path,
+    runtime_binding: dict[str, Any],
+    probe_config: dict[str, Any] | None,
+    state_root: Path | None = None,
+    config_root: Path | None = None,
+    max_attempts: int = 10,
+    delay_seconds: float = 0.2,
+) -> tuple[bool, str]:
+    import time
+    last_err = "health_check_failed"
+    for _ in range(max_attempts):
+        h_res = invoke_component_action(
+            base_dir, comp, "health", resolved_file, state_root=state_root, config_root=config_root
+        )
+        p_ok, p_detail = probe_runtime_endpoint(runtime_binding, probe_config)
+        if h_res.returncode == 0 and p_ok:
+            return True, "PASS"
+        last_err = f"entrypoint_rc={h_res.returncode}, probe={p_detail}"
+        time.sleep(delay_seconds)
+    return False, last_err
+
+
+class ReconcileLock:
+    def __init__(self, state_root: Path):
+        self.lock_dir = state_root / "locks"
+        self.lock_file = self.lock_dir / "workstation-lifecycle.lock"
+        self._fd: int | None = None
+
+    def __enter__(self) -> "ReconcileLock":
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._fd = os.open(
+                str(self.lock_file),
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.set_inheritable(self._fd, True)
+            os.environ["SISTER_WORKSTATION_LOCK_FD"] = str(self._fd)
+        except (BlockingIOError, OSError) as exc:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            raise ReconcileError(
+                f"outra operação de lifecycle está em execução (lock ativo em {self.lock_file})"
+            ) from exc
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if "SISTER_WORKSTATION_LOCK_FD" in os.environ:
+            del os.environ["SISTER_WORKSTATION_LOCK_FD"]
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+
+def execute_apply(
+    current_release_arg: str | None,
+    desired_candidate_arg: str,
+    desired_deployment_arg: str,
+    mode: str = "lab",
+    state_root: Path | None = None,
+    config_root: Path | None = None,
+) -> dict[str, Any]:
+    if mode != "lab":
+        raise ReconcileError(
+            f"modo '{mode}' não autorizado para apply no ciclo OPS-03 (somente 'lab' é suportado)"
+        )
+
+    if not state_root:
+        state_root = Path(
+            os.environ.get("SISTER_WORKSTATION_STATE_ROOT", "~/.local/state/sister/workstation")
+        ).expanduser().resolve()
+    if not config_root:
+        config_root = Path(
+            os.environ.get("SISTER_WORKSTATION_CONFIG_ROOT", "~/.config/sister/workstation")
+        ).expanduser().resolve()
+
+    with ReconcileLock(state_root):
+        # 1. OBSERVE & PLAN sob lock operacional
+        current = load_current_state(current_release_arg, probe_runtime=True)
+        if not current:
+            raise ReconcileError("apply requer uma release current ativa declarada")
+
+        desired = load_desired_state(desired_candidate_arg, desired_deployment_arg)
+        plan = compute_plan(current, desired, mode=mode, probe_runtime=True)
+
+        # 2. PREFLIGHT: Fail-closed se gateway ou projection exigirem mutações
+        if plan["gateway"]["action"] != "KEEP":
+            raise ReconcileError(
+                f"apply recusado: gateway action={plan['gateway']['action']} exige ciclos futuros OPS-04/OPS-05"
+            )
+
+        if plan["projection"]["action"] != "KEEP":
+            raise ReconcileError(
+                f"apply recusado: projection action={plan['projection']['action']} exige ciclos futuros OPS-04/OPS-05"
+            )
+
+        if plan["summary"]["reconfigure"] > 0:
+            reconfig_cids = [c["component_id"] for c in plan["changes"] if c["action"] == "RECONFIGURE"]
+            raise ReconcileError(
+                f"apply recusado: RECONFIGURE não é suportado no ciclo OPS-03 ({reconfig_cids})"
+            )
+
+        has_update = any(c["action"] == "UPDATE" for c in plan["changes"])
+        has_repair = any(c["action"] == "REPAIR" for c in plan["changes"])
+        if has_update and has_repair:
+            raise ReconcileError(
+                "apply recusado: plano combina UPDATE e REPAIR no mesmo ciclo; "
+                "combinação não autorizada em OPS-03 (execute REPAIR primeiro ou isole o UPDATE)"
+            )
+
+        # 3. NO-OP CHECK
+        active_changes = [c for c in plan["changes"] if c["action"] != "KEEP"]
+        untouched = [c["component_id"] for c in plan["changes"] if c["action"] == "KEEP"]
+
+        if not active_changes:
+            return {
+                "schema": APPLY_SCHEMA,
+                "status": "NO_OP",
+                "mode": mode,
+                "executed_changes": [],
+                "untouched_components": untouched,
+                "summary": plan["summary"],
+            }
+
+        current_dir = Path(current["current_dir"])
+        current_resolved_file = Path(current["resolved_file"])
+
+        target_release_dir: Path | None = None
+        target_resolved_file: Path | None = None
+
+        # 4. MATERIALIZE: Se houver UPDATE, materializa TARGET_RELEASE imutável
+        if has_update:
+            dep_doc = load_json(Path(desired_deployment_arg), "deployment desejado")
+            if dep_doc.get("schema") != "sister.infra.deployment/1.0.0":
+                raise ReconcileError(
+                    f"apply com UPDATE requer deployment declarativo 'sister.infra.deployment/1.0.0' (obtido: {dep_doc.get('schema')})"
+                )
+
+            # 4a. Valida integridade da OLD_RELEASE
+            verify_old = subprocess.run(
+                [str(WORKSTATION_CLI), "release-verify", str(current_dir), "--json"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=False,
+                check=False,
+            )
+            if verify_old.returncode != 0:
+                err = verify_old.stderr.strip() or verify_old.stdout.strip()
+                raise ReconcileError(f"release atual (OLD_RELEASE) falhou na verificação de integridade: {err}")
+
+            # 4b. Cria TARGET_RELEASE via sister-workstation release-create
+            dep_arg = desired_deployment_arg
+            create_res = subprocess.run(
+                [
+                    str(WORKSTATION_CLI),
+                    "release-create",
+                    "--candidate", str(desired["candidate_dir"]),
+                    "--deployment", str(dep_arg),
+                    "--json",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=False,
+                check=False,
+            )
+            if create_res.returncode != 0:
+                err = create_res.stderr.strip() or create_res.stdout.strip()
+                raise ReconcileError(f"falha ao materializar TARGET_RELEASE via sister-workstation: {err}")
+
+            try:
+                rel_info = json.loads(create_res.stdout)
+            except json.JSONDecodeError as exc:
+                raise ReconcileError(f"saída JSON inválida de release-create: {exc}") from exc
+
+            target_release_dir = Path(rel_info["release_path"])
+            target_resolved_file = target_release_dir / "evidence" / "deployment" / "resolved.json"
+
+            # 4c. Valida integridade da TARGET_RELEASE recém-criada
+            verify_target = subprocess.run(
+                [str(WORKSTATION_CLI), "release-verify", str(target_release_dir), "--json"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=False,
+                check=False,
+            )
+            if verify_target.returncode != 0:
+                err = verify_target.stderr.strip() or verify_target.stdout.strip()
+                raise ReconcileError(f"TARGET_RELEASE recém-criada falhou na verificação de integridade: {err}")
+
+        # 5. ACT & VERIFY: Execução com Rollback Transacional do Change-set
+        rollback_stack: list[tuple[Any, ...]] = []
+        executed_changes = []
+
+        try:
+            # Executa ações ordenadas
+            for item in plan["changes"]:
+                action = item["action"]
+                cid = item["component_id"]
+
+                if action == "UPDATE":
+                    curr_comp = current["components"][cid]
+                    des_comp = desired["components"][cid]
+
+                    # Para versão anterior na OLD_RELEASE
+                    stop_res = invoke_component_action(
+                        current_dir, curr_comp, "stop", current_resolved_file,
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if stop_res.returncode != 0:
+                        err = stop_res.stderr.strip() or stop_res.stdout.strip()
+                        raise ReconcileError(f"UPDATE falhou ao parar versão anterior de {cid}: {err}")
+                    rollback_stack.append(("STOPPED_OLD", curr_comp, current_dir, current_resolved_file))
+
+                    # Inicia nova versão a partir de TARGET_RELEASE (Gate T)
+                    assert target_release_dir is not None
+                    assert target_resolved_file is not None
+                    start_res = invoke_component_action(
+                        target_release_dir, des_comp, "start", target_resolved_file,
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if start_res.returncode != 0:
+                        err = start_res.stderr.strip() or start_res.stdout.strip()
+                        raise ReconcileError(f"UPDATE falhou ao iniciar nova versão de {cid} na TARGET_RELEASE: {err}")
+                    rollback_stack.append(("STARTED_NEW", des_comp, target_release_dir, target_resolved_file))
+
+                    ok, detail = verify_component_health(
+                        target_release_dir, des_comp, target_resolved_file,
+                        des_comp["runtime"], des_comp.get("probe"),
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if not ok:
+                        raise ReconcileError(f"UPDATE falhou no health check da nova versão de {cid}: {detail}")
+
+                    executed_changes.append({
+                        "component_id": cid,
+                        "action": "UPDATE",
+                        "status": "SUCCESS",
+                        "detail": "updated to target release version and verified healthy",
+                        "reason": item["reason"],
+                    })
+
+                elif action == "REPAIR":
+                    curr_comp = current["components"][cid]
+                    start_res = invoke_component_action(
+                        current_dir, curr_comp, "start", current_resolved_file,
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if start_res.returncode != 0:
+                        err = start_res.stderr.strip() or start_res.stdout.strip()
+                        raise ReconcileError(f"REPAIR falhou ao iniciar {cid}: {err}")
+
+                    ok, detail = verify_component_health(
+                        current_dir, curr_comp, current_resolved_file,
+                        curr_comp["runtime"], curr_comp.get("probe"),
+                        state_root=state_root, config_root=config_root,
+                    )
+                    if not ok:
+                        raise ReconcileError(f"REPAIR falhou no health check de {cid}: {detail}")
+
+                    executed_changes.append({
+                        "component_id": cid,
+                        "action": "REPAIR",
+                        "status": "SUCCESS",
+                        "detail": "restored drifted runtime and verified healthy",
+                        "reason": item["reason"],
+                    })
+
+            # VERIFY: Checa que todos os componentes KEEP continuam saudáveis
+            for cid in untouched:
+                curr_comp = current["components"][cid]
+                ok, detail = probe_runtime_endpoint(curr_comp["runtime"], curr_comp.get("probe"))
+                if not ok:
+                    raise ReconcileError(f"violação crítica: componente KEEP '{cid}' perdeu a saúde após mutação: {detail}")
+
+            # 6. COMMIT OPERACIONAL (Comutação Atômica)
+            if target_release_dir is not None:
+                switch_res = subprocess.run(
+                    [str(WORKSTATION_CLI), "release-switch", "--target", str(target_release_dir)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=False,
+                    check=False,
+                )
+                if switch_res.returncode != 0:
+                    err = switch_res.stderr.strip() or switch_res.stdout.strip()
+                    raise ReconcileError(f"falha no commit operacional ao comutar release via sister-workstation: {err}")
+
+            return {
+                "schema": APPLY_SCHEMA,
+                "status": "SUCCESS",
+                "mode": mode,
+                "target_release": str(target_release_dir) if target_release_dir else str(current_dir),
+                "executed_changes": executed_changes,
+                "untouched_components": untouched,
+                "summary": plan["summary"],
+            }
+
+        except Exception:
+            # Rollback transacional de todas as ações em ordem estritamente inversa
+            for step in reversed(rollback_stack):
+                step_type = step[0]
+                if step_type == "STARTED_NEW":
+                    _, des_comp, tr_dir, tr_res_file = step
+                    try:
+                        invoke_component_action(tr_dir, des_comp, "stop", tr_res_file, state_root=state_root, config_root=config_root)
+                    except Exception:
+                        pass
+                elif step_type == "STOPPED_OLD":
+                    _, curr_comp, cur_dir, cur_res_file = step
+                    try:
+                        invoke_component_action(cur_dir, curr_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
+                    except Exception:
+                        pass
+
+            if target_release_dir and target_release_dir.exists():
+                shutil.rmtree(target_release_dir, ignore_errors=True)
+
+            raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sister-reconcile",
@@ -666,6 +1074,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emite o plano no formato JSON padronizado",
     )
 
+    apply_p = sub.add_parser(
+        "apply",
+        help="Executa as alterações incrementais do plano (component-scoped)",
+    )
+    apply_p.add_argument(
+        "--desired-candidate",
+        required=True,
+        help="Diretório da candidata desejada verificada ou caminho de seu manifest.json",
+    )
+    apply_p.add_argument(
+        "--desired-deployment",
+        required=True,
+        help="Caminho do arquivo de deployment desejado (resolvido ou declarativo)",
+    )
+    apply_p.add_argument(
+        "--current-release",
+        help="Caminho da release ativa instalada ou seu manifest.json",
+    )
+    apply_p.add_argument(
+        "--mode",
+        default="lab",
+        choices=["lab"],
+        help="Contexto operacional autorizado (somente lab neste ciclo)",
+    )
+    apply_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emite o resultado da execução em JSON",
+    )
+
     return parser
 
 
@@ -673,27 +1111,46 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        current = load_current_state(
-            args.current_release,
-            probe_runtime=args.probe_runtime,
-        )
-        desired = load_desired_state(
-            args.desired_candidate,
-            args.desired_deployment,
-        )
-        plan = compute_plan(
-            current,
-            desired,
-            mode=args.mode,
-            probe_runtime=args.probe_runtime,
-        )
+        if args.command == "plan":
+            current = load_current_state(
+                args.current_release,
+                probe_runtime=args.probe_runtime,
+            )
+            desired = load_desired_state(
+                args.desired_candidate,
+                args.desired_deployment,
+            )
+            plan = compute_plan(
+                current,
+                desired,
+                mode=args.mode,
+                probe_runtime=args.probe_runtime,
+            )
 
-        if args.json:
-            print(json.dumps(plan, indent=2, sort_keys=True))
+            if args.json:
+                print(json.dumps(plan, indent=2, sort_keys=True))
+            else:
+                print(render_human_plan(plan))
+
+            return 0
+
+        elif args.command == "apply":
+            result = execute_apply(
+                args.current_release,
+                args.desired_candidate,
+                args.desired_deployment,
+                mode=args.mode,
+            )
+
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(render_human_apply(result))
+
+            return 0
+
         else:
-            print(render_human_plan(plan))
-
-        return 0
+            raise ReconcileError(f"comando desconhecido: {args.command}")
 
     except ReconcileError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)

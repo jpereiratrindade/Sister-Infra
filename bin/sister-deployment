@@ -292,15 +292,127 @@ def resolve(
     }
 
 
+def verify_resolved_deployment(
+    candidate: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    if resolved.get("schema") != "sister.infra.deployment.resolved/1":
+        raise DeploymentError(
+            f"schema de deployment resolvido inválido: esperado sister.infra.deployment.resolved/1, obtido {resolved.get('schema')}"
+        )
+    if resolved.get("status") != "READY":
+        raise DeploymentError(
+            f"deployment resolvido não está READY: status={resolved.get('status')}"
+        )
+
+    cand_id = candidate.get("candidate_id")
+    res_cand_id = resolved.get("candidate_id")
+    if not cand_id:
+        raise DeploymentError("manifesto de candidata inválido: candidate_id ausente")
+    if not res_cand_id:
+        raise DeploymentError("deployment resolvido inválido: candidate_id ausente")
+    if cand_id != res_cand_id:
+        raise DeploymentError(
+            f"incompatibilidade: candidate_id divergente: candidata possui '{cand_id}', mas deployment indica '{res_cand_id}'"
+        )
+
+    cand_comp_id = candidate.get("composition", {}).get("composition_id")
+    res_comp_id = resolved.get("composition_id")
+    if not cand_comp_id:
+        raise DeploymentError("manifesto de candidata inválido: composition_id ausente")
+    if not res_comp_id:
+        raise DeploymentError("deployment resolvido inválido: composition_id ausente")
+    if cand_comp_id != res_comp_id:
+        raise DeploymentError(
+            f"incompatibilidade: composition_id divergente: candidata possui '{cand_comp_id}', mas deployment indica '{res_comp_id}'"
+        )
+
+    cand_components = candidate.get("components", [])
+    if not isinstance(cand_components, list) or not cand_components:
+        raise DeploymentError("candidata sem participantes válidos")
+
+    res_components = resolved.get("components", [])
+    if not isinstance(res_components, list) or not res_components:
+        raise DeploymentError("deployment resolvido sem participantes")
+
+    seen_cand_cids: set[str] = set()
+    seen_cand_sids: set[str] = set()
+    cand_pairs: list[tuple[str, str]] = []
+    for c in cand_components:
+        if not isinstance(c, dict):
+            raise DeploymentError(f"candidata contém entrada de componente inválida: {c}")
+        cid = c.get("component_id")
+        sid = c.get("system_id")
+        if not cid:
+            raise DeploymentError(f"candidata inválida: componente sem component_id: {c}")
+        if not sid:
+            raise DeploymentError(f"candidata inválida: componente '{cid}' sem system_id")
+        if cid in seen_cand_cids:
+            raise DeploymentError(f"candidata possui component_id duplicado: '{cid}'")
+        if sid in seen_cand_sids:
+            raise DeploymentError(f"candidata possui system_id duplicado: '{sid}'")
+        seen_cand_cids.add(cid)
+        seen_cand_sids.add(sid)
+        cand_pairs.append((cid, sid))
+
+    seen_res_cids: set[str] = set()
+    seen_res_sids: set[str] = set()
+    res_pairs: list[tuple[str, str]] = []
+    for c in res_components:
+        if not isinstance(c, dict):
+            raise DeploymentError(f"deployment resolvido contém entrada de componente inválida: {c}")
+        cid = c.get("component_id")
+        sid = c.get("system_id")
+        if not cid:
+            raise DeploymentError(f"deployment resolvido inválido: componente sem component_id: {c}")
+        if not sid:
+            raise DeploymentError(f"deployment resolvido inválido: componente '{cid}' sem system_id")
+        if cid in seen_res_cids:
+            raise DeploymentError(f"deployment resolvido possui component_id duplicado: '{cid}'")
+        if sid in seen_res_sids:
+            raise DeploymentError(f"deployment resolvido possui system_id duplicado: '{sid}'")
+        seen_res_cids.add(cid)
+        seen_res_sids.add(sid)
+        res_pairs.append((cid, sid))
+
+    cand_pairs.sort()
+    res_pairs.sort()
+
+    if cand_pairs != res_pairs:
+        raise DeploymentError(
+            f"incompatibilidade: participantes (component_id, system_id) divergentes: candidata possui {cand_pairs}, mas deployment resolvido possui {res_pairs}"
+        )
+
+    return {
+        "schema": "sister.infra.deployment.verified/1",
+        "status": "VALID",
+        "candidate_id": cand_id,
+        "deployment_id": resolved.get("deployment_id"),
+        "composition_id": cand_comp_id,
+        "components_count": len(cand_pairs),
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Resolve bindings de deployment para uma candidata"
+        description="Resolve e verifica bindings de deployment para uma candidata"
     )
     subcommands = result.add_subparsers(dest="command", required=True)
-    resolve_parser = subcommands.add_parser("resolve")
+
+    resolve_parser = subcommands.add_parser(
+        "resolve", help="Resolve deployment declarativo contra candidata"
+    )
     resolve_parser.add_argument("candidate_manifest")
     resolve_parser.add_argument("deployment")
     resolve_parser.add_argument("--json", action="store_true")
+
+    verify_parser = subcommands.add_parser(
+        "verify", help="Verifica compatibilidade entre candidata e deployment resolvido"
+    )
+    verify_parser.add_argument("candidate_manifest")
+    verify_parser.add_argument("resolved_deployment")
+    verify_parser.add_argument("--json", action="store_true")
+
     return result
 
 
@@ -310,30 +422,49 @@ def main() -> int:
         candidate_path = existing_file(
             args.candidate_manifest, "manifesto de candidata"
         )
-        deployment_path = existing_file(args.deployment, "deployment")
-        result = resolve(
-            load_json(candidate_path, "manifesto de candidata"),
-            load_json(deployment_path, "deployment"),
-            candidate_path=candidate_path,
-        )
+        if args.command == "resolve":
+            deployment_path = existing_file(args.deployment, "deployment")
+            result = resolve(
+                load_json(candidate_path, "manifesto de candidata"),
+                load_json(deployment_path, "deployment"),
+                candidate_path=candidate_path,
+            )
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(
+                    "[PASS] deployment resolvido: "
+                    f"{result['deployment_id']} -> {result['candidate_id']}"
+                )
+                print(f"status={result['status']}")
+                for component in result["components"]:
+                    print(
+                        f"{component['system_id']} -> "
+                        f"{component['runtime']['transport']}"
+                    )
+            return 0
+
+        elif args.command == "verify":
+            resolved_path = existing_file(
+                args.resolved_deployment, "deployment resolvido"
+            )
+            candidate_doc = load_json(candidate_path, "manifesto de candidata")
+            resolved_doc = load_json(resolved_path, "deployment resolvido")
+            result = verify_resolved_deployment(candidate_doc, resolved_doc)
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(
+                    f"[PASS] deployment resolvido compatível com a candidata: {result['deployment_id']} -> {result['candidate_id']}"
+                )
+            return 0
+
+        else:
+            raise DeploymentError(f"comando desconhecido: {args.command}")
+
     except DeploymentError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
-
-    if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        print(
-            "[PASS] deployment resolvido: "
-            f"{result['deployment_id']} -> {result['candidate_id']}"
-        )
-        print(f"status={result['status']}")
-        for component in result["components"]:
-            print(
-                f"{component['system_id']} -> "
-                f"{component['runtime']['transport']}"
-            )
-    return 0
 
 
 if __name__ == "__main__":

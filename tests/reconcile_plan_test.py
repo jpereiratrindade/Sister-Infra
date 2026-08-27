@@ -158,10 +158,10 @@ def main() -> None:
                 or "sister-reconcile" in line
                 or "sister-candidate" in line
                 or "sister-deployment" in line
-                or "sister_reconcile" in line
-                or "sister_current_release" in line
-                or "sister_workstation_install_root" in line
-                or (".local" in line and "share" in line and "sister" in line)
+                or "sister-workstation" in line
+                or "sister_" in line
+                or (".local" in line and "sister" in line)
+                or (".config" in line and "sister" in line)
                 or "sister infra" in line
             )
             assert allowed, (
