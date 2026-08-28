@@ -31,8 +31,9 @@ doctor
   = read-only
 
 repair
-  = correção mínima de drift comprovado e autorizado
-  = planejado após estabilização desta fronteira
+  = NÃO pertence ao OPS-07A0
+  = trabalho futuro a ser tratado em incremento posterior
+  = correção mínima de drift comprovado e autorizado (não é reexecutar bootstrap)
 ```
 
 Regra central:
@@ -92,6 +93,20 @@ Um objeto existente incompatível com a intenção não é tratado como ausênci
 
 A fronteira de manutenção não conhece participantes concretos, portas ou hosts.
 Esses dados continuam pertencendo às declarações e aos contratos autoritativos.
+
+### MNT-007 — Contrato de canais e pureza JSON
+
+A CLI do control plane preserva separação estrita de canais:
+
+- Em invocação normal:
+  - `stdout`: resultado operacional formal do comando;
+  - `stderr`: diagnóstico, progresso e logs.
+- Em invocação com `--json`:
+  - `stdout`: exatamente um único documento JSON válido;
+  - `stderr`: diagnóstico, progresso e logs permitidos.
+
+Funções auxiliares (`materialize_layout`, `layout_check`, checagens de
+integridade) e materializadores intermediários nunca poluem `stdout`.
 
 ## 4. Relação com o bootstrap histórico
 

@@ -396,6 +396,10 @@ python3 tests/lab_ux_test.py
 # Plano de dados / TLS
 bash tests/data_plane_contract_test.sh
 bash tests/tls_lifecycle_test.sh
+
+# Manutenção e semântica de control plane
+python3 tests/workstation_maintenance_semantics_test.py
+python3 tests/historical_bootstrap_retirement_test.py
 ```
 
 Antes de commit:
@@ -448,12 +452,14 @@ produção e sua autoridade pertencem ao ambiente institucional, não ao Git.
 Estado atual do roadmap:
 
 ```text
-OPS-00  DONE
-OPS-01  DONE
-OPS-02  DONE
-OPS-03  DONE
-OPS-04  DONE
-OPS-05  DONE
-OPS-06  DONE
-OPS-07  NEXT (PLANNED)
+OPS-00    DONE
+OPS-01    DONE
+OPS-02    DONE
+OPS-03    DONE
+OPS-04    DONE
+OPS-05    DONE
+OPS-06    DONE
+OPS-07A0  DONE
+OPS-07A1  DONE
+OPS-07    NEXT (PLANNED)
 ```

@@ -167,34 +167,46 @@ Na prova real de fechamento, o plano observou `sister`, `nexo` e `praxis` como
 
 ### OPS-07A0 — Maintenance Semantics
 
-**IN PROGRESS**
+**DONE**
 
 Aplicação operacional de `REARIT-P001@0.1.0` à manutenção do control plane.
 
-Fronteira adotada:
+Fronteira adotada e comprovada:
 
 ```text
 check      read-only
 bootstrap  materialização idempotente de pré-condições ausentes
 doctor     diagnóstico read-only
-repair     correção mínima autorizada (próximo incremento)
+repair     trabalho futuro (não pertence ao OPS-07A0; próximo incremento)
 ```
 
 O Gate 0 identificou que o bootstrap histórico mantinha uma segunda
 representação concreta de participantes e que `doctor` e outros comandos
 observacionais herdavam mutação de `ensure_dirs`.
 
-O primeiro incremento remove essa ambiguidade antes da abertura de
-`production apply`.
+A correção eliminou a mutação espúria, estabeleceu a materialização isolada de
+pré-condições locais, e restaurou o contrato de separação de canais:
 
-Critérios:
+```text
+CLI normal:
+  stdout = resultado operacional
+  stderr = diagnóstico/log
 
-- observação não cria estado;
+CLI com --json:
+  stdout = exatamente um documento JSON válido
+  stderr = diagnóstico/log permitido
+```
+
+Critérios comprovados por testes automatizados:
+
+- observação (`check`, `doctor`) não cria estado;
 - bootstrap executa preflight antes de mutar;
 - bootstrap repetido converge para `NO_OP`;
 - divergência existente falha fechado;
-- manutenção permanece genérica;
+- manutenção permanece genérica (zero participantes concretos hardcoded);
 - conhecimento derivável continua vindo das declarações autoritativas;
+- contrato JSON puro em `release-create --json` e `release-verify --json`
+  protegido por teste regressivo (Gate J);
 - `setup_sister_infra.sh` não é modernizado como segunda implementação;
 - OPS-07A1 comprovou ausência de dependência operacional e retirou o bootstrap
   histórico da árvore corrente, preservando sua genealogia no Git.
