@@ -67,7 +67,9 @@ Em conformidade com a política institucional, os recursos são distribuídos se
   └── current -> releases/pr-20260828120000Z-cand-001
 
 /etc/sister/
-  ├── production.env
+  ├── composition.json
+  ├── deployment.json
+  ├── policy.json            (opcional; somente política local)
   ├── tls/
   │     ├── ecosystem.crt   (fornecido externamente)
   │     └── ecosystem.key   (600, fornecido externamente)

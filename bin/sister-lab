@@ -16,33 +16,41 @@ import tempfile
 from typing import Any
 
 INFRA_ROOT = Path(__file__).resolve().parent.parent
+AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
 
 class LabUxError(RuntimeError):
     pass
 
+def authority_context(
+    composition: Path | None = None,
+    deployment: Path | None = None,
+    allow_missing: bool = True,
+) -> dict[str, Any]:
+    cmd = [str(AUTHORITY_CLI), "resolve", "--target", "lab"]
+    if composition:
+        cmd.extend(["--composition", str(composition)])
+    if deployment:
+        cmd.extend(["--deployment", str(deployment)])
+    if allow_missing:
+        cmd.append("--allow-missing")
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise LabUxError(proc.stderr.strip() or "falha ao resolver installation authority")
+    return json.loads(proc.stdout)
+
+
 def canonical_paths() -> tuple[Path, Path]:
-    control_plane = Path(
-        os.environ.get(
-            "SISTER_WORKSTATION_CONTROL_PLANE_SOURCE",
-            str(INFRA_ROOT),
-        )
-    ).expanduser()
-
-    composition = Path(
-        os.environ.get(
-            "SISTER_WORKSTATION_COMPOSITION_FILE",
-            str(control_plane / "config" / "compositions" / "workstation.json"),
-        )
-    ).expanduser()
-
-    deployment = Path(
-        os.environ.get(
-            "SISTER_WORKSTATION_DEPLOYMENT_FILE",
-            str(control_plane / "config" / "deployments" / "workstation-lab.json"),
-        )
-    ).expanduser()
-
-    return composition, deployment
+    context = authority_context()
+    return (
+        Path(context["composition"]["path"]),
+        Path(context["deployment"]["path"]),
+    )
 
 def candidate_cli() -> Path:
     return Path(
@@ -539,6 +547,7 @@ def invoke_reconcile(
     args: argparse.Namespace,
     desired_candidate: Path,
     desired_deployment: Path,
+    context: dict[str, Any],
 ) -> int:
     cli = reconcile_cli()
     if not cli.is_file():
@@ -564,7 +573,31 @@ def invoke_reconcile(
     if args.json:
         cmd.append("--json")
 
-    proc = subprocess.run(cmd, check=False)
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if args.command == "plan" and proc.returncode == 0:
+        if args.json:
+            try:
+                document = json.loads(proc.stdout)
+            except json.JSONDecodeError as exc:
+                raise LabUxError(f"reconciliador produziu JSON inválido: {exc}") from exc
+            document["authority"] = context
+            print(json.dumps(document, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Authority root: {context['config_root']}")
+            print(f"Composition: {context['composition']['path']} {context['composition']['digest']}")
+            print(f"Deployment: {context['deployment']['path']} {context['deployment']['digest']}")
+            if proc.stdout:
+                sys.stdout.write(proc.stdout)
+    elif proc.stdout:
+        sys.stdout.write(proc.stdout)
     return proc.returncode
 
 def run(args: argparse.Namespace) -> int:
@@ -600,7 +633,12 @@ def run(args: argparse.Namespace) -> int:
         desired_deployment = canonical_deployment.resolve()
 
     if explicit_candidate is not None:
-        return invoke_reconcile(args, explicit_candidate, desired_deployment)
+        context = authority_context(
+            explicit_candidate / "manifest.json",
+            desired_deployment if args.desired_deployment else None,
+            allow_missing=False,
+        )
+        return invoke_reconcile(args, explicit_candidate, desired_deployment, context)
 
     if not canonical_composition.is_file():
         raise LabUxError(
@@ -626,7 +664,11 @@ def run(args: argparse.Namespace) -> int:
             canonical_composition.resolve(),
             candidate_dir,
         )
-        return invoke_reconcile(args, desired_candidate, desired_deployment)
+        context = authority_context(
+            deployment=desired_deployment if args.desired_deployment else None,
+            allow_missing=False,
+        )
+        return invoke_reconcile(args, desired_candidate, desired_deployment, context)
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)

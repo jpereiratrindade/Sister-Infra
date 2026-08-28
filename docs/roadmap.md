@@ -131,12 +131,11 @@ sister-infra lab apply
 
 sem necessidade de fornecer manualmente caminhos de candidata e deployment.
 
-O desired state LAB passa a ser derivado das declarações canônicas versionadas
-no control plane:
+O desired state LAB passa a ser derivado da authority externa da workstation:
 
 ```text
-config/compositions/workstation.json
-config/deployments/workstation-lab.json
+~/.config/sister/workstation/composition.json
+~/.config/sister/workstation/deployment.json
 ```
 
 com precedência explícita dos overrides:
@@ -144,7 +143,6 @@ com precedência explícita dos overrides:
 ```text
 SISTER_WORKSTATION_COMPOSITION_FILE
 SISTER_WORKSTATION_DEPLOYMENT_FILE
-SISTER_WORKSTATION_CONTROL_PLANE_SOURCE
 ```
 
 Propriedades comprovadas:
@@ -157,7 +155,7 @@ Propriedades comprovadas:
 - overrides explícitos permanecem retrocompatíveis;
 - ausência de declaração necessária falha fechado;
 - stdout JSON permanece puro;
-- defaults oficiais são derivados do control plane;
+- defaults oficiais são derivados da installation authority externa;
 - regressões de `reconcile plan` e `reconcile apply` preservadas;
 - prova factual real de `sister-infra lab plan` sem argumentos manuais.
 
@@ -365,6 +363,19 @@ Propriedades comprovadas e invariantes (Gates L1 a L25):
 - **Genericidade Estática (`REARIT-P003`)**: Zero conhecimento embutido de participantes (`urt`, `nexo`, etc.) ou portas fixas (Gate L23);
 - **Prova com Sistema Real Testemunha (URT)**: Prova real executada contra o repositório URT em sandbox efêmero com mutações sintéticas inofensivas, preservando 100% a árvore e branch originais do URT (Gate L24);
 - **Preservação Absoluta do Host**: O runtime de produção real (HAProxy 8443, PID 9488) permaneceu intocado (Gate L25).
+
+### OPS-09 — Installation Authority Boundary
+
+**DONE**
+
+O engine deixou de usar o source tree como installation authority implícita.
+`sister-authority` centraliza precedência, paths, provenance e SHA-256 para LAB
+e produção. Gateway bind/port passam pelo deployment resolvido; exemplos sob
+`config/` são explicitamente não autoritativos.
+
+Gates UX33–UX45 comprovam mudança de domínio/IP sem código, source read-only,
+fail-closed sem authority, identidade consistente, bootstrap não criador e
+preservação byte a byte da configuração externa.
 
 ## Visão de chegada
 

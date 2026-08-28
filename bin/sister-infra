@@ -21,6 +21,7 @@ Uso:
   ./bin/sister-infra candidate <comando> [opções]
   ./bin/sister-infra production <comando> [opções]
   ./bin/sister-infra lifecycle <comando> [opções]
+  ./bin/sister-infra authority resolve --target <lab|production>
 
 Comandos gerais:
   up          inicia gateway derivado do deployment resolvido
@@ -44,7 +45,7 @@ Exemplos:
   ./bin/sister-infra status --profile lan
   ./bin/sister-infra down --profile lan
 
-Produção exige config/production.env, PRODUCTION_APPROVED=YES e:
+Produção exige installation authority externa, PRODUCTION_APPROVED=YES e:
   SISTER_INFRA_PRODUCTION_CONFIRM=YES ./bin/sister-infra up --profile production
 USAGE
 }
@@ -61,19 +62,11 @@ require_command() {
 load_profile() {
   local default_port="${GATEWAY_LISTEN_PORT:-}"
   local default_addr="${GATEWAY_LISTEN_ADDRESS:-}"
-  # shellcheck disable=SC1091
-  source "$INFRA_ROOT/config/common.env"
-
-  local profile_file="$INFRA_ROOT/config/${PROFILE}.env"
-  if [[ "$PROFILE" == "production" && ! -f "$profile_file" ]]; then
-    die "produção não configurada. Copie config/production.env.example para config/production.env e revise."
-  fi
-  [[ -f "$profile_file" ]] || die "perfil inexistente: $PROFILE"
-  # shellcheck disable=SC1090
-  source "$profile_file"
-
-  [[ -n "$default_port" ]] && GATEWAY_LISTEN_PORT="$default_port"
-  [[ -n "$default_addr" ]] && GATEWAY_LISTEN_ADDRESS="$default_addr"
+  HAPROXY_BIN="${HAPROXY_BIN:-/usr/local/sbin/haproxy-3.2.22}"
+  STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-90}"
+  TLS_MODE="${TLS_MODE:-$([[ "$PROFILE" == "production" ]] && printf external || printf lab)}"
+  GATEWAY_LISTEN_PORT="$default_port"
+  GATEWAY_LISTEN_ADDRESS="$default_addr"
 
   mkdir -p "$GATEWAY_RUN" "$LOG_ROOT"
   chmod 700 "$RUN_ROOT" "$GATEWAY_RUN" "$LOG_ROOT" 2>/dev/null || true
@@ -91,7 +84,7 @@ production_preflight() {
   [[ "$PROFILE" == "production" ]] || return 0
 
   [[ "${PRODUCTION_APPROVED:-NO}" == "YES" ]] || \
-    die "PRODUCTION_APPROVED=YES não está definido em config/production.env"
+    die "PRODUCTION_APPROVED=YES não está definido pela autoridade externa"
 
   [[ "${SISTER_INFRA_PRODUCTION_CONFIRM:-NO}" == "YES" ]] || \
     die "produção exige SISTER_INFRA_PRODUCTION_CONFIRM=YES no comando"
@@ -195,6 +188,14 @@ runtime_preflight() {
     and .status == "READY"
     and (.components | type == "array" and length > 0)
   ' "$resolved" >/dev/null || die "deployment resolvido inválido"
+
+  local declared_addr declared_port
+  declared_addr="$(jq -r '.gateway.listen // empty' "$resolved")"
+  declared_port="$(jq -r '.gateway.port // empty' "$resolved")"
+  GATEWAY_LISTEN_ADDRESS="${GATEWAY_LISTEN_ADDRESS:-$declared_addr}"
+  GATEWAY_LISTEN_PORT="${GATEWAY_LISTEN_PORT:-$declared_port}"
+  [[ -n "$GATEWAY_LISTEN_ADDRESS" ]] || die "gateway.listen ausente no deployment resolvido"
+  [[ -n "$GATEWAY_LISTEN_PORT" ]] || die "gateway.port ausente no deployment resolvido"
 
   if [[ ! -x "$HAPROXY_BIN" ]]; then
     local detected
@@ -449,6 +450,11 @@ fi
 if [[ "${1:-}" == "lifecycle" ]]; then
   shift
   exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-lifecycle" "$@"
+fi
+
+if [[ "${1:-}" == "authority" ]]; then
+  shift
+  exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-authority" "$@"
 fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

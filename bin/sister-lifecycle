@@ -35,6 +35,7 @@ LAB_CLI = INFRA_ROOT / "bin" / "sister-lab"
 RECONCILE_CLI = INFRA_ROOT / "bin" / "sister-reconcile"
 WORKSTATION_CLI = INFRA_ROOT / "bin" / "sister-workstation"
 PRODUCTION_CLI = INFRA_ROOT / "bin" / "sister-production"
+AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
 
 
 # -----------------------------------------------------------------------------
@@ -85,39 +86,36 @@ def run_cmd(
     )
 
 
+def resolve_authority_context(
+    composition_arg: str | None,
+    deployment_arg: str | None,
+    target: str = "lab",
+    allow_missing: bool = False,
+) -> dict[str, Any]:
+    cmd = [str(AUTHORITY_CLI), "resolve", "--target", target]
+    if composition_arg:
+        cmd.extend(["--composition", composition_arg])
+    if deployment_arg:
+        cmd.extend(["--deployment", deployment_arg])
+    if allow_missing:
+        cmd.append("--allow-missing")
+    proc = run_cmd(cmd)
+    if proc.returncode != 0:
+        raise LifecycleError(
+            "INSTALLATION_AUTHORITY_MISSING",
+            proc.stderr.strip() or "falha ao resolver installation authority",
+            "AUTHORITY",
+        )
+    return json.loads(proc.stdout)
+
+
 def resolve_canonical_paths(
     composition_arg: str | None,
     deployment_arg: str | None,
     target: str = "lab",
 ) -> tuple[Path, Path]:
-    control_source = Path(
-        os.environ.get("SISTER_WORKSTATION_CONTROL_PLANE_SOURCE", str(INFRA_ROOT))
-    ).expanduser().resolve()
-
-    # Composição
-    if composition_arg:
-        comp_path = Path(composition_arg).expanduser().resolve()
-    else:
-        env_comp = os.environ.get("SISTER_WORKSTATION_COMPOSITION_FILE")
-        if env_comp:
-            comp_path = Path(env_comp).expanduser().resolve()
-        else:
-            comp_path = control_source / "config" / "compositions" / "workstation.json"
-
-    # Deployment
-    if deployment_arg:
-        dep_path = Path(deployment_arg).expanduser().resolve()
-    else:
-        env_dep = os.environ.get("SISTER_WORKSTATION_DEPLOYMENT_FILE")
-        if env_dep:
-            dep_path = Path(env_dep).expanduser().resolve()
-        else:
-            if target == "production":
-                dep_path = control_source / "config" / "deployments" / "production.json"
-            else:
-                dep_path = control_source / "config" / "deployments" / "workstation-lab.json"
-
-    return comp_path, dep_path
+    context = resolve_authority_context(composition_arg, deployment_arg, target)
+    return Path(context["composition"]["path"]), Path(context["deployment"]["path"])
 
 
 def get_lifecycle_state_roots() -> dict[str, Path]:
@@ -687,9 +685,15 @@ def get_lifecycle_status() -> dict[str, Any]:
     # 5. Production Readiness
     prod_status = "AVAILABLE_IN_SANDBOX"
 
+    authorities = {
+        target: resolve_authority_context(None, None, target, allow_missing=True)
+        for target in ("lab", "production")
+    }
+
     return {
         "schema": "sister.infra.lifecycle.status/1.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "authorities": authorities,
         "layers": {
             "source": {
                 "status": source_status,
@@ -850,7 +854,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "plan":
-            comp_p, dep_p = resolve_canonical_paths(args.composition, args.deployment, args.target)
+            authority = resolve_authority_context(args.composition, args.deployment, args.target)
+            comp_p = Path(authority["composition"]["path"])
+            dep_p = Path(authority["deployment"]["path"])
             cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
             plan = build_lifecycle_plan(
                 target=args.target,
@@ -859,6 +865,7 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_path=cand_p,
                 component_ref=args.component,
             )
+            plan["authority"] = authority
             out_str = json.dumps(plan, indent=2, ensure_ascii=False)
             if args.out:
                 Path(args.out).write_text(out_str + "\n", encoding="utf-8")
@@ -867,7 +874,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "run":
-            comp_p, dep_p = resolve_canonical_paths(args.composition, args.deployment, args.target)
+            authority = resolve_authority_context(args.composition, args.deployment, args.target)
+            comp_p = Path(authority["composition"]["path"])
+            dep_p = Path(authority["deployment"]["path"])
             cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
             res = execute_lifecycle_run(
                 target=args.target,

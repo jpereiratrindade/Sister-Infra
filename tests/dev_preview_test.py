@@ -654,13 +654,23 @@ def test_gate_7_zero_residues() -> None:
 
 def main() -> None:
     print("[TEST] Iniciando suite de testes de DEV Preview (OPS-05)...")
-    test_gate_1_dev_binding()
-    test_gate_2_discovery()
-    test_gate_3_source_preservation()
-    test_gate_4_lab_isolation()
-    test_gate_5_port_retry()
-    test_gate_6_lifecycle_health()
-    test_gate_7_zero_residues()
+    from component_resolver_test import make_contracts
+    with tempfile.TemporaryDirectory(prefix="sister-dev-contracts-") as tmp:
+        previous = os.environ.get("SISTER_CONTRACT_ROOT")
+        os.environ["SISTER_CONTRACT_ROOT"] = str(make_contracts(Path(tmp)))
+        try:
+            test_gate_1_dev_binding()
+            test_gate_2_discovery()
+            test_gate_3_source_preservation()
+            test_gate_4_lab_isolation()
+            test_gate_5_port_retry()
+            test_gate_6_lifecycle_health()
+            test_gate_7_zero_residues()
+        finally:
+            if previous is None:
+                os.environ.pop("SISTER_CONTRACT_ROOT", None)
+            else:
+                os.environ["SISTER_CONTRACT_ROOT"] = previous
     print("[PASS] Todos os Gates de OPS-05 (1 a 7) passaram com sucesso!")
 
 

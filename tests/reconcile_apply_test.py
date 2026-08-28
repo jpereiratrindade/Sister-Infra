@@ -378,7 +378,7 @@ def main() -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "dep-base",
             "composition_id": "test_reconcile",
-            "gateway": {"protocol": "https", "port": 8443},
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
             "bindings": [
                 {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
                 {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},
@@ -463,7 +463,7 @@ def main() -> None:
                 "schema": "sister.infra.deployment/1.0.0",
                 "deployment_id": "dep-reconfig",
                 "composition_id": "test_reconcile",
-                "gateway": {"protocol": "https", "port": 8443},
+                "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
                 "bindings": [
                     {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha + 100}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
                     {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},

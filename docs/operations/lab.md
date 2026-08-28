@@ -23,15 +23,15 @@ A forma canônica disponível é:
 sister-infra lab plan
 ```
 
-Por padrão, a intenção LAB é derivada das declarações canônicas versionadas no
-control plane:
+Por padrão, a intenção LAB vem da authority externa persistente:
 
 ```text
-config/compositions/workstation.json
-config/deployments/workstation-lab.json
+~/.config/sister/workstation/composition.json
+~/.config/sister/workstation/deployment.json
 ```
 
-A resolução é responsabilidade da camada `sister-lab`; o motor
+A resolução central é responsabilidade de `sister-authority`; `sister-lab`
+consome esse contexto. O motor
 `sister-reconcile` continua recebendo candidata e deployment explicitamente e
 permanece genérico.
 

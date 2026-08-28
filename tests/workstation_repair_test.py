@@ -131,6 +131,7 @@ def write_deployment(path: Path, port: int) -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "fixture-lab",
             "composition_id": "example_workstation",
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
@@ -534,4 +535,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

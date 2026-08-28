@@ -145,17 +145,17 @@ def main() -> int:
     bootstrap_preflight = function_block(
         source, "workstation_bootstrap_preflight"
     )
-    assert "COMPOSITION_FILE" in bootstrap_preflight
-    assert "DEPLOYMENT_FILE" in bootstrap_preflight
-    assert "CONTROL_PLANE_SOURCE" in bootstrap_preflight
+    assert "COMPOSITION_FILE" not in bootstrap_preflight
+    assert "DEPLOYMENT_FILE" not in bootstrap_preflight
+    assert "CONTROL_PLANE_SOURCE" not in bootstrap_preflight
 
     bootstrap_block = function_block(source, "workstation_bootstrap")
     assert "workstation_bootstrap_preflight" in bootstrap_block
     assert "materialize_layout" in bootstrap_block
+    assert "workstation_check" not in bootstrap_block
 
     print(
-        "[PASS] Gate B2 — materialização local desacoplada da autoridade "
-        "de bootstrap"
+        "[PASS] Gate B2 — bootstrap materializa somente layout"
     )
 
     with tempfile.TemporaryDirectory(
@@ -230,17 +230,23 @@ def main() -> int:
     ) as tmp_text:
         tmp = Path(tmp_text)
         env, paths = make_env(tmp)
+        paths["composition"].unlink()
         paths["deployment"].unlink()
 
+        boot = run(env, "bootstrap")
+        assert boot.returncode == 0
+        assert "autoridade da instalação ainda não materializada" in boot.stderr
+        assert paths["install"].is_dir()
+        assert not paths["composition"].exists()
+        assert not paths["deployment"].exists()
         before = snapshot(tmp)
-        blocked = run(env, "bootstrap")
+        blocked = run(env, "check")
         after = snapshot(tmp)
-
         assert blocked.returncode != 0
+        assert "composição canônica ausente" in blocked.stderr
         assert "deployment canônico ausente" in blocked.stderr
         assert before == after
-        assert not paths["install"].exists()
-        print("[PASS] Gate I — bootstrap exige declaração canônica antes de agir")
+        print("[PASS] Gate I — bootstrap não inventa authority; check falha fechado")
 
     # Gate J: Pureza de stdout JSON em operações declarativas (OPS-07A0-FIX)
     # Caso 1: release-create --json produz exatamente um documento JSON válido em stdout

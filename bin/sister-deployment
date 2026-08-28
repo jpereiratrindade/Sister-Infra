@@ -288,6 +288,7 @@ def resolve(
         "deployment_id": deployment["deployment_id"],
         "candidate_id": candidate.get("candidate_id"),
         "composition_id": deployment["composition_id"],
+        "gateway": gateway_config,
         "components": resolved_components,
     }
 

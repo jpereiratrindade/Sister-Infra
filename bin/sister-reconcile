@@ -960,11 +960,18 @@ def generate_leaf_certificate(
 def get_gateway_paths(
     state_root: Path,
     config_root: Path,
+    resolved_doc: dict[str, Any],
 ) -> tuple[Path, Path, str, int]:
     cfg_p = Path(os.environ.get("GATEWAY_CFG", state_root / "control-plane" / "gateway" / "haproxy-lan.cfg")).expanduser().resolve()
     pid_p = Path(os.environ.get("GATEWAY_PID", state_root / "control-plane" / "gateway" / "haproxy-lan.pid")).expanduser().resolve()
-    listen_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "127.0.0.1")
-    listen_port = int(os.environ.get("GATEWAY_LISTEN_PORT", "8443"))
+    gateway = resolved_doc.get("gateway") or {}
+    listen_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip() or gateway.get("listen")
+    port_value = os.environ.get("GATEWAY_LISTEN_PORT", "").strip() or gateway.get("port")
+    if not listen_addr:
+        raise ReconcileError("gateway.listen ausente no deployment resolvido")
+    if not port_value:
+        raise ReconcileError("gateway.port ausente no deployment resolvido")
+    listen_port = int(port_value)
     return cfg_p, pid_p, listen_addr, listen_port
 
 
@@ -1375,7 +1382,9 @@ def execute_apply(
         executed_changes = []
 
         tls_pem, ca_cert, ca_key = get_tls_paths(config_root)
-        gateway_cfg, gateway_pid_file, gw_listen_addr, gw_listen_port = get_gateway_paths(state_root, config_root)
+        gateway_cfg, gateway_pid_file, gw_listen_addr, gw_listen_port = get_gateway_paths(
+            state_root, config_root, desired["resolved_deployment"]
+        )
         if target_resolved_doc and "gateway" in target_resolved_doc:
             gw_listen_port = target_resolved_doc["gateway"].get("port", gw_listen_port)
             gw_listen_addr = target_resolved_doc["gateway"].get("listen", gw_listen_addr)

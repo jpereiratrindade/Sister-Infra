@@ -45,10 +45,10 @@ Por padrão:
 
 ```text
 composition
-  → config/compositions/workstation.json
+  → ~/.config/sister/workstation/composition.json
 
 deployment
-  → config/deployments/workstation-lab.json
+  → ~/.config/sister/workstation/deployment.json
 ```
 
 Overrides explícitos continuam válidos:

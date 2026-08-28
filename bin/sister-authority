@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Resolve installation authority without consulting the source tree."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
+
+
+class AuthorityError(RuntimeError):
+    pass
+
+
+def digest(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def production_config_root() -> Path:
+    explicit = os.environ.get("SISTER_PRODUCTION_CONFIG_ROOT", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    sandbox = os.environ.get("SISTER_PRODUCTION_ROOT", "").strip()
+    if sandbox:
+        return (Path(sandbox).expanduser().resolve() / "etc" / "sister")
+    return Path("/etc/sister")
+
+
+def config_root(target: str) -> Path:
+    if target == "production":
+        return production_config_root()
+    value = os.environ.get("SISTER_WORKSTATION_CONFIG_ROOT", "").strip()
+    if value:
+        return Path(value).expanduser().resolve()
+    return (Path.home() / ".config" / "sister" / "workstation").resolve()
+
+
+def select_path(
+    cli_value: str | None,
+    env_name: str,
+    default_path: Path,
+) -> tuple[Path, str]:
+    if cli_value:
+        return Path(cli_value).expanduser().resolve(), "cli"
+    env_value = os.environ.get(env_name, "").strip()
+    if env_value:
+        return Path(env_value).expanduser().resolve(), "environment"
+    return default_path.resolve(), "installation_authority"
+
+
+def artifact(path: Path, source: str) -> dict[str, Any]:
+    file_digest = digest(path)
+    return {
+        "path": str(path),
+        "source": source,
+        "digest": file_digest,
+        "status": "READY" if file_digest else "ABSENT",
+    }
+
+
+def resolve_context(args: argparse.Namespace) -> dict[str, Any]:
+    target = "lab" if args.target == "workstation" else args.target
+    root = config_root(target)
+    prefix = "SISTER_PRODUCTION" if target == "production" else "SISTER_WORKSTATION"
+
+    composition, composition_source = select_path(
+        args.composition,
+        f"{prefix}_COMPOSITION_FILE",
+        root / "composition.json",
+    )
+    deployment, deployment_source = select_path(
+        args.deployment,
+        f"{prefix}_DEPLOYMENT_FILE",
+        root / "deployment.json",
+    )
+    policy, policy_source = select_path(
+        args.policy,
+        f"{prefix}_POLICY_FILE",
+        root / "policy.json",
+    )
+
+    context = {
+        "schema": "sister.infra.installation-authority/1",
+        "target": target,
+        "config_root": str(root),
+        "composition": artifact(composition, composition_source),
+        "deployment": artifact(deployment, deployment_source),
+        "installation_policy": artifact(policy, policy_source),
+        "source_tree_is_authority": False,
+    }
+    required = ("composition",) if target == "dev" else ("composition", "deployment")
+    missing = [
+        name
+        for name in required
+        if context[name]["status"] != "READY"
+    ]
+    context["status"] = "READY" if not missing else "MISSING"
+    context["missing"] = missing
+    if missing and not args.allow_missing:
+        details = ", ".join(
+            f"{name}={context[name]['path']}" for name in missing
+        )
+        raise AuthorityError(f"installation authority ausente: {details}")
+    return context
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-authority",
+        description="Resolve autoridade da instalação sem fallback para source tree.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    resolve = sub.add_parser("resolve")
+    resolve.add_argument(
+        "--target",
+        choices=("dev", "lab", "workstation", "production"),
+        required=True,
+    )
+    resolve.add_argument("--composition")
+    resolve.add_argument("--deployment")
+    resolve.add_argument("--policy")
+    resolve.add_argument("--allow-missing", action="store_true")
+    resolve.add_argument("--format", choices=("json", "paths"), default="json")
+    seed = sub.add_parser(
+        "seed-lab",
+        help="Migra declarações revisadas para authority LAB de forma explícita.",
+    )
+    seed.add_argument("--composition-source", required=True)
+    seed.add_argument("--deployment-source", required=True)
+    seed.add_argument("--config-root")
+    return parser
+
+
+def seed_lab(args: argparse.Namespace) -> dict[str, Any]:
+    root = (
+        Path(args.config_root).expanduser().resolve()
+        if args.config_root
+        else config_root("lab")
+    )
+    sources = {
+        "composition": Path(args.composition_source).expanduser().resolve(),
+        "deployment": Path(args.deployment_source).expanduser().resolve(),
+    }
+    destinations = {
+        "composition": root / "composition.json",
+        "deployment": root / "deployment.json",
+    }
+    if root.exists() and not root.is_dir():
+        raise AuthorityError(f"config root existe e não é diretório: {root}")
+    for name, source in sources.items():
+        if not source.is_file():
+            raise AuthorityError(f"seed {name} ausente: {source}")
+        destination = destinations[name]
+        if destination.is_symlink():
+            raise AuthorityError(f"seed recusado sobre symlink: {destination}")
+        if destination.exists() and destination.read_bytes() != source.read_bytes():
+            raise AuthorityError(f"seed recusado; destino divergente existe: {destination}")
+
+    root_was_present = root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    if not root_was_present:
+        root.chmod(0o700)
+    created: list[Path] = []
+    try:
+        for name, source in sources.items():
+            destination = destinations[name]
+            if destination.exists():
+                continue
+            with destination.open("xb") as stream:
+                stream.write(source.read_bytes())
+            destination.chmod(0o644)
+            created.append(destination)
+    except Exception:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "schema": "sister.infra.installation-authority.seed/1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": "lab",
+        "status": "SEEDED" if created else "NO_OP",
+        "config_root": str(root),
+        "created": [str(path) for path in created],
+        "composition": artifact(destinations["composition"], "explicit_seed"),
+        "deployment": artifact(destinations["deployment"], "explicit_seed"),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        context = seed_lab(args) if args.command == "seed-lab" else resolve_context(args)
+    except (AuthorityError, OSError, ValueError) as exc:
+        print(f"[FAIL-CLOSED] {exc}", file=sys.stderr)
+        return 2
+    if args.command == "resolve" and args.format == "paths":
+        print(context["config_root"])
+        print(context["composition"]["path"])
+        print(context["deployment"]["path"])
+        print(context["installation_policy"]["path"])
+    else:
+        print(json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

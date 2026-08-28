@@ -72,12 +72,12 @@ própria workstation:
 
 ### MNT-003 — Preflight antes da mutação
 
-Antes de criar qualquer diretório, `bootstrap` exige:
+Antes de criar qualquer diretório, `bootstrap` exige ausência de colisões em
+que um path requerido exista com tipo incompatível.
 
-- control plane acessível;
-- composição canônica presente;
-- deployment canônico presente;
-- ausência de colisões em que um path requerido exista com tipo incompatível.
+Composition, deployment, installation policy e TLS não são materializados,
+copiados nem sobrescritos pelo bootstrap. Sua ausência não impede preparação
+do layout; comandos dependentes falham fechado depois.
 
 Falha de preflight não pode deixar materialização parcial.
 
@@ -95,7 +95,12 @@ Um objeto existente incompatível com a intenção não é tratado como ausênci
 A fronteira de manutenção não conhece participantes concretos, portas ou hosts.
 Esses dados continuam pertencendo às declarações e aos contratos autoritativos.
 
-### MNT-007 — Contrato de canais e pureza JSON
+### MNT-007 — Installation authority externa
+
+Todos os paths operacionais de composition/deployment são resolvidos por
+`sister-authority`. O source tree pode conter exemplos, mas nunca é fallback.
+
+### MNT-008 — Contrato de canais e pureza JSON
 
 A CLI do control plane preserva separação estrita de canais:
 

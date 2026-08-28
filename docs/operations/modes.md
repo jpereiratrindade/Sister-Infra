@@ -100,12 +100,11 @@ sister-infra lab plan
 sister-infra lab apply
 ```
 
-A UX LAB resolve automaticamente o desired state a partir das declarações
-canônicas versionadas no control plane:
+A UX LAB resolve automaticamente o desired state a partir da authority externa:
 
 ```text
-config/compositions/workstation.json
-config/deployments/workstation-lab.json
+~/.config/sister/workstation/composition.json
+~/.config/sister/workstation/deployment.json
 ```
 
 Argumentos `--desired-candidate` e `--desired-deployment` permanecem disponíveis

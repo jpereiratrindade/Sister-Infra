@@ -12,7 +12,6 @@ CANDIDATES_ROOT="$INSTALL_ROOT/candidates"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
 
-CONFIG_ROOT="${SISTER_WORKSTATION_CONFIG_ROOT:-$HOME_DIR/.config/sister/workstation}"
 STATE_ROOT="${SISTER_WORKSTATION_STATE_ROOT:-$HOME_DIR/.local/state/sister/workstation}"
 SYSTEMD_USER_ROOT="${SISTER_WORKSTATION_SYSTEMD_ROOT:-$HOME_DIR/.config/systemd/user}"
 UNIT_NAME="${SISTER_WORKSTATION_UNIT_NAME:-sister-workstation.service}"
@@ -20,12 +19,21 @@ UNIT_FILE="$SYSTEMD_USER_ROOT/$UNIT_NAME"
 BIN_ROOT="${SISTER_WORKSTATION_BIN_ROOT:-$HOME_DIR/.local/bin}"
 CLI_LINK="$BIN_ROOT/sister-infra"
 
+CONTROL_PLANE_SOURCE="${SISTER_WORKSTATION_CONTROL_PLANE_SOURCE:-$INFRA_ROOT}"
+AUTHORITY_CLI="$INFRA_ROOT/bin/sister-authority"
+AUTHORITY_PATHS_OUTPUT="$(
+  "$AUTHORITY_CLI" resolve --target lab --allow-missing --format paths
+)" || {
+  printf '[FAIL] não foi possível resolver installation authority\n' >&2
+  exit 1
+}
+mapfile -t AUTHORITY_PATHS <<<"$AUTHORITY_PATHS_OUTPUT"
+CONFIG_ROOT="${AUTHORITY_PATHS[0]}"
+COMPOSITION_FILE="${AUTHORITY_PATHS[1]}"
+DEPLOYMENT_FILE="${AUTHORITY_PATHS[2]}"
+POLICY_FILE="${AUTHORITY_PATHS[3]}"
 RUNTIME_ENV="$CONFIG_ROOT/runtime.env"
 TLS_CONFIG="$CONFIG_ROOT/tls"
-
-CONTROL_PLANE_SOURCE="${SISTER_WORKSTATION_CONTROL_PLANE_SOURCE:-$INFRA_ROOT}"
-COMPOSITION_FILE="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONTROL_PLANE_SOURCE/config/compositions/workstation.json}"
-DEPLOYMENT_FILE="${SISTER_WORKSTATION_DEPLOYMENT_FILE:-$CONTROL_PLANE_SOURCE/config/deployments/workstation-lab.json}"
 COMPOSITION_CONTRACTS_ROOT="${SISTER_WORKSTATION_CONTRACTS_ROOT:-}"
 
 TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
@@ -34,6 +42,10 @@ pass() { printf '[PASS] %s\n' "$*" >&2; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 info() { printf '[INFO] %s\n' "$*" >&2; }
 die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+
+is_git_repo() {
+  git -C "$1" rev-parse --git-dir >/dev/null 2>&1
+}
 
 usage() {
   cat <<'EOF'
@@ -119,15 +131,6 @@ layout_preflight() {
 }
 
 workstation_bootstrap_preflight() {
-  [[ -d "$CONTROL_PLANE_SOURCE" ]] || \
-    die "control plane ausente: $CONTROL_PLANE_SOURCE"
-
-  [[ -f "$COMPOSITION_FILE" ]] || \
-    die "composição canônica ausente: $COMPOSITION_FILE"
-
-  [[ -f "$DEPLOYMENT_FILE" ]] || \
-    die "deployment canônico ausente: $DEPLOYMENT_FILE"
-
   layout_preflight
 }
 
@@ -158,7 +161,7 @@ require_repo_clean() {
   local repo="$1"
   local name="$2"
 
-  [[ -d "$repo/.git" ]] || die "$name não localizado: $repo"
+  is_git_repo "$repo" || die "$name não localizado: $repo"
 
   local dirty
   dirty="$(git -C "$repo" status --porcelain)"
@@ -219,10 +222,8 @@ sync_runtime_env() {
   local release resolved values
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
-  local gateway_listen=""
-  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
-    gateway_listen="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
-  fi
+  local gateway_listen
+  gateway_listen="$(jq -r '.gateway.listen // empty' "$resolved")"
   values="$(jq -r --arg gw_ip "$gateway_listen" '
     ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
     + (if $gw_ip != "" then [$gw_ip] else [] end)
@@ -241,10 +242,8 @@ cmd_client_env() {
   local release resolved values
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
-  local gateway_listen=""
-  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
-    gateway_listen="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
-  fi
+  local gateway_listen
+  gateway_listen="$(jq -r '.gateway.listen // empty' "$resolved")"
   values="$(jq -r --arg gw_ip "$gateway_listen" '
     ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
     + (if $gw_ip != "" then [$gw_ip] else [] end)
@@ -260,12 +259,9 @@ cmd_hosts_line() {
   local release resolved hosts_list
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
-  local gateway_listen="127.0.0.1"
-  if [[ -f "$CONTROL_PLANE_SOURCE/config/lan.env" ]]; then
-    local found
-    found="$(grep -E '^GATEWAY_LISTEN_ADDRESS=' "$CONTROL_PLANE_SOURCE/config/lan.env" | cut -d= -f2 | tr -d '"' || true)"
-    if [[ -n "$found" ]]; then gateway_listen="$found"; fi
-  fi
+  local gateway_listen
+  gateway_listen="$(jq -r '.gateway.listen // empty' "$resolved")"
+  [[ -n "$gateway_listen" ]] || die "gateway.listen ausente no deployment resolvido"
   hosts_list="$(jq -r '
     [.components[] | select(.gateway != null) | .gateway.host]
     | unique | join(" ")
@@ -804,12 +800,8 @@ declarative_source_files() {
   control_plane="$(cd "$CONTROL_PLANE_SOURCE" && pwd -P)"
   require_repo_clean "$control_plane" "sister-infra"
 
-  local composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-}"
-  local deployment="${SISTER_WORKSTATION_DEPLOYMENT_FILE:-}"
-  [[ -n "$composition" ]] || \
-    composition="$control_plane/config/compositions/workstation.json"
-  [[ -n "$deployment" ]] || \
-    deployment="$control_plane/config/deployments/workstation-lab.json"
+  local composition="$COMPOSITION_FILE"
+  local deployment="$DEPLOYMENT_FILE"
 
   [[ -f "$composition" ]] || die "composição oficial ausente: $composition"
   [[ -f "$deployment" ]] || die "deployment oficial ausente: $deployment"
@@ -1262,7 +1254,7 @@ release_create() {
 
   if [[ "$(jq -r '.control_plane // empty' "$tmp/manifest.json")" == "" ]]; then
     local infra_source="${CONTROL_PLANE_SOURCE:-$INFRA_ROOT}"
-    if [[ -d "$infra_source/.git" ]]; then
+    if is_git_repo "$infra_source"; then
       local infra_commit
       infra_commit="$(git -C "$infra_source" rev-parse HEAD)"
       clone_component "$infra_source" "$tmp/components/sister-infra" "$infra_commit"
@@ -1663,8 +1655,12 @@ workstation_check() {
 workstation_bootstrap() {
   workstation_bootstrap_preflight
   materialize_layout
-  workstation_check
   pass "workstation bootstrap READY"
+  if [[ ! -f "$COMPOSITION_FILE" || ! -f "$DEPLOYMENT_FILE" ]]; then
+    info "autoridade da instalação ainda não materializada"
+    info "composition esperado: $COMPOSITION_FILE"
+    info "deployment esperado: $DEPLOYMENT_FILE"
+  fi
 }
 
 doctor() {
@@ -1684,7 +1680,7 @@ doctor() {
     fi
   done
 
-  if [[ -d "$CONTROL_PLANE_SOURCE/.git" ]]; then
+  if is_git_repo "$CONTROL_PLANE_SOURCE"; then
     if [[ -z "$(git -C "$CONTROL_PLANE_SOURCE" status --porcelain)" ]]; then
       pass "control plane clean @ $(repo_short "$CONTROL_PLANE_SOURCE")"
     else
@@ -1695,12 +1691,12 @@ doctor() {
     failures=$((failures + 1))
   fi
 
-  local composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONTROL_PLANE_SOURCE/config/compositions/workstation.json}"
+  local composition="$COMPOSITION_FILE"
   local resolved=""
   if resolved="$("$INFRA_ROOT/bin/sister-composition" resolve "$composition" --json)"; then
     local component_id root
     while IFS=$'\t' read -r component_id root; do
-      if [[ -d "$root/.git" && -z "$(git -C "$root" status --porcelain)" ]]; then
+      if is_git_repo "$root" && [[ -z "$(git -C "$root" status --porcelain)" ]]; then
         pass "$component_id clean @ $(repo_short "$root")"
       else
         warn "$component_id ausente ou dirty: $root"
@@ -1735,7 +1731,7 @@ plan() {
   release="$(current_release_path || true)"
 
   local composition resolved component_id repo source_short current_short change
-  composition="${SISTER_WORKSTATION_COMPOSITION_FILE:-$CONTROL_PLANE_SOURCE/config/compositions/workstation.json}"
+  composition="$COMPOSITION_FILE"
   resolved="$("$INFRA_ROOT/bin/sister-composition" resolve "$composition" --json)"
 
   while IFS=$'\t' read -r component_id repo; do
@@ -2014,11 +2010,15 @@ if gw_pid_file.is_file():
         except (ValueError, OSError):
             gw_running = False
 
-gw_port = int(os.environ.get("GATEWAY_LISTEN_PORT", "8443"))
+gateway = resolved_deployment.get("gateway") or {}
+gw_port_value = os.environ.get("GATEWAY_LISTEN_PORT", "").strip() or gateway.get("port")
+gw_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip() or gateway.get("listen")
+if not gw_port_value or not gw_addr:
+    fail_closed("GATEWAY_AUTHORITY_MISSING", "gateway.listen/port ausente no deployment resolvido")
+gw_port = int(gw_port_value)
 if test_mode:
     gw_port_used = (os.environ.get("SISTER_TEST_GATEWAY_PORT_COLLISION") == "1")
 else:
-    gw_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.163.80.176")
     gw_port_used = check_port_in_use(gw_addr, gw_port)
 
 if gw_port_used and not gw_running:
@@ -2316,6 +2316,8 @@ status() {
   printf 'Current:  %s\n' "$(current_release_id)"
   printf 'Previous: %s\n' "$(previous_release_id)"
   printf 'Unit:     %s\n' "$UNIT_NAME"
+  printf 'Authority root: %s\n' "$CONFIG_ROOT"
+  "$AUTHORITY_CLI" resolve --target lab --allow-missing
 
   if [[ "$TEST_MODE" == "1" ]]; then
     printf 'Service:  TEST_MODE\n'

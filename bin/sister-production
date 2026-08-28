@@ -23,6 +23,7 @@ import tempfile
 from typing import Any
 
 INFRA_ROOT = Path(__file__).resolve().parent.parent
+AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
 
 
 class ProductionError(RuntimeError):
@@ -42,6 +43,31 @@ class ProductionAuthorityError(ProductionError):
 
 class ProductionRollbackError(ProductionError):
     pass
+
+
+def resolve_authority_context(
+    composition_selection: Path,
+    deployment: Path,
+) -> dict[str, Any]:
+    proc = subprocess.run(
+        [
+            str(AUTHORITY_CLI),
+            "resolve",
+            "--target", "production",
+            "--composition", str(composition_selection),
+            "--deployment", str(deployment),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ProductionError(
+            "INSTALLATION_AUTHORITY_INVALID",
+            proc.stderr.strip() or "falha ao resolver installation authority",
+        )
+    return json.loads(proc.stdout)
 
 
 # -----------------------------------------------------------------------------
@@ -477,6 +503,28 @@ def build_production_plan(
     if not deployment_file.is_file():
         raise ProductionError("DEPLOYMENT_INVALID", f"arquivo de deployment ausente: {deployment_file}")
     deployment = json.loads(deployment_file.read_text(encoding="utf-8"))
+    authority = resolve_authority_context(candidate_manifest_file, deployment_file)
+    gateway = deployment.get("gateway") or {}
+    gateway_listen = (
+        os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS", "").strip()
+        or os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip()
+        or gateway.get("listen")
+    )
+    if not gateway_listen:
+        raise ProductionError(
+            "GATEWAY_BIND_MISSING",
+            "deployment de produção deve declarar gateway.listen ou receber override explícito",
+        )
+    gateway_port_text = (
+        os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_PORT", "").strip()
+        or os.environ.get("GATEWAY_LISTEN_PORT", "").strip()
+    )
+    gateway_port = int(gateway_port_text) if gateway_port_text else gateway.get("port")
+    if not isinstance(gateway_port, int) or isinstance(gateway_port, bool):
+        raise ProductionError(
+            "GATEWAY_PORT_MISSING",
+            "deployment de produção deve declarar gateway.port ou receber override explícito",
+        )
 
     # 3. Invocar reconciliador em modo production
     reconcile_bin = INFRA_ROOT / "bin" / "sister-reconcile"
@@ -535,6 +583,10 @@ def build_production_plan(
             "mode": "production",
             "tls_mode": "external",
         },
+        "gateway": {
+            "listen": gateway_listen,
+            "port": gateway_port,
+        },
         "bindings": sorted(normalized_bindings, key=lambda x: x["system_id"]),
         "changes": sorted([
             {
@@ -553,6 +605,7 @@ def build_production_plan(
         "schema": "sister.infra.production.plan/1.0.0",
         "plan_version": "1.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "authority": authority,
         "policy": {
             "mode": "production",
             "fhs_root": str(fhs["root"]),
@@ -567,7 +620,8 @@ def build_production_plan(
             "deployment_id": deployment.get("deployment_id"),
             "schema": deployment.get("schema"),
             "deployment_path": str(deployment_file.resolve()),
-            "gateway_port": deployment.get("gateway", {}).get("port", 443),
+            "gateway_listen": gateway_listen,
+            "gateway_port": gateway_port,
             "declared_hosts": declared_hosts,
         },
         "current_release": {
@@ -672,7 +726,7 @@ def execute_production_apply(
     tls_info = validate_external_tls(tls_cert, tls_key, declared_hosts)
 
     # Verificação de DNS
-    expected_gw_target = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.0.1.50")
+    expected_gw_target = plan_doc["deployment"]["gateway_listen"]
     dns_info = check_dns_readiness(declared_hosts, expected_gw_target)
 
     # Verificação de portas e concorrência
@@ -685,9 +739,10 @@ def execute_production_apply(
     if deployment_path_str and Path(deployment_path_str).is_file():
         deployment_file = Path(deployment_path_str)
     else:
-        deployment_file = candidate_path / "evidence" / "deployment" / "declaration.json"
-        if not deployment_file.exists():
-            deployment_file = Path(os.environ.get("SISTER_WORKSTATION_DEPLOYMENT_FILE", ""))
+        raise ProductionAuthorityError(
+            "PLAN_DEPLOYMENT_MISSING",
+            f"deployment selado no plano não está disponível: {deployment_path_str}",
+        )
     fresh_plan = build_production_plan(
         candidate_path,
         deployment_file,
@@ -952,7 +1007,17 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
     ]
     tls_info = validate_external_tls(tls_cert, tls_key, declared_hosts)
 
-    expected_gw_target = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.0.1.50")
+    gateway = resolved_dep.get("gateway") or {}
+    expected_gw_target = (
+        os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS", "").strip()
+        or os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip()
+        or gateway.get("listen")
+    )
+    if not expected_gw_target:
+        raise ProductionError(
+            "GATEWAY_BIND_MISSING",
+            "deployment resolvido não identifica gateway.listen",
+        )
     dns_info = check_dns_readiness(declared_hosts, expected_gw_target)
 
     if not fhs["state"].is_dir():

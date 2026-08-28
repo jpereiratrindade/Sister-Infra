@@ -129,11 +129,11 @@ A UX canônica está disponível desde OPS-06:
 ./bin/sister-infra lab apply
 ```
 
-Por padrão, o desired state é derivado de:
+Por padrão, o desired state vem da authority externa da workstation:
 
 ```text
-config/compositions/workstation.json
-config/deployments/workstation-lab.json
+~/.config/sister/workstation/composition.json
+~/.config/sister/workstation/deployment.json
 ```
 
 Os overrides permanecem disponíveis:
@@ -205,7 +205,7 @@ O repositório do participante fornece `.sister/component.json`.
 
 ### 3.2 Incluir na composição LAB
 
-Exemplo em `config/compositions/workstation.json`:
+Exemplo não autoritativo em `config/compositions/workstation.json`:
 
 ```json
 {
@@ -215,7 +215,7 @@ Exemplo em `config/compositions/workstation.json`:
 
 ### 3.3 Declarar o binding
 
-Exemplo em `config/deployments/workstation-lab.json`:
+Exemplo não autoritativo em `config/deployments/workstation-lab.json`:
 
 ```json
 {
@@ -477,6 +477,7 @@ produção e sua autoridade pertencem ao ambiente institucional, não ao Git.
 - `docs/operations/lab.md` — operação cotidiana do LAB;
 - `docs/operations/reconciliation.md` — semântica de plan/apply/rollback;
 - `docs/operations/maintenance.md` — check/bootstrap/doctor/repair e aplicação de REARIT-P001;
+- `docs/operations/installation-authority.md` — separação entre engine e autoridade da instalação;
 - `docs/operations/agent-missions.md` — missões autônomas de agentes e aplicação de REARIT-P005;
 - `docs/architecture/operational-model.md` — modelo operacional;
 - `docs/architecture/DATA_PLANE.md` — fronteira do plano de dados.

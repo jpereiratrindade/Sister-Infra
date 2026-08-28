@@ -207,7 +207,7 @@ def main() -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "lab-lifecycle-01",
             "composition_id": "lifecycle_ecosystem",
-            "gateway": {"protocol": "https", "port": 8443},
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
@@ -226,7 +226,7 @@ def main() -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "production-datacenter-01",
             "composition_id": "lifecycle_ecosystem",
-            "gateway": {"protocol": "https", "port": 443},
+            "gateway": {"protocol": "https", "listen": prod_gw, "port": 443},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
@@ -253,10 +253,11 @@ def main() -> None:
             "SISTER_PRODUCTION_INSTALL_ROOT": str(sandbox_prod / "opt" / "sister"),
             "SISTER_PRODUCTION_CONTROL_PLANE_SOURCE": str(control_fixture),
             "SISTER_PRODUCTION_SERVICE_MANAGER": "mock",
+            "SISTER_CONTRACT_ROOT": str(contracts),
             "SISTER_WORKSTATION_TEST_MODE": "1",
             "PRODUCTION_TLS_CERT": str(tls_cert),
             "PRODUCTION_TLS_KEY": str(tls_key),
-            "GATEWAY_LISTEN_ADDRESS": prod_gw,
+            "SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS": prod_gw,
             "SISTER_PRODUCTION_DNS_RESOLVER": json.dumps({prod_host: prod_gw}),
             "PRODUCTION_APPROVED": "YES",
             "SISTER_INFRA_PRODUCTION_CONFIRM": "YES",
@@ -480,8 +481,8 @@ def main() -> None:
         )
         assert res_prom_blocked.returncode != 0
         doc_p_bl = json.loads(res_prom_blocked.stdout)
-        assert doc_p_bl.get("failed_stage") == "PROMOTION_EVIDENCE", f"doc_p_bl inesperado: {doc_p_bl}"
-        print("[PASS] Gate L13 — Promotion bloqueia fail-closed sem deployment válido")
+        assert doc_p_bl.get("failed_stage") == "AUTHORITY", f"doc_p_bl inesperado: {doc_p_bl}"
+        print("[PASS] Gate L13 — Authority bloqueia antes da promoção sem deployment válido")
 
         # --------------------------------------------------------------------
         # Gate L14 & L15: Promotion PROMOTABLE e Preservação de Identidade
@@ -600,7 +601,7 @@ def main() -> None:
         )
         assert res_err.returncode != 0
         doc_err = json.loads(res_err.stdout)
-        assert doc_err["failed_stage"] == "DISCOVER"
+        assert doc_err["failed_stage"] == "AUTHORITY"
         assert "error" in doc_err
         print("[PASS] Gate L22 — Semântica de erro clara com estágio diagnosticado")
 
