@@ -73,12 +73,13 @@ load_profile() {
   [[ -n "$default_port" ]] && GATEWAY_LISTEN_PORT="$default_port"
   [[ -n "$default_addr" ]] && GATEWAY_LISTEN_ADDRESS="$default_addr"
 
-  mkdir -p "$GATEWAY_RUN" "$LOG_ROOT" "$INFRA_ROOT/secrets"
-  chmod 700 "$RUN_ROOT" "$GATEWAY_RUN" "$LOG_ROOT" "$INFRA_ROOT/secrets" 2>/dev/null || true
+  mkdir -p "$GATEWAY_RUN" "$LOG_ROOT"
+  chmod 700 "$RUN_ROOT" "$GATEWAY_RUN" "$LOG_ROOT" 2>/dev/null || true
 
-  TLS_PEM="${TLS_PEM:-$INFRA_ROOT/secrets/ecosystem-lab.pem}"
-  CA_CERT="${CA_CERT:-$INFRA_ROOT/secrets/ecosystem-lab-ca.crt}"
-  CA_KEY="${CA_KEY:-$INFRA_ROOT/secrets/ecosystem-lab-ca.key}"
+  local workstation_tls="${SISTER_WORKSTATION_CONFIG_ROOT:-$HOME/.config/sister/workstation}/tls"
+  TLS_PEM="${TLS_PEM:-$workstation_tls/ecosystem-lab.pem}"
+  CA_CERT="${CA_CERT:-$workstation_tls/ecosystem-lab-ca.crt}"
+  CA_KEY="${CA_KEY:-$workstation_tls/ecosystem-lab-ca.key}"
   GATEWAY_CFG="${GATEWAY_CFG:-$GATEWAY_RUN/haproxy-${PROFILE}.cfg}"
   GATEWAY_PID="${GATEWAY_PID:-$GATEWAY_RUN/haproxy-${PROFILE}.pid}"
   GATEWAY_LOG="${GATEWAY_LOG:-$LOG_ROOT/haproxy-${PROFILE}.log}"
