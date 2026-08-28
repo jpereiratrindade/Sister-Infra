@@ -799,13 +799,6 @@ def get_tls_paths(config_root: Path) -> tuple[Path, Path, Path]:
     ca_cert = Path(ca_cert_str).expanduser().resolve() if ca_cert_str else (config_root / "tls" / "ecosystem-lab-ca.crt")
     ca_key = Path(ca_key_str).expanduser().resolve() if ca_key_str else (config_root / "tls" / "ecosystem-lab-ca.key")
 
-    if not tls_pem.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab.pem").is_file():
-        tls_pem = (INFRA_ROOT / "secrets" / "ecosystem-lab.pem").resolve()
-    if not ca_cert.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.crt").is_file():
-        ca_cert = (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.crt").resolve()
-    if not ca_key.is_file() and (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.key").is_file():
-        ca_key = (INFRA_ROOT / "secrets" / "ecosystem-lab-ca.key").resolve()
-
     return tls_pem, ca_cert, ca_key
 
 
