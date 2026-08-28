@@ -119,6 +119,35 @@ O script foi, portanto, retirado da árvore operacional corrente. Sua genealogia
 permanece integralmente preservada pelo histórico Git, sem manter uma segunda
 implementação de componentes, portas, hosts, templates ou lifecycle.
 
+### 4.1 Aposentadoria do bootstrap top-level (OPS-07A2)
+
+O comando top-level histórico `sister-infra bootstrap` (que executava geração de TLS
+e renderização de gateway como uma segunda implementação) foi formalmente aposentado.
+
+O fluxo canônico do control plane agora se divide com clareza em:
+
+1. **Layout Local da Workstation**:
+   ```bash
+   sister-infra workstation bootstrap
+   ```
+   Materializa de forma idempotente a árvore de diretórios em `~/.local/share/sister`,
+   `~/.config/sister/workstation`, `~/.local/state/sister/workstation` e unidades systemd.
+
+2. **Autoridade CA de Laboratório**:
+   ```bash
+   sister-infra lab tls status
+   sister-infra lab tls init-ca
+   ```
+   Inspeciona e inicializa explicitamente a raiz de confiança CA local sob exclusão
+   mútua e publicação atômica.
+
+3. **Materialização Declarativa e Runtime**:
+   ```bash
+   sister-infra lab apply
+   ```
+   Reconcilia componentes, deriva o certificado folha com SANs contratuais e
+   atualiza o gateway declarativo com graceful reload.
+
 ## 5. Próximo passo
 
 Somente após `check`, `bootstrap` e `doctor` possuírem semântica comprovada,

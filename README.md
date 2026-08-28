@@ -356,12 +356,16 @@ O HAProxy:
 - suporta graceful reload;
 - participa do rollback transacional.
 
-No LAB, o TLS:
+No LAB, o modelo de autoridade TLS (OPS-07A2):
 
-- deriva SANs dos hosts publicados;
-- preserva a CA quando válida;
-- pode reemitir o leaf quando bindings publicados mudam;
-- falha fechado quando uma decisão de autoridade sobre a CA for necessária.
+- estabelece administração explícita da CA via `sister-infra lab tls status/init-ca`;
+- localiza a autoridade exclusivamente em `~/.config/sister/workstation/tls/`;
+- elimina qualquer fallback ou autoridade em `<repo>/secrets/`;
+- preserva estritamente a CA existente e falha fechado diante de divergência;
+- delega ao reconciliador a emissão declarativa do certificado leaf (`ecosystem-lab.pem`)
+  com SANs derivadas dos hosts publicados;
+- desacopla o boot de runtime (`sister-infra up`) do ciclo de vida TLS (o boot consome
+  material existente sem jamais criar ou alterar certificados).
 
 Material privado não deve ser versionado.
 
@@ -395,7 +399,9 @@ python3 tests/lab_ux_test.py
 
 # Plano de dados / TLS
 bash tests/data_plane_contract_test.sh
-bash tests/tls_lifecycle_test.sh
+python3 tests/tls_authority_test.py
+python3 tests/lab_tls_authority_init_test.py
+python3 tests/gateway_cold_boot_tls_test.py
 
 # Manutenção e semântica de control plane
 python3 tests/workstation_maintenance_semantics_test.py

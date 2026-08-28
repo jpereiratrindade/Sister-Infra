@@ -139,6 +139,35 @@ cabeçalho `Host`). A resolução desses nomes nos clientes da LAN continua send
 uma preocupação de publicação e deployment (por exemplo, configuração de DNS
 local ou `/etc/hosts` na LAN), e não do runtime individual dos participantes.
 
+### 7.1 Modelo de Autoridade TLS Convergida (OPS-07A2)
+
+O ciclo de vida TLS do LAB opera sob estrita separação de responsabilidades:
+
+1. **Autoridade CA (Administração Explícita)**:
+   A autoridade CA do laboratório é inspecionada e inicializada explicitamente via CLI:
+   ```bash
+   sister-infra lab tls status [--json]
+   sister-infra lab tls init-ca [--json]
+   ```
+   - O comando `status` é estritamente observacional (read-only em qualquer estado).
+   - O comando `init-ca` cria a CA raiz (`ecosystem-lab-ca.crt` e `ecosystem-lab-ca.key`) sob lock de processo (`fcntl.flock`), com publicação atômica do diretório inteiro e permissões seguras (`0700/0600/0644`). É idempotente (`NO_OP`) sobre CA válida e falha fechado (`FAIL-CLOSED`) sobre divergências ou conteúdo preexistente em `tls/`.
+
+2. **Localização Canônica da Autoridade**:
+   A única fonte autoritativa de TLS no LAB reside na configuração da workstation:
+   ```text
+   ~/.config/sister/workstation/tls/
+   ├── ecosystem-lab-ca.crt
+   ├── ecosystem-lab-ca.key
+   └── ecosystem-lab.pem
+   ```
+   O diretório `<repo>/secrets/` não é autoridade, fallback nem destino operacional.
+
+3. **Emissão e Reconciliação do Leaf**:
+   Apenas o reconciliador (`sister-reconcile` / `sister-infra lab apply`) emite ou renova o certificado folha (`ecosystem-lab.pem`), derivando automaticamente os SANs dos hosts publicados no deployment resolvido, preservando inalterada a autoridade CA.
+
+4. **Consumo no Boot de Runtime**:
+   O cold-start do gateway (`sister-infra up`) opera exclusivamente como consumidor da autoridade existente. Ele nunca gera, renova ou rotaciona material TLS; caso o `TLS_PEM` necessário esteja ausente ou ilegível, o boot falha fechado imediatamente.
+
 Além disso, mecanismos LAB não constituem substitutos arquiteturais para:
 
 - DNS real;

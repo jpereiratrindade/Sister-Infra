@@ -227,6 +227,53 @@ operacional corrente após prova factual de que:
 A retirada elimina uma segunda representação concreta de participantes, hosts,
 portas, templates e lifecycle sem alterar o runtime instalado.
 
+### OPS-07A2 — TLS Authority Convergence
+
+**DONE**
+
+Convergência factual da autoridade TLS do LAB, eliminando concorrência de fontes,
+fallbacks espúrios para o clone Git e ciclos mutantes em runtime.
+
+Sub-incrementos realizados e comprovados:
+
+- **A2.1 — Reconciler sem fallback para repo secrets**:
+  Eliminação do fallback histórico de `sister-reconcile` para `<repo>/secrets/`.
+  Invariante fail-closed comprovado: se o caminho declarado ou o diretório de TLS
+  estiver ausente, o reconciliador recusa atuar em vez de recorrer ao repositório.
+
+- **A2.2a — First-boot explícito da CA**:
+  Introdução da interface administrativa:
+  ```bash
+  sister-infra lab tls status [--json]
+  sister-infra lab tls init-ca [--json]
+  ```
+  Propriedades comprovadas: observação estritamente read-only (`status`),
+  criação exclusiva sob lock de processo (`fcntl.flock`), publicação atômica do
+  bundle inteiro via rename de diretório, idempotência (`NO_OP`) sobre autoridade
+  existente, bloqueio fail-closed sobre estados parciais/inválidos e proteção do
+  namespace de `$CONFIG_ROOT/tls/`.
+
+- **A2.2b — Desacoplamento do boot de runtime do lifecycle TLS**:
+  Remoção de `generate_lab_tls` de `cmd_up()`. O cold-start do gateway HAProxy
+  passa a consumir estritamente a autoridade existente (`TLS_PEM`), falhando
+  fechado se o leaf estiver ausente, sem jamais gerar, renovar ou rotacionar CA.
+
+- **A2.2c — Eliminação de defaults operacionais de repo/secrets**:
+  Retirada definitiva de qualquer referência a `$INFRA_ROOT/secrets` de
+  `load_profile()` e do control plane. O caminho canônico do TLS no LAB passa a ser
+  exclusivamente `${SISTER_WORKSTATION_CONFIG_ROOT:-$HOME/.config/sister/workstation}/tls`.
+
+- **A2.2d — Aposentadoria do lifecycle e bootstrap TLS legados**:
+  Remoção de mais de 400 linhas de código Bash legado (`generate_lab_tls`,
+  `generate_lab_ca`, `generate_lab_server_certificate`, `lab_tls_*`) e do verbo
+  top-level `sister-infra bootstrap`, substituído pelo fluxo canônico:
+  `workstation bootstrap` → `lab tls status/init-ca` → `lab apply`.
+
+- **A2.2e — Higienização de repo/secrets**:
+  Remoção de todos os resíduos locais de chaves e certificados de `<repo>/secrets/`,
+  preservando exclusivamente `secrets/.gitkeep`. Prova estrita de não-dependência
+  e zero consumidores operacionais.
+
 ### OPS-07 — Production Adapter / Authority Gates
 
 **NEXT (PLANNED)**
