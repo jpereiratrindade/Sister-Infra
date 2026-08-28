@@ -195,7 +195,25 @@ Critérios:
 - divergência existente falha fechado;
 - manutenção permanece genérica;
 - conhecimento derivável continua vindo das declarações autoritativas;
-- `setup_sister_infra.sh` não será modernizado como segunda implementação.
+- `setup_sister_infra.sh` não é modernizado como segunda implementação;
+- OPS-07A1 comprovou ausência de dependência operacional e retirou o bootstrap
+  histórico da árvore corrente, preservando sua genealogia no Git.
+
+### OPS-07A1 — Historical Bootstrap Retirement
+
+**DONE**
+
+Retirada da implementação histórica `setup_sister_infra.sh` da árvore
+operacional corrente após prova factual de que:
+
+- não havia consumidores operacionais ativos;
+- o TLS legado do SisTer estava expirado;
+- a CA corrente é administrada pela fronteira declarativa da workstation;
+- o runtime corrente não depende do bootstrap histórico;
+- a genealogia permanece preservada no Git.
+
+A retirada elimina uma segunda representação concreta de participantes, hosts,
+portas, templates e lifecycle sem alterar o runtime instalado.
 
 ### OPS-07 — Production Adapter / Authority Gates
 

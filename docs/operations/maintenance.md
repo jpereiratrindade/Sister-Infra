@@ -95,14 +95,14 @@ Esses dados continuam pertencendo às declarações e aos contratos autoritativo
 
 ## 4. Relação com o bootstrap histórico
 
-`setup_sister_infra.sh` representa a genealogia da primeira implantação do
-harness. Ele não é referenciado pela superfície operacional atual e contém uma
-segunda representação histórica de componentes, portas, hosts e templates.
+`setup_sister_infra.sh` representava a genealogia da primeira implantação do
+harness. OPS-07A1 comprovou que ele não possuía consumidores operacionais, que
+seu material TLS legado estava expirado e que a autoridade TLS corrente pertence
+ao control plane da workstation.
 
-OPS-07A0 não o moderniza como nova implementação concorrente.
-
-Após a comprovação desta fronteira, o incremento seguinte deve retirar o script
-histórico da árvore operacional corrente, preservando sua genealogia no Git.
+O script foi, portanto, retirado da árvore operacional corrente. Sua genealogia
+permanece integralmente preservada pelo histórico Git, sem manter uma segunda
+implementação de componentes, portas, hosts, templates ou lifecycle.
 
 ## 5. Próximo passo
 
