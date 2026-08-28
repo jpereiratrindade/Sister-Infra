@@ -43,7 +43,9 @@ Uso:
   sister-infra workstation <comando>
 
 Comandos:
-  doctor          valida host, fontes, Git, systemd e layout
+  check           observa invariantes locais e declarações canônicas, sem mutar
+  bootstrap       materializa pré-condições locais ausentes de forma idempotente
+  doctor          diagnostica host, fontes, Git, systemd e layout, sem mutar
   plan            mostra diferença entre release atual e fontes, sem mutar
   release-create  cria release declarativa qualificada e READY
   release-verify <dir> [--json]  verifica integridade declarativa da release
@@ -71,14 +73,84 @@ Comandos:
 EOF
 }
 
-ensure_dirs() {
-  mkdir -p \
+layout_paths() {
+  printf '%s\n' \
+    "$INSTALL_ROOT" \
     "$RELEASES_ROOT" \
     "$CANDIDATES_ROOT" \
     "$CONFIG_ROOT" \
     "$STATE_ROOT" \
     "$SYSTEMD_USER_ROOT" \
     "$BIN_ROOT"
+}
+
+layout_check() {
+  local failures=0
+  local path
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+
+    if [[ -d "$path" ]]; then
+      pass "layout dir: $path"
+    elif [[ -e "$path" || -L "$path" ]]; then
+      printf '[FAIL] layout exige diretório, mas encontrou outro tipo: %s\n' \
+        "$path" >&2
+      failures=$((failures + 1))
+    else
+      printf '[FAIL] diretório de layout ausente: %s\n' "$path" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(layout_paths)
+
+  [[ "$failures" -eq 0 ]]
+}
+
+layout_preflight() {
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ -e "$path" || -L "$path" ]]; then
+      [[ -d "$path" ]] || \
+        die "materialização recusada: path de layout existe e não é diretório: $path"
+    fi
+  done < <(layout_paths)
+}
+
+workstation_bootstrap_preflight() {
+  [[ -d "$CONTROL_PLANE_SOURCE" ]] || \
+    die "control plane ausente: $CONTROL_PLANE_SOURCE"
+
+  [[ -f "$COMPOSITION_FILE" ]] || \
+    die "composição canônica ausente: $COMPOSITION_FILE"
+
+  [[ -f "$DEPLOYMENT_FILE" ]] || \
+    die "deployment canônico ausente: $DEPLOYMENT_FILE"
+
+  layout_preflight
+}
+
+materialize_layout() {
+  layout_preflight
+
+  local created=0
+  local path
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ ! -d "$path" ]]; then
+      mkdir -p "$path"
+      created=$((created + 1))
+    fi
+  done < <(layout_paths)
+
+  layout_check || die "layout não convergiu após materialização"
+
+  if [[ "$created" -eq 0 ]]; then
+    pass "layout já convergido (NO_OP)"
+  else
+    pass "layout materializado: $created diretório(s) criado(s)"
+  fi
 }
 
 require_repo_clean() {
@@ -142,7 +214,7 @@ release_integrity() {
 }
 
 sync_runtime_env() {
-  ensure_dirs
+  materialize_layout
   local release resolved values
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
@@ -165,7 +237,6 @@ sync_runtime_env() {
 }
 
 cmd_client_env() {
-  ensure_dirs
   local release resolved values
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
@@ -185,7 +256,6 @@ cmd_client_env() {
 }
 
 cmd_hosts_line() {
-  ensure_dirs
   local release resolved hosts_list
   release="$(current_release_path)" || die "nenhuma release current"
   resolved="$(release_resolved_deployment "$release")"
@@ -401,7 +471,7 @@ composition_candidate_integrity() {
 }
 
 materialize_composition_candidate() {
-  ensure_dirs
+  materialize_layout
 
   local composition
   composition="$(composition_path "${1:-}")"
@@ -612,7 +682,6 @@ PY_CR05_MANIFEST
 }
 
 candidate_verify() {
-  ensure_dirs
 
   local id="${1:-}"
   [[ -n "$id" ]] || die "candidate-verify requer id"
@@ -747,7 +816,7 @@ declarative_source_files() {
 }
 
 release_create_declarative() {
-  ensure_dirs
+  materialize_layout
 
   local composition deployment
   IFS=$'\t' read -r composition deployment < <(declarative_source_files)
@@ -1043,7 +1112,7 @@ atomic_replace_symlink() {
 LIFECYCLE_LOCK_FD=9
 
 acquire_lifecycle_lock() {
-  ensure_dirs
+  materialize_layout
   mkdir -p "$STATE_ROOT/locks"
 
   local lock_file="$STATE_ROOT/locks/workstation-lifecycle.lock"
@@ -1081,7 +1150,7 @@ release_switch() {
   done
 
   [[ -n "$target" ]] || die "release-switch requer --target <release>"
-  ensure_dirs
+  materialize_layout
 
   acquire_lifecycle_lock
 
@@ -1139,7 +1208,7 @@ release_create() {
     die "--candidate e --deployment devem ser fornecidos conjuntamente"
   fi
 
-  ensure_dirs
+  materialize_layout
 
   local candidate_path
   if [[ -f "$candidate" && "$(basename "$candidate")" == "manifest.json" ]]; then
@@ -1278,7 +1347,7 @@ PY_RELEASE_V3
 }
 
 render_unit() {
-  ensure_dirs
+  materialize_layout
 
   # SISTER-INFRA-OPS001E-SYSTEMD-SINGLE-SOURCE
   #
@@ -1333,7 +1402,7 @@ systemctl_user() {
 }
 
 install_release() {
-  ensure_dirs
+  materialize_layout
   acquire_lifecycle_lock
 
   local id="${1:-}"
@@ -1556,11 +1625,47 @@ rollback_workstation() {
   pass "current alterado para $(basename "$target"); serviço permanece parado"
 }
 
-doctor() {
-  ensure_dirs
+workstation_check() {
+  local failures=0
 
+  if ! layout_check; then
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$COMPOSITION_FILE" ]]; then
+    pass "composição canônica: $COMPOSITION_FILE"
+  else
+    printf '[FAIL] composição canônica ausente: %s\n' "$COMPOSITION_FILE" >&2
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$DEPLOYMENT_FILE" ]]; then
+    pass "deployment canônico: $DEPLOYMENT_FILE"
+  else
+    printf '[FAIL] deployment canônico ausente: %s\n' "$DEPLOYMENT_FILE" >&2
+    failures=$((failures + 1))
+  fi
+
+  [[ "$failures" -eq 0 ]] || \
+    die "workstation check encontrou $failures falha(s)"
+
+  pass "workstation check READY"
+}
+
+workstation_bootstrap() {
+  workstation_bootstrap_preflight
+  materialize_layout
+  workstation_check
+  pass "workstation bootstrap READY"
+}
+
+doctor() {
   local failures=0
   local cmd
+
+  if ! layout_check; then
+    failures=$((failures + 1))
+  fi
 
   for cmd in bash git python3 jq systemctl openssl curl; do
     if command -v "$cmd" >/dev/null 2>&1; then
@@ -1672,7 +1777,6 @@ status() {
 }
 
 release_list() {
-  ensure_dirs
 
   local d
 
@@ -1703,6 +1807,8 @@ main() {
   shift || true
 
   case "$command" in
+    check) workstation_check ;;
+    bootstrap) workstation_bootstrap ;;
     doctor) doctor ;;
     plan) plan ;;
     candidate-create) materialize_composition_candidate "${1:-}" ;;

@@ -165,6 +165,38 @@ Na prova real de fechamento, o plano observou `sister`, `nexo` e `praxis` como
 `KEEP` e `urt` como `UPDATE`, mantendo gateway e ecosystem projection como
 `KEEP`.
 
+### OPS-07A0 — Maintenance Semantics
+
+**IN PROGRESS**
+
+Aplicação operacional de `REARIT-P001@0.1.0` à manutenção do control plane.
+
+Fronteira adotada:
+
+```text
+check      read-only
+bootstrap  materialização idempotente de pré-condições ausentes
+doctor     diagnóstico read-only
+repair     correção mínima autorizada (próximo incremento)
+```
+
+O Gate 0 identificou que o bootstrap histórico mantinha uma segunda
+representação concreta de participantes e que `doctor` e outros comandos
+observacionais herdavam mutação de `ensure_dirs`.
+
+O primeiro incremento remove essa ambiguidade antes da abertura de
+`production apply`.
+
+Critérios:
+
+- observação não cria estado;
+- bootstrap executa preflight antes de mutar;
+- bootstrap repetido converge para `NO_OP`;
+- divergência existente falha fechado;
+- manutenção permanece genérica;
+- conhecimento derivável continua vindo das declarações autoritativas;
+- `setup_sister_infra.sh` não será modernizado como segunda implementação.
+
 ### OPS-07 — Production Adapter / Authority Gates
 
 **NEXT (PLANNED)**
