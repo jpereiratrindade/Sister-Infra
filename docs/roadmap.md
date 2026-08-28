@@ -274,6 +274,43 @@ Sub-incrementos realizados e comprovados:
   preservando exclusivamente `secrets/.gitkeep`. Prova estrita de não-dependência
   e zero consumidores operacionais.
 
+### OPS-07A3 — Operational Reflexive Repair
+
+**DONE**
+
+Materialização e fechamento do **Operational Reflexive Repair** na workstation (`sister-workstation repair`), aplicando os princípios `REARIT-P001` (Manutenção Reflexiva Automatizável) e `REARIT-P005` (Autonomia Delegada por Fronteiras).
+
+O comando `repair` atua sobre *drift factual comprovado* de um ambiente operacional já instalado em `current`, executando o ciclo estrito:
+
+```text
+OBSERVE → COMPARE → EXPLAIN → AUTHORITY → MINIMAL ACT → VERIFY → EVIDENCE
+```
+
+Fronteira adotada e comprovada:
+
+- **Repair autorizado**:
+  - Symlinks locais derivados e comprováveis (`CLI_LINK` → control plane da release `current`);
+  - Permissões de runtime (`0600` em `runtime.env`, chaves e PEMs; `0644` em `unit` e certificados; `0700` em diretórios com permissão insegura/escrita global);
+  - Unit systemd derivável (`sister-workstation.service` renderizada do template da release corrente sob autoridade de `daemon-reload`);
+  - Processo gerenciado parado (participante com porta livre e estado íntegro reiniciado e validado por health check);
+  - Gateway gerenciado parado (HAProxy reiniciado quando autoridade TLS e configuração forem íntegras).
+
+- **Fail-closed obrigatório**:
+  - Release modificada ou corrompida (`RELEASE_CORRUPTED`);
+  - Porta ocupada por processo externo não gerenciado (`PORT_COLLISION_EXTERNAL`);
+  - Autoridade TLS inválida ou ausente (`TLS_AUTHORITY_INVALID` — repair nunca cria CA);
+  - Dados persistentes ausentes ou com tipo incompatível (`PERSISTENT_DATA_CORRUPTED`);
+  - Deployment divergente (`DEPLOYMENT_DIVERGENT`);
+  - Ação que implique mudança de versão (`CURRENT_RELEASE_MISSING`).
+
+Propriedades comprovadas pelos 13 Gates de `tests/workstation_repair_test.py`:
+- Plan antes de mutação (`--plan` e `--dry-run` não mutam filesystem);
+- Idempotência (`repair` consecutivo produz `NO_OP` com 0 ações);
+- Pós-verificação automática de todos os recursos reparados;
+- Pureza estrita de stdout JSON (`sister.infra.workstation.repair/1.0.0`);
+- Não-mutação dos bytes da release instalada;
+- Runtime real de host preservado e intocado.
+
 ### OPS-07 — Production Adapter / Authority Gates
 
 **NEXT (PLANNED)**

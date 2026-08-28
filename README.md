@@ -234,8 +234,9 @@ O control plane decide as ações mínimas necessárias (`KEEP`, `ADD`, `UPDATE`
 pelo reconciliador.
 
 ```bash
-# Diagnóstico
+# Diagnóstico e Manutenção
 ./bin/sister-infra workstation doctor
+./bin/sister-infra workstation repair [--plan] [--json]
 ./bin/sister-infra workstation plan
 
 # Candidatas e releases
@@ -406,6 +407,7 @@ python3 tests/gateway_cold_boot_tls_test.py
 # Manutenção e semântica de control plane
 python3 tests/workstation_maintenance_semantics_test.py
 python3 tests/historical_bootstrap_retirement_test.py
+python3 tests/workstation_repair_test.py
 ```
 
 Antes de commit:
@@ -468,5 +470,7 @@ OPS-05    DONE
 OPS-06    DONE
 OPS-07A0  DONE
 OPS-07A1  DONE
+OPS-07A2  DONE
+OPS-07A3  DONE
 OPS-07    NEXT (PLANNED)
 ```

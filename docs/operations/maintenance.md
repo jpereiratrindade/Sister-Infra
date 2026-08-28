@@ -31,9 +31,10 @@ doctor
   = read-only
 
 repair
-  = NÃO pertence ao OPS-07A0
-  = trabalho futuro a ser tratado em incremento posterior
-  = correção mínima de drift comprovado e autorizado (não é reexecutar bootstrap)
+  = introduzido e fechado em OPS-07A3
+  = correção mínima de drift factual comprovado e autorizado sob a release current
+  = opera sob o ciclo estrito: OBSERVE -> COMPARE -> EXPLAIN -> AUTHORITY -> MINIMAL ACT -> VERIFY -> EVIDENCE
+  = nunca é um alias para reexecutar bootstrap
 ```
 
 Regra central:
@@ -148,21 +149,89 @@ O fluxo canônico do control plane agora se divide com clareza em:
    Reconcilia componentes, deriva o certificado folha com SANs contratuais e
    atualiza o gateway declarativo com graceful reload.
 
-## 5. Próximo passo
+## 5. Operational Reflexive Repair (OPS-07A3)
 
-Somente após `check`, `bootstrap` e `doctor` possuírem semântica comprovada,
-`repair` deve ser introduzido.
+Implementado e fechado em **OPS-07A3**, o comando `sister-infra workstation repair`
+materializa a manutenção reflexiva sob autoridade formal (`REARIT-P001` e `REARIT-P005`).
 
-`repair` deverá:
+O repair **não é bootstrap**:
+- `bootstrap`: cria pré-condições locais ausentes;
+- `repair`: atua exclusivamente sobre *drift factual comprovado* de um ambiente já instalado.
+
+### 5.1 Ciclo Normativo do Repair
 
 ```text
 OBSERVE
+  ↓
 COMPARE
+  ↓
 EXPLAIN
+  ↓
 AUTHORITY
+  ↓
 MINIMAL ACT
+  ↓
 VERIFY
+  ↓
 EVIDENCE
 ```
 
-e nunca ser um alias para “reexecutar bootstrap”.
+### 5.2 Escopo de Repair Autorizado
+
+1. **Symlinks Locais Deriváveis e Comprováveis**:
+   - `$BIN_ROOT/sister-infra` (`CLI_LINK`) apontando para `$CURRENT_LINK/components/sister-infra/bin/sister-infra`.
+2. **Permissões de Runtime**:
+   - `0600` em `$CONFIG_ROOT/runtime.env`, chaves privadas e certificados PEM;
+   - `0644` em `$SYSTEMD_USER_ROOT/$UNIT_NAME` e certificados de autoridade CA;
+   - `0700` em `$CONFIG_ROOT/tls` e restrição a `0700` em diretórios de runtime (`config`, `state`, `run`, `components`) com permissões inseguras (escrita global / `0777`).
+3. **Unit Systemd Derivável**:
+   - Renderização determinística de `$UNIT_FILE` a partir do template `$CURRENT_LINK/components/sister-infra/templates/systemd/sister-workstation.service.in` e disparo de `systemctl --user daemon-reload`.
+4. **Processo Gerenciado Parado**:
+   - Reinicialização seletiva via entrypoint (`start` seguido de `health`) de participante da release corrente parado, desde que sua porta esteja livre e seu estado persistente íntegro.
+5. **Gateway Gerenciado Parado**:
+   - Inicialização do gateway HAProxy via `sister-infra up` quando parado, desde que sua porta esteja livre e sua autoridade TLS e configuração sejam válidas e íntegras.
+
+### 5.3 Salvaguardas Estritas de FAIL-CLOSED
+
+O repair recusa qualquer mutação e falha fechado (código 1) nos seguintes casos:
+- `RELEASE_CORRUPTED`: release instalada com arquivos modificados, evidência ausente, hash divergente ou git dirty;
+- `PORT_COLLISION_EXTERNAL`: porta de participante ou de gateway ocupada por processo externo não gerenciado;
+- `TLS_AUTHORITY_INVALID`: autoridade CA de laboratório ou certificado folha ausente, ilegível, expirado ou não validado (repair **nunca** emite ou rotaciona CA);
+- `PERSISTENT_DATA_CORRUPTED`: caminho de dados persistentes inexistente como diretório;
+- `DEPLOYMENT_DIVERGENT`: deployment resolvido da release divergente ou corrompido;
+- `CURRENT_RELEASE_MISSING`: ausência de release instalada em `current` (repair nunca adivinha ou troca versões).
+
+### 5.4 Contrato da CLI e Evidência Estruturada
+
+```bash
+sister-infra workstation repair [--plan|--dry-run] [--json]
+```
+
+- **Modo `--plan` / `--dry-run`**:
+  Diagnostica todo o drift, explica as divergências observadas e emite o plano de mínima ação sem aplicar qualquer mutação. Retorna 0.
+- **Idempotência (`NO_OP`)**:
+  Executar `repair` em um sistema saudável produz status `NO_OP` com 0 ações aplicadas. Retorna 0.
+- **Evidência JSON (`--json`)**:
+  Emite estritamente um documento JSON no stdout com schema `sister.infra.workstation.repair/1.0.0`:
+  ```json
+  {
+    "schema": "sister.infra.workstation.repair/1.0.0",
+    "status": "REPAIRED",
+    "release_id": "wr-...",
+    "plan": [
+      {
+        "category": "symlink",
+        "resource": ".../sister-infra",
+        "divergence": "symlink ausente",
+        "expected": "...",
+        "actual": "absent",
+        "action": "atualizar symlink ..."
+      }
+    ],
+    "actions_applied": [ ... ],
+    "verification": {
+      "status": "PASS",
+      "details": "todas as verificações pós-repair passaram com sucesso"
+    }
+  }
+  ```
