@@ -39,6 +39,7 @@ from composition_resolver_test import (
 from composition_qualification_test import git_init_commit
 
 LIFECYCLE_CLI = ROOT / "bin" / "sister-lifecycle"
+LAB_CLI = ROOT / "bin" / "sister-lab"
 INFRA_CLI = ROOT / "bin" / "sister-infra"
 URT_REPO = Path("/run/media/jpereiratrindade/labeco10T/dev/cpp/sister-urt")
 
@@ -67,7 +68,7 @@ def snapshot_dir(directory: Path) -> dict[str, str]:
     return hashes_map
 
 
-def generate_test_tls_cert(cert_path: Path, key_path: Path, sans: list[str]) -> None:
+def generate_test_tls_cert(cert_path: Path, key_path: Path, sans: list[str], is_ca: bool = False) -> None:
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.parent.mkdir(parents=True, exist_ok=True)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -82,7 +83,7 @@ def generate_test_tls_cert(cert_path: Path, key_path: Path, sans: list[str]) -> 
         x509.NameAttribute(NameOID.COMMON_NAME, sans[0] if sans else "test.local"),
     ])
     now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
@@ -91,8 +92,25 @@ def generate_test_tls_cert(cert_path: Path, key_path: Path, sans: list[str]) -> 
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=90))
         .add_extension(x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]), critical=False)
-        .sign(key, hashes.SHA256())
+        .add_extension(x509.BasicConstraints(ca=is_ca, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
     )
+    if is_ca:
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+    cert = builder.sign(key, hashes.SHA256())
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
@@ -157,14 +175,50 @@ def main() -> None:
         alpha = make_component(tmp, "sister-alpha", "alpha", "sister_alpha")
         runtime_script = alpha / "scripts" / "runtime.sh"
         runtime_script.write_text(
-            "#!/usr/bin/env bash\n"
-            "case \"$1\" in\n"
-            "  start) mkdir -p \"$SISTER_RUNTIME_RUN_DIR\"; echo \"$$\" > \"$SISTER_RUNTIME_RUN_DIR/pid\"; exit 0 ;;\n"
-            "  stop) rm -f \"$SISTER_RUNTIME_RUN_DIR/pid\"; exit 0 ;;\n"
-            "  status) [[ -f \"$SISTER_RUNTIME_RUN_DIR/pid\" ]] && exit 0 || exit 1 ;;\n"
-            "  health) exit 0 ;;\n"
-            "  readiness) exit 0 ;;\n"
-            "esac\n",
+            f"""#!/usr/bin/env bash
+PID_FILE="$SISTER_RUNTIME_RUN_DIR/pid"
+case "$1" in
+  start)
+    mkdir -p "$SISTER_RUNTIME_RUN_DIR"
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      exit 0
+    fi
+    python3 -c "
+import http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{{\\"status\\":\\"UP\\",\\"systems\\":[{{\\"componentId\\":\\"alpha\\"}}]}}\\n')
+    def log_message(self, format, *args):
+        pass
+
+class ReusableServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with ReusableServer(('127.0.0.1', {alpha_port}), Handler) as httpd:
+    httpd.serve_forever()
+" >/dev/null 2>&1 &
+    echo "$!" > "$PID_FILE"
+    sleep 0.1
+    exit 0
+    ;;
+  stop)
+    if [[ -f "$PID_FILE" ]]; then
+      kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
+      rm -f "$PID_FILE"
+    fi
+    exit 0
+    ;;
+  status)
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && exit 0 || exit 1
+    ;;
+  health|readiness)
+    exit 0
+    ;;
+esac
+""",
             encoding="utf-8",
         )
         runtime_script.chmod(0o755)
@@ -202,12 +256,13 @@ def main() -> None:
         )
 
         # 5. Deployment LAB
+        gw_port_lab = allocate_free_port()
         dep_lab_path = tmp / "deployment_lab.json"
         write_json(dep_lab_path, {
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "lab-lifecycle-01",
             "composition_id": "lifecycle_ecosystem",
-            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": gw_port_lab},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
@@ -219,6 +274,7 @@ def main() -> None:
         })
 
         # 6. Deployment PRODUÇÃO
+        alpha_port_prod = allocate_free_port()
         dep_prod_path = tmp / "deployment_prod.json"
         prod_host = "alpha.institutional.gov.br"
         prod_gw = "10.0.1.50"
@@ -230,12 +286,23 @@ def main() -> None:
             "bindings": [
                 {
                     "system_id": "sister_alpha",
-                    "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": alpha_port},
+                    "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": alpha_port_prod},
                     "probe": {"health_path": "/health"},
                     "gateway": {"host": prod_host},
                 },
             ],
         })
+
+        # TLS de Laboratório (inicialização canônica de CA)
+        res_ca = run_cmd(
+            [str(LAB_CLI), "tls", "init-ca"],
+            env={
+                "SISTER_WORKSTATION_CONFIG_ROOT": str(sandbox_config),
+                "SISTER_WORKSTATION_STATE_ROOT": str(sandbox_state),
+                "PATH": os.environ.get("PATH", ""),
+            },
+        )
+        assert res_ca.returncode == 0, f"init-ca falhou: {res_ca.stderr}"
 
         # TLS Externo de Produção
         tls_cert = sandbox_prod / "etc" / "sister" / "tls" / "ecosystem.crt"
@@ -255,6 +322,7 @@ def main() -> None:
             "SISTER_PRODUCTION_SERVICE_MANAGER": "mock",
             "SISTER_CONTRACT_ROOT": str(contracts),
             "SISTER_WORKSTATION_TEST_MODE": "1",
+            "SISTER_ECOSYSTEM_PROJECTION_FILE": str(sandbox_state / "projection.tsv"),
             "PRODUCTION_TLS_CERT": str(tls_cert),
             "PRODUCTION_TLS_KEY": str(tls_key),
             "SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS": prod_gw,
@@ -551,7 +619,7 @@ def main() -> None:
             ],
             env=env_base,
         )
-        assert res_lprod.returncode == 0, f"Production run falhou: {res_lprod.stderr}"
+        assert res_lprod.returncode == 0, f"Production run falhou: RC={res_lprod.returncode}\nSTDOUT:\n{res_lprod.stdout}\nSTDERR:\n{res_lprod.stderr}"
         doc_lprod = json.loads(res_lprod.stdout)
         assert doc_lprod["status"] == "COMPLETED"
         assert (sandbox_prod / "opt" / "sister" / "current").is_symlink()

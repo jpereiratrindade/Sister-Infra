@@ -432,6 +432,8 @@ pelo gate de aceitação `tests/public_cli_contract_test.py`.
 
 Quarto corte (OPS-10D Frente A — Unificação e Fechamento do Contrato de Installation Lock): fechamento completo do contrato de lock por *installation identity* (OPS-10B §7). Implementação do use-case lock ownership (`sister-lab apply` e `sister-production apply` adquirem o lock antes da invocação dos motores internos, passando `SISTER_INSTALLATION_LOCK_FD` para herança segura), unificação do caminho canônico para `installation.lock` (com ponte de link simbólico e detecção fail-closed `INSTALLATION_LOCK_IDENTITY_CONFLICT` contra split-brain), isolamento rigoroso do estado de produção (sem materialização de paths legados de workstation) e validação de todos os gates em `tests/installation_lock_contract_test.py`.
 
+Quinto corte (OPS-10D Frente B — Target Ownership do Ciclo de Vida): eliminação da duplicação de lógica procedural de LAB em `sister-lifecycle`. O lifecycle agora coordena estritamente os donos canônicos de cada target (`sister-dev` para DEV, `sister-lab` para LAB, `sister-production` para Produção), sem implementar diretamente reconciliação, release-create ou release-switch. Validação estrita de contratos de máquina (fail-closed em saídas malformadas/incompletas) e comprovação hermética dos 16 gates em `tests/lifecycle_target_ownership_test.py`.
+
 ## Visão de chegada
 
 A interface final desejada permite que o operador pense em intenção, não em procedimentos mecânicos:

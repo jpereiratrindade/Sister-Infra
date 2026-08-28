@@ -20,6 +20,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,12 +31,11 @@ COMPONENT_CLI = INFRA_ROOT / "bin" / "sister-component"
 COMPOSITION_CLI = INFRA_ROOT / "bin" / "sister-composition"
 CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
 DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
-DEV_CLI = INFRA_ROOT / "bin" / "sister-dev"
-LAB_CLI = INFRA_ROOT / "bin" / "sister-lab"
-RECONCILE_CLI = INFRA_ROOT / "bin" / "sister-reconcile"
-WORKSTATION_CLI = INFRA_ROOT / "bin" / "sister-workstation"
-PRODUCTION_CLI = INFRA_ROOT / "bin" / "sister-production"
-AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
+DEV_CLI = Path(os.environ.get("SISTER_LIFECYCLE_DEV_CLI", str(INFRA_ROOT / "bin" / "sister-dev")))
+LAB_CLI = Path(os.environ.get("SISTER_LIFECYCLE_LAB_CLI", str(INFRA_ROOT / "bin" / "sister-lab")))
+WORKSTATION_CLI = Path(os.environ.get("SISTER_LIFECYCLE_WORKSTATION_CLI", str(INFRA_ROOT / "bin" / "sister-workstation")))
+PRODUCTION_CLI = Path(os.environ.get("SISTER_LIFECYCLE_PRODUCTION_CLI", str(INFRA_ROOT / "bin" / "sister-production")))
+AUTHORITY_CLI = Path(os.environ.get("SISTER_LIFECYCLE_AUTHORITY_CLI", str(INFRA_ROOT / "bin" / "sister-authority")))
 
 
 # -----------------------------------------------------------------------------
@@ -394,7 +394,7 @@ def execute_lifecycle_run(
 ) -> dict[str, Any]:
     """Orquestra as capacidades operacionais existentes encadeando os estágios autorizados."""
     roots = get_lifecycle_state_roots()
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%SZ")
+    ts = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%SZ')}-{os.getpid()}-{time.time_ns() % 1000000}"
     execution_evidence: dict[str, Any] = {
         "schema": "sister.infra.lifecycle.evidence/1.0.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -416,12 +416,16 @@ def execute_lifecycle_run(
                 raise LifecycleError("COMPOSITION_NOT_FOUND", f"composição não encontrada: {composition_path}", "DISCOVER")
 
             # Qualificar composição
-            r_qual = run_cmd([
+            contracts_root_env = os.environ.get("SISTER_CONTRACT_ROOT") or os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT")
+            qual_cmd = [
                 str(COMPOSITION_CLI),
                 "qualify",
                 str(composition_path),
                 "--json",
-            ])
+            ]
+            if contracts_root_env:
+                qual_cmd.extend(["--contracts-root", contracts_root_env])
+            r_qual = run_cmd(qual_cmd)
             if r_qual.returncode != 0:
                 raise LifecycleError(
                     "QUALIFICATION_FAILED",
@@ -436,14 +440,17 @@ def execute_lifecycle_run(
             stage_name = "CANDIDATE"
             created_candidate_tmp = Path(os.environ.get("SISTER_LIFECYCLE_TMPDIR") or "/tmp") / f"sister-lifecycle-cand-{ts}"
             cand_id = f"cand-lifecycle-{ts}"
-            r_cand = run_cmd([
+            cand_cmd = [
                 str(CANDIDATE_CLI),
                 "create",
                 str(composition_path),
                 "--out", str(created_candidate_tmp),
                 "--candidate-id", cand_id,
                 "--json",
-            ])
+            ]
+            if contracts_root_env:
+                cand_cmd.extend(["--contracts-root", contracts_root_env])
+            r_cand = run_cmd(cand_cmd)
             if r_cand.returncode != 0:
                 raise LifecycleError(
                     "CANDIDATE_CREATE_FAILED",
@@ -508,51 +515,106 @@ def execute_lifecycle_run(
             if not deployment_path.is_file():
                 raise LifecycleError("DEPLOYMENT_NOT_FOUND", f"deployment LAB não encontrado: {deployment_path}", stage_name)
 
-            install_root = Path(
-                os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT") or (Path.home() / ".local" / "share" / "sister")
-            ).expanduser()
-            current_link = install_root / "current"
+            r_plan = run_cmd([
+                str(LAB_CLI),
+                "plan",
+                "--desired-candidate", str(active_candidate),
+                "--desired-deployment", str(deployment_path),
+                "--json",
+            ])
+            if r_plan.returncode != 0:
+                raise LifecycleError(
+                    "LAB_PLAN_FAILED",
+                    f"lab plan falhou: {r_plan.stderr.strip() or r_plan.stdout.strip()}",
+                    stage_name,
+                )
 
-            if not current_link.exists():
-                stage_name = "LAB_BOOTSTRAP_RELEASE"
-                r_create = run_cmd([
-                    str(WORKSTATION_CLI),
-                    "release-create",
-                    "--candidate", str(active_candidate),
-                    "--deployment", str(deployment_path),
-                    "--json",
-                ])
-                if r_create.returncode != 0:
-                    raise LifecycleError("LAB_RELEASE_CREATE_FAILED", f"release-create falhou: {r_create.stderr.strip()}", stage_name)
-                c_info = json.loads(r_create.stdout)
-                rel_path = c_info["release_path"]
-                r_switch = run_cmd([str(WORKSTATION_CLI), "release-switch", "--target", rel_path])
-                if r_switch.returncode != 0:
-                    raise LifecycleError("LAB_RELEASE_SWITCH_FAILED", f"release-switch falhou: {r_switch.stderr.strip()}", stage_name)
-                execution_evidence["stages_executed"].append({"stage": "LAB_BOOTSTRAP_RELEASE", "status": "PASS", "release_id": c_info["release_id"]})
-            else:
-                r_plan = run_cmd([
-                    str(RECONCILE_CLI),
-                    "plan",
-                    "--desired-candidate", str(active_candidate),
-                    "--desired-deployment", str(deployment_path),
-                    "--json",
-                ])
-                if r_plan.returncode != 0:
-                    raise LifecycleError("LAB_PLAN_FAILED", f"reconcile plan falhou: {r_plan.stderr.strip()}", stage_name)
-                execution_evidence["stages_executed"].append({"stage": "LAB_PLAN", "status": "PASS"})
+            if not r_plan.stdout.strip():
+                raise LifecycleError(
+                    "LAB_PLAN_RESULT_INVALID",
+                    "lab plan retornou saída vazia quando documento JSON era obrigatório",
+                    stage_name,
+                )
 
-                stage_name = "LAB_APPLY"
-                r_apply = run_cmd([
-                    str(RECONCILE_CLI),
-                    "apply",
-                    "--desired-candidate", str(active_candidate),
-                    "--desired-deployment", str(deployment_path),
-                    "--json",
-                ])
-                if r_apply.returncode != 0:
-                    raise LifecycleError("LAB_APPLY_FAILED", f"reconcile apply falhou: {r_apply.stderr.strip()}", stage_name)
-                execution_evidence["stages_executed"].append({"stage": "LAB_APPLY", "status": "PASS"})
+            try:
+                plan_doc = json.loads(r_plan.stdout)
+            except json.JSONDecodeError as exc:
+                raise LifecycleError(
+                    "LAB_PLAN_RESULT_INVALID",
+                    f"lab plan retornou JSON malformado: {exc}",
+                    stage_name,
+                ) from exc
+
+            if not isinstance(plan_doc, dict) or ("schema" not in plan_doc and "status" not in plan_doc):
+                raise LifecycleError(
+                    "LAB_PLAN_RESULT_INVALID",
+                    "lab plan retornou documento JSON sem campos obrigatórios (schema/status)",
+                    stage_name,
+                )
+
+            if plan_doc.get("status") in ("FAILED", "FAIL_CLOSED"):
+                raise LifecycleError(
+                    "LAB_PLAN_FAILED",
+                    f"lab plan reportou falha: {plan_doc.get('error', plan_doc.get('status'))}",
+                    stage_name,
+                )
+
+            execution_evidence["stages_executed"].append({
+                "stage": "LAB_PLAN",
+                "status": "PASS",
+                "plan_status": plan_doc.get("status", "VALID"),
+            })
+
+            stage_name = "LAB_APPLY"
+            r_apply = run_cmd([
+                str(LAB_CLI),
+                "apply",
+                "--desired-candidate", str(active_candidate),
+                "--desired-deployment", str(deployment_path),
+                "--json",
+            ])
+            if r_apply.returncode != 0:
+                raise LifecycleError(
+                    "LAB_APPLY_FAILED",
+                    f"lab apply falhou: {r_apply.stderr.strip() or r_apply.stdout.strip()}",
+                    stage_name,
+                )
+
+            if not r_apply.stdout.strip():
+                raise LifecycleError(
+                    "LAB_APPLY_RESULT_INVALID",
+                    "lab apply retornou saída vazia quando documento JSON era obrigatório",
+                    stage_name,
+                )
+
+            try:
+                apply_doc = json.loads(r_apply.stdout)
+            except json.JSONDecodeError as exc:
+                raise LifecycleError(
+                    "LAB_APPLY_RESULT_INVALID",
+                    f"lab apply retornou JSON malformado: {exc}",
+                    stage_name,
+                ) from exc
+
+            if not isinstance(apply_doc, dict) or ("status" not in apply_doc and "schema" not in apply_doc):
+                raise LifecycleError(
+                    "LAB_APPLY_RESULT_INVALID",
+                    "lab apply retornou documento JSON sem campos obrigatórios (schema/status)",
+                    stage_name,
+                )
+
+            if apply_doc.get("status") in ("FAILED", "FAIL_CLOSED"):
+                raise LifecycleError(
+                    "LAB_APPLY_FAILED",
+                    f"lab apply reportou falha: {apply_doc.get('error', apply_doc.get('status'))}",
+                    stage_name,
+                )
+
+            execution_evidence["stages_executed"].append({
+                "stage": "LAB_APPLY",
+                "status": "PASS",
+                "apply_status": apply_doc.get("status"),
+            })
 
             # Mandatory Verify Gate
             stage_name = "VERIFY"
