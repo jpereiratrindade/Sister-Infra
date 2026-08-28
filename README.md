@@ -452,6 +452,7 @@ produção e sua autoridade pertencem ao ambiente institucional, não ao Git.
 - `docs/operations/lab.md` — operação cotidiana do LAB;
 - `docs/operations/reconciliation.md` — semântica de plan/apply/rollback;
 - `docs/operations/maintenance.md` — check/bootstrap/doctor/repair e aplicação de REARIT-P001;
+- `docs/operations/agent-missions.md` — missões autônomas de agentes e aplicação de REARIT-P005;
 - `docs/architecture/operational-model.md` — modelo operacional;
 - `docs/architecture/DATA_PLANE.md` — fronteira do plano de dados.
 
