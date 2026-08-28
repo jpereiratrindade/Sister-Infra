@@ -30,9 +30,9 @@ COMPOSITION_CONTRACTS_ROOT="${SISTER_WORKSTATION_CONTRACTS_ROOT:-}"
 
 TEST_MODE="${SISTER_WORKSTATION_TEST_MODE:-0}"
 
-pass() { printf '[PASS] %s\n' "$*"; }
+pass() { printf '[PASS] %s\n' "$*" >&2; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-info() { printf '[INFO] %s\n' "$*"; }
+info() { printf '[INFO] %s\n' "$*" >&2; }
 die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
 usage() {
