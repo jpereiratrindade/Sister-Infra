@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Controlador de Ciclo de Vida do SisTer (OPS-08).
+
+Orquestra as capacidades declarativas existentes (discover, qualify, candidate,
+dev preview, lab reconcile, verify, reflexive repair, promotion, production adapter)
+sob os princípios de orquestração sem duplicação (REARIT-P001..P005).
+
+Invariante estrito: ORCHESTRATION != DUPLICATION.
+Genericidade estrita: zero conhecimento de participantes ou portas concretas.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from typing import Any
+
+# Raiz do control plane
+INFRA_ROOT = Path(__file__).resolve().parent.parent
+
+COMPONENT_CLI = INFRA_ROOT / "bin" / "sister-component"
+COMPOSITION_CLI = INFRA_ROOT / "bin" / "sister-composition"
+CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
+DEPLOYMENT_CLI = INFRA_ROOT / "bin" / "sister-deployment"
+DEV_CLI = INFRA_ROOT / "bin" / "sister-dev"
+LAB_CLI = INFRA_ROOT / "bin" / "sister-lab"
+RECONCILE_CLI = INFRA_ROOT / "bin" / "sister-reconcile"
+WORKSTATION_CLI = INFRA_ROOT / "bin" / "sister-workstation"
+PRODUCTION_CLI = INFRA_ROOT / "bin" / "sister-production"
+
+
+# -----------------------------------------------------------------------------
+# Exceções do Ciclo de Vida
+# -----------------------------------------------------------------------------
+
+class LifecycleError(Exception):
+    def __init__(self, code: str, message: str, stage: str = "ORCHESTRATION", evidence: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.stage = stage
+        self.evidence = evidence
+
+    def to_dict(self) -> dict[str, Any]:
+        doc: dict[str, Any] = {
+            "schema": "sister.infra.lifecycle.error/1.0.0",
+            "status": "FAIL_CLOSED",
+            "code": self.code,
+            "failed_stage": self.stage,
+            "error": self.message,
+        }
+        if self.evidence:
+            doc["evidence"] = self.evidence
+        return doc
+
+
+# -----------------------------------------------------------------------------
+# Helpers de Sistema e Caminhos
+# -----------------------------------------------------------------------------
+
+def run_cmd(
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environ = os.environ.copy()
+    if env:
+        environ.update(env)
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=environ,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def resolve_canonical_paths(
+    composition_arg: str | None,
+    deployment_arg: str | None,
+    target: str = "lab",
+) -> tuple[Path, Path]:
+    control_source = Path(
+        os.environ.get("SISTER_WORKSTATION_CONTROL_PLANE_SOURCE", str(INFRA_ROOT))
+    ).expanduser().resolve()
+
+    # Composição
+    if composition_arg:
+        comp_path = Path(composition_arg).expanduser().resolve()
+    else:
+        env_comp = os.environ.get("SISTER_WORKSTATION_COMPOSITION_FILE")
+        if env_comp:
+            comp_path = Path(env_comp).expanduser().resolve()
+        else:
+            comp_path = control_source / "config" / "compositions" / "workstation.json"
+
+    # Deployment
+    if deployment_arg:
+        dep_path = Path(deployment_arg).expanduser().resolve()
+    else:
+        env_dep = os.environ.get("SISTER_WORKSTATION_DEPLOYMENT_FILE")
+        if env_dep:
+            dep_path = Path(env_dep).expanduser().resolve()
+        else:
+            if target == "production":
+                dep_path = control_source / "config" / "deployments" / "production.json"
+            else:
+                dep_path = control_source / "config" / "deployments" / "workstation-lab.json"
+
+    return comp_path, dep_path
+
+
+def get_lifecycle_state_roots() -> dict[str, Path]:
+    state_root = Path(
+        os.environ.get("SISTER_WORKSTATION_STATE_ROOT") or (Path.home() / ".local" / "state" / "sister")
+    ).expanduser().resolve()
+
+    lifecycle_ev_dir = Path(
+        os.environ.get("SISTER_LIFECYCLE_EVIDENCE_ROOT") or (state_root / "evidence" / "lifecycle")
+    ).expanduser().resolve()
+
+    promotion_ev_dir = Path(
+        os.environ.get("SISTER_PROMOTION_EVIDENCE_ROOT") or (state_root / "evidence" / "promotion")
+    ).expanduser().resolve()
+
+    for d in (lifecycle_ev_dir, promotion_ev_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "state_root": state_root,
+        "lifecycle_evidence": lifecycle_ev_dir,
+        "promotion_evidence": promotion_ev_dir,
+    }
+
+
+def check_git_clean(repo_path: Path) -> tuple[bool, str, str]:
+    """Verifica se o repositório está limpo e retorna (is_clean, commit_hash, status_output)."""
+    if not (repo_path / ".git").exists():
+        return True, "unversioned", ""
+    r_rev = run_cmd(["git", "-C", str(repo_path), "rev-parse", "HEAD"])
+    commit = r_rev.stdout.strip() if r_rev.returncode == 0 else "unknown"
+    r_stat = run_cmd(["git", "-C", str(repo_path), "status", "--porcelain"])
+    status_out = r_stat.stdout.strip()
+    return (len(status_out) == 0, commit, status_out)
+
+
+# -----------------------------------------------------------------------------
+# 1. Planejamento do Ciclo de Vida (`lifecycle plan`)
+# -----------------------------------------------------------------------------
+
+def build_lifecycle_plan(
+    target: str,
+    composition_path: Path,
+    deployment_path: Path,
+    candidate_path: Path | None = None,
+    component_ref: str | None = None,
+) -> dict[str, Any]:
+    """Projeta os estágios necessários do ciclo de vida de forma puramente read-only."""
+    stages: list[dict[str, Any]] = []
+
+    # 1. Estágio DISCOVER
+    comp_exists = composition_path.is_file()
+    stages.append({
+        "stage": "DISCOVER",
+        "status": "READY" if comp_exists else "BLOCKED",
+        "description": "Descoberta de componentes autônomos declarados",
+        "composition": str(composition_path),
+    })
+
+    if not comp_exists:
+        return {
+            "schema": "sister.infra.lifecycle.plan/1.0.0",
+            "target": target,
+            "status": "BLOCKED",
+            "stages": stages,
+            "summary": {"blocked": True, "reason": f"composição inexistente: {composition_path}"},
+        }
+
+    # Inspecionar componentes na composição de forma read-only
+    comp_doc = json.loads(composition_path.read_text(encoding="utf-8"))
+    components_info = []
+    comp_sources_clean = True
+    for item in comp_doc.get("components", []):
+        src = item.get("source")
+        if src:
+            src_p = Path(src)
+            if not src_p.is_absolute():
+                src_p = (composition_path.parent / src_p).resolve()
+            is_clean, commit, st_out = check_git_clean(src_p)
+            if not is_clean:
+                comp_sources_clean = False
+            components_info.append({
+                "source": str(src_p),
+                "clean": is_clean,
+                "commit": commit,
+            })
+
+    # 2. Estágio QUALIFY
+    # Se candidata explícita foi fornecida com evidência válida, qualificação é NO_OP
+    qual_needed = True
+    if candidate_path and (candidate_path / "evidence" / "composition" / "qualification.json").is_file():
+        qual_needed = False
+
+    stages.append({
+        "stage": "QUALIFY",
+        "status": "NO_OP" if not qual_needed else "NEEDED",
+        "description": "Compilação, testes de unidade e qualificação formal dos artefatos",
+        "components_count": len(components_info),
+        "all_sources_clean": comp_sources_clean,
+    })
+
+    # 3. Estágio CANDIDATE
+    cand_needed = True
+    if candidate_path and (candidate_path / "manifest.json").is_file():
+        cand_needed = False
+    stages.append({
+        "stage": "CANDIDATE",
+        "status": "NO_OP" if not cand_needed else "NEEDED",
+        "description": "Materialização imutável do pacote candidata com commits e artefatos",
+    })
+
+    # 4. Estágios dependentes do target
+    if target == "dev":
+        stages.append({
+            "stage": "DEV_PREVIEW",
+            "status": "READY",
+            "description": "Execução de preview isolado em loopback sem tocar o runtime LAB",
+            "component_ref": component_ref,
+        })
+        stages.append({
+            "stage": "VERIFY",
+            "status": "NEEDED",
+            "description": "Verificação de saúde do preview e integridade do runtime real",
+        })
+    elif target in ("lab", "production"):
+        # 5. Estágio LAB_PLAN & LAB_APPLY
+        dep_exists = deployment_path.is_file()
+        stages.append({
+            "stage": "LAB_PLAN",
+            "status": "READY" if dep_exists else "BLOCKED",
+            "description": "Projeção determinística das ações de reconciliação para LAB",
+            "deployment": str(deployment_path),
+        })
+        stages.append({
+            "stage": "LAB_APPLY",
+            "status": "NEEDED" if dep_exists else "BLOCKED",
+            "description": "Aplicação transacional e component-scoped no ambiente LAB",
+        })
+        stages.append({
+            "stage": "VERIFY",
+            "status": "NEEDED",
+            "description": "Verificação obrigatória pós-apply dos serviços e gateway",
+        })
+
+        if target == "production":
+            # 6. Promoção e Produção
+            stages.append({
+                "stage": "PROMOTION_EVIDENCE",
+                "status": "READY" if comp_sources_clean else "BLOCKED",
+                "description": "Avaliação de elegibilidade e selagem de evidência de promoção",
+            })
+            stages.append({
+                "stage": "PRODUCTION_PLAN",
+                "status": "REQUIRES_AUTHORITY",
+                "description": "Projeção de plano selado FHS sob travas de autoridade institucional",
+            })
+            stages.append({
+                "stage": "PRODUCTION_APPLY",
+                "status": "REQUIRES_AUTHORITY",
+                "description": "Aplicação produtiva governada e rollback transacional em sandbox",
+            })
+
+    return {
+        "schema": "sister.infra.lifecycle.plan/1.0.0",
+        "plan_version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "status": "READY",
+        "composition": str(composition_path),
+        "deployment": str(deployment_path),
+        "candidate": str(candidate_path) if candidate_path else None,
+        "stages": stages,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 2. Avaliação de Promoção (`evaluate_promotion`)
+# -----------------------------------------------------------------------------
+
+def evaluate_promotion(
+    candidate_path: Path,
+    production_deployment_path: Path,
+    roots: dict[str, Path],
+) -> dict[str, Any]:
+    """Avalia elegibilidade formal de promoção e emite evidência selada (WHAT WAS VERIFIED = WHAT IS PROMOTED)."""
+    manifest_file = candidate_path / "manifest.json"
+    if not manifest_file.is_file():
+        raise LifecycleError("PROMOTION_BLOCKED", f"manifesto de candidata ausente: {candidate_path}", "PROMOTION_EVIDENCE")
+
+    candidate_manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    candidate_id = candidate_manifest.get("candidate_id", "unknown")
+
+    # 1. Checar evidência de qualificação da composição
+    qual_file = candidate_path / "evidence" / "composition" / "qualification.json"
+    if not qual_file.is_file():
+        raise LifecycleError("PROMOTION_BLOCKED", "evidência de qualificação ausente na candidata", "PROMOTION_EVIDENCE")
+
+    qual_doc = json.loads(qual_file.read_text(encoding="utf-8"))
+    if qual_doc.get("status") != "PASS":
+        raise LifecycleError("PROMOTION_BLOCKED", f"qualificação da candidata não é PASS: {qual_doc.get('status')}", "PROMOTION_EVIDENCE")
+
+    # 2. Checar compatibilidade de deployment produtivo
+    if not production_deployment_path.is_file():
+        raise LifecycleError("PROMOTION_BLOCKED", f"declaração de deployment produtivo ausente: {production_deployment_path}", "PROMOTION_EVIDENCE")
+
+    r_resolve = run_cmd([
+        str(DEPLOYMENT_CLI),
+        "resolve",
+        str(manifest_file),
+        str(production_deployment_path),
+        "--json",
+    ])
+    if r_resolve.returncode != 0:
+        raise LifecycleError("PROMOTION_BLOCKED", f"candidata incompatível com deployment de produção: {r_resolve.stderr.strip()}", "PROMOTION_EVIDENCE")
+
+    # 3. Validar se fontes estão 100% limpas (PRD-008)
+    control_source = Path(
+        os.environ.get("SISTER_PRODUCTION_CONTROL_PLANE_SOURCE")
+        or os.environ.get("SISTER_WORKSTATION_CONTROL_PLANE_SOURCE")
+        or str(INFRA_ROOT)
+    ).expanduser().resolve()
+    control_clean, control_commit, _ = check_git_clean(control_source)
+    sources_status = [{"repo": "control-plane", "clean": control_clean, "commit": control_commit}]
+
+    for comp in qual_doc.get("components", []):
+        root_str = comp.get("root")
+        if root_str:
+            c_clean, c_commit, _ = check_git_clean(Path(root_str))
+            sources_status.append({
+                "component_id": comp.get("component_id"),
+                "clean": c_clean,
+                "commit": c_commit,
+            })
+
+    all_clean = all(s["clean"] for s in sources_status)
+    status = "PROMOTABLE" if all_clean else "BLOCKED"
+    reason = "Candidata plenamente qualificada, compatível e com fontes limpas" if all_clean else "Fontes contêm alterações não commitadas"
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%SZ")
+    evidence_doc = {
+        "schema": "sister.infra.promotion.evidence/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "candidate_id": candidate_id,
+        "candidate_path": str(candidate_path.resolve()),
+        "composition_id": candidate_manifest.get("composition", {}).get("composition_id"),
+        "status": status,
+        "reason": reason,
+        "sources": sources_status,
+        "production_deployment_id": json.loads(production_deployment_path.read_text(encoding="utf-8")).get("deployment_id"),
+    }
+
+    # Salvar evidência de promoção
+    ev_file = roots["promotion_evidence"] / f"promotion-{candidate_id}-{ts}.json"
+    ev_file.write_text(json.dumps(evidence_doc, indent=2), encoding="utf-8")
+    evidence_doc["evidence_file"] = str(ev_file)
+
+    if not all_clean:
+        dirty_repos = [s for s in sources_status if not s["clean"]]
+        raise LifecycleError("PROMOTION_BLOCKED", f"promoção bloqueada: {reason} ({dirty_repos})", "PROMOTION_EVIDENCE", evidence=evidence_doc)
+
+    return evidence_doc
+
+
+# -----------------------------------------------------------------------------
+# 3. Execução do Ciclo de Vida (`lifecycle run`)
+# -----------------------------------------------------------------------------
+
+def execute_lifecycle_run(
+    target: str,
+    composition_path: Path,
+    deployment_path: Path,
+    candidate_path: Path | None = None,
+    component_ref: str | None = None,
+    preview_port: int | None = None,
+    preview_duration: int = 5,
+) -> dict[str, Any]:
+    """Orquestra as capacidades operacionais existentes encadeando os estágios autorizados."""
+    roots = get_lifecycle_state_roots()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%SZ")
+    execution_evidence: dict[str, Any] = {
+        "schema": "sister.infra.lifecycle.evidence/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "status": "IN_PROGRESS",
+        "stages_executed": [],
+    }
+
+    tmp_artifacts = None
+    created_candidate_tmp = None
+
+    try:
+        # ---------------------------------------------------------------------
+        # 1. DISCOVER & QUALIFY
+        # ---------------------------------------------------------------------
+        stage_name = "QUALIFY"
+        if not candidate_path or not (candidate_path / "manifest.json").is_file():
+            if not composition_path.is_file():
+                raise LifecycleError("COMPOSITION_NOT_FOUND", f"composição não encontrada: {composition_path}", "DISCOVER")
+
+            # Qualificar composição
+            r_qual = run_cmd([
+                str(COMPOSITION_CLI),
+                "qualify",
+                str(composition_path),
+                "--json",
+            ])
+            if r_qual.returncode != 0:
+                raise LifecycleError(
+                    "QUALIFICATION_FAILED",
+                    f"falha na qualificação da composição: {r_qual.stderr.strip() or r_qual.stdout.strip()}",
+                    stage_name,
+                )
+            execution_evidence["stages_executed"].append({"stage": "QUALIFY", "status": "PASS"})
+
+            # -----------------------------------------------------------------
+            # 2. CANDIDATE CREATE
+            # -----------------------------------------------------------------
+            stage_name = "CANDIDATE"
+            created_candidate_tmp = Path(os.environ.get("SISTER_LIFECYCLE_TMPDIR") or "/tmp") / f"sister-lifecycle-cand-{ts}"
+            cand_id = f"cand-lifecycle-{ts}"
+            r_cand = run_cmd([
+                str(CANDIDATE_CLI),
+                "create",
+                str(composition_path),
+                "--out", str(created_candidate_tmp),
+                "--candidate-id", cand_id,
+                "--json",
+            ])
+            if r_cand.returncode != 0:
+                raise LifecycleError(
+                    "CANDIDATE_CREATE_FAILED",
+                    f"falha ao criar candidata: {r_cand.stderr.strip() or r_cand.stdout.strip()}",
+                    stage_name,
+                )
+            active_candidate = created_candidate_tmp
+            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id})
+        else:
+            active_candidate = candidate_path
+            # Verificar candidata existente
+            r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
+            if r_v.returncode != 0:
+                raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida: {r_v.stderr.strip()}", "CANDIDATE")
+            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED", "candidate_path": str(active_candidate)})
+
+        # ---------------------------------------------------------------------
+        # 3. TARGET: DEV
+        # ---------------------------------------------------------------------
+        if target == "dev":
+            stage_name = "DEV_PREVIEW"
+            comp_to_preview = component_ref
+            if not comp_to_preview:
+                qual_file = active_candidate / "evidence" / "composition" / "qualification.json"
+                if qual_file.is_file():
+                    try:
+                        qdoc = json.loads(qual_file.read_text(encoding="utf-8"))
+                        comps = qdoc.get("components", [])
+                        if comps:
+                            comp_to_preview = comps[0].get("root") or comps[0].get("component_id")
+                    except Exception:
+                        pass
+                if not comp_to_preview:
+                    cand_manifest = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8"))
+                    comps = cand_manifest.get("components", [])
+                    if comps:
+                        comp_to_preview = comps[0].get("component_id")
+
+            if not comp_to_preview:
+                raise LifecycleError("DEV_NO_COMPONENT", "nenhum componente especificado para preview em DEV", stage_name)
+
+            dev_cmd = [str(DEV_CLI), "preview", comp_to_preview, "--duration", str(preview_duration), "--json"]
+            if preview_port:
+                dev_cmd.extend(["--port", str(preview_port)])
+
+            r_dev = run_cmd(dev_cmd)
+            if r_dev.returncode != 0:
+                raise LifecycleError("DEV_PREVIEW_FAILED", f"preview de dev falhou: {r_dev.stderr.strip() or r_dev.stdout.strip()}", stage_name)
+
+            execution_evidence["stages_executed"].append({
+                "stage": "DEV_PREVIEW",
+                "status": "PASS",
+                "component": comp_to_preview,
+            })
+            execution_evidence["status"] = "COMPLETED"
+
+        # ---------------------------------------------------------------------
+        # 4. TARGET: LAB
+        # ---------------------------------------------------------------------
+        elif target == "lab":
+            stage_name = "LAB_PLAN"
+            if not deployment_path.is_file():
+                raise LifecycleError("DEPLOYMENT_NOT_FOUND", f"deployment LAB não encontrado: {deployment_path}", stage_name)
+
+            install_root = Path(
+                os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT") or (Path.home() / ".local" / "share" / "sister")
+            ).expanduser()
+            current_link = install_root / "current"
+
+            if not current_link.exists():
+                stage_name = "LAB_BOOTSTRAP_RELEASE"
+                r_create = run_cmd([
+                    str(WORKSTATION_CLI),
+                    "release-create",
+                    "--candidate", str(active_candidate),
+                    "--deployment", str(deployment_path),
+                    "--json",
+                ])
+                if r_create.returncode != 0:
+                    raise LifecycleError("LAB_RELEASE_CREATE_FAILED", f"release-create falhou: {r_create.stderr.strip()}", stage_name)
+                c_info = json.loads(r_create.stdout)
+                rel_path = c_info["release_path"]
+                r_switch = run_cmd([str(WORKSTATION_CLI), "release-switch", "--target", rel_path])
+                if r_switch.returncode != 0:
+                    raise LifecycleError("LAB_RELEASE_SWITCH_FAILED", f"release-switch falhou: {r_switch.stderr.strip()}", stage_name)
+                execution_evidence["stages_executed"].append({"stage": "LAB_BOOTSTRAP_RELEASE", "status": "PASS", "release_id": c_info["release_id"]})
+            else:
+                r_plan = run_cmd([
+                    str(RECONCILE_CLI),
+                    "plan",
+                    "--desired-candidate", str(active_candidate),
+                    "--desired-deployment", str(deployment_path),
+                    "--json",
+                ])
+                if r_plan.returncode != 0:
+                    raise LifecycleError("LAB_PLAN_FAILED", f"reconcile plan falhou: {r_plan.stderr.strip()}", stage_name)
+                execution_evidence["stages_executed"].append({"stage": "LAB_PLAN", "status": "PASS"})
+
+                stage_name = "LAB_APPLY"
+                r_apply = run_cmd([
+                    str(RECONCILE_CLI),
+                    "apply",
+                    "--desired-candidate", str(active_candidate),
+                    "--desired-deployment", str(deployment_path),
+                    "--json",
+                ])
+                if r_apply.returncode != 0:
+                    raise LifecycleError("LAB_APPLY_FAILED", f"reconcile apply falhou: {r_apply.stderr.strip()}", stage_name)
+                execution_evidence["stages_executed"].append({"stage": "LAB_APPLY", "status": "PASS"})
+
+            # Mandatory Verify Gate
+            stage_name = "VERIFY"
+            r_ver = run_cmd([str(WORKSTATION_CLI), "verify"])
+            if r_ver.returncode != 0:
+                raise LifecycleError("LAB_VERIFY_FAILED", f"pós-verificação de workstation falhou: {r_ver.stderr.strip()}", stage_name)
+            execution_evidence["stages_executed"].append({"stage": "VERIFY", "status": "PASS"})
+            execution_evidence["status"] = "COMPLETED"
+
+        # ---------------------------------------------------------------------
+        # 5. TARGET: PRODUCTION
+        # ---------------------------------------------------------------------
+        elif target == "production":
+            # 5.1 Promoção
+            stage_name = "PROMOTION_EVIDENCE"
+            prom_doc = evaluate_promotion(active_candidate, deployment_path, roots)
+            execution_evidence["stages_executed"].append({
+                "stage": "PROMOTION_EVIDENCE",
+                "status": "PASS",
+                "evidence_file": prom_doc.get("evidence_file"),
+            })
+
+            # 5.2 Production Plan
+            stage_name = "PRODUCTION_PLAN"
+            plan_out = roots["lifecycle_evidence"] / f"prod-plan-{ts}.json"
+            r_pplan = run_cmd([
+                str(PRODUCTION_CLI),
+                "plan",
+                "--desired-candidate", str(active_candidate),
+                "--desired-deployment", str(deployment_path),
+                "--out", str(plan_out),
+                "--json",
+            ])
+            if r_pplan.returncode != 0:
+                raise LifecycleError("PRODUCTION_PLAN_FAILED", f"production plan falhou: {r_pplan.stderr.strip() or r_pplan.stdout.strip()}", stage_name)
+            pplan_doc = json.loads(r_pplan.stdout)
+            digest = pplan_doc["plan_digest"]
+            execution_evidence["stages_executed"].append({
+                "stage": "PRODUCTION_PLAN",
+                "status": "PASS",
+                "plan_digest": digest,
+            })
+
+            # 5.3 Production Apply (em sandbox)
+            stage_name = "PRODUCTION_APPLY"
+            r_papply = run_cmd([
+                str(PRODUCTION_CLI),
+                "apply",
+                "--plan", str(plan_out),
+                "--plan-digest", digest,
+                "--json",
+            ])
+            if r_papply.returncode != 0:
+                raise LifecycleError("PRODUCTION_APPLY_FAILED", f"production apply falhou: {r_papply.stderr.strip() or r_papply.stdout.strip()}", stage_name)
+            papply_doc = json.loads(r_papply.stdout)
+            execution_evidence["stages_executed"].append({
+                "stage": "PRODUCTION_APPLY",
+                "status": "PASS",
+                "release_id": papply_doc.get("release_id"),
+            })
+
+            # 5.4 Production Verify
+            stage_name = "PRODUCTION_VERIFY"
+            r_pver = run_cmd([str(PRODUCTION_CLI), "verify", "--json"])
+            if r_pver.returncode != 0:
+                raise LifecycleError("PRODUCTION_VERIFY_FAILED", f"production verify falhou: {r_pver.stderr.strip()}", stage_name)
+            execution_evidence["stages_executed"].append({"stage": "PRODUCTION_VERIFY", "status": "PASS"})
+            execution_evidence["status"] = "COMPLETED"
+
+        else:
+            raise LifecycleError("UNKNOWN_TARGET", f"target desconhecido: {target}")
+
+        # Gravar evidência do ciclo de vida
+        ev_file = roots["lifecycle_evidence"] / f"lifecycle-{target}-{ts}.json"
+        ev_file.write_text(json.dumps(execution_evidence, indent=2), encoding="utf-8")
+        execution_evidence["evidence_file"] = str(ev_file)
+        return execution_evidence
+
+    except LifecycleError as exc:
+        execution_evidence["status"] = "FAILED"
+        execution_evidence["failed_stage"] = exc.stage
+        execution_evidence["error"] = exc.message
+        ev_file = roots["lifecycle_evidence"] / f"lifecycle-{target}-{ts}-FAILED.json"
+        ev_file.write_text(json.dumps(execution_evidence, indent=2), encoding="utf-8")
+        raise
+
+
+# -----------------------------------------------------------------------------
+# 4. Status do Ciclo de Vida (`lifecycle status`)
+# -----------------------------------------------------------------------------
+
+def get_lifecycle_status() -> dict[str, Any]:
+    """Inspeciona e consolida o estado operacional de todas as camadas (estritamente read-only)."""
+    # 1. Source & Control Plane
+    control_clean, control_commit, _ = check_git_clean(INFRA_ROOT)
+    source_status = "QUALIFIED" if control_clean else "DIRTY"
+
+    # 2. Workstation / LAB
+    r_ver = run_cmd([str(WORKSTATION_CLI), "verify"])
+    lab_status = "ACTIVE_HEALTHY" if r_ver.returncode == 0 else "DRIFT_DETECTED"
+
+    install_root = Path(
+        os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT") or (Path.home() / ".local" / "share" / "sister")
+    ).expanduser()
+    current_link = install_root / "current"
+    current_release_id = None
+    if current_link.is_symlink() or current_link.is_dir():
+        try:
+            current_man = current_link / "manifest.json"
+            if current_man.is_file():
+                current_release_id = json.loads(current_man.read_text(encoding="utf-8")).get("release_id")
+        except Exception:
+            pass
+
+    # 3. Maintenance State
+    maintenance_status = "CONVERGED" if r_ver.returncode == 0 else "REPAIR_REQUIRED"
+
+    # 4. Latest Promotion
+    roots = get_lifecycle_state_roots()
+    prom_files = sorted(roots["promotion_evidence"].glob("promotion-*.json"))
+    if prom_files:
+        try:
+            last_prom = json.loads(prom_files[-1].read_text(encoding="utf-8"))
+            promotion_status = last_prom.get("status", "UNKNOWN")
+        except Exception:
+            promotion_status = "UNKNOWN"
+    else:
+        promotion_status = "UNEVALUATED"
+
+    # 5. Production Readiness
+    prod_status = "AVAILABLE_IN_SANDBOX"
+
+    return {
+        "schema": "sister.infra.lifecycle.status/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "layers": {
+            "source": {
+                "status": source_status,
+                "control_plane_commit": control_commit,
+                "clean": control_clean,
+            },
+            "lab": {
+                "status": lab_status,
+                "current_release": current_release_id,
+            },
+            "maintenance": {
+                "status": maintenance_status,
+            },
+            "promotion": {
+                "status": promotion_status,
+                "latest_evidence": str(prom_files[-1]) if prom_files else None,
+            },
+            "production": {
+                "status": prod_status,
+                "real_production": "NOT_EXECUTED_NOT_AUTHORIZED",
+            },
+        },
+    }
+
+
+# -----------------------------------------------------------------------------
+# 5. Manutenção Reflexiva (`lifecycle maintain`)
+# -----------------------------------------------------------------------------
+
+def execute_lifecycle_maintain() -> dict[str, Any]:
+    """Composição direta de verify + reflexive repair sem reimplementar autoridade."""
+    # 1. Observar estado factual atual
+    r_ver = run_cmd([str(WORKSTATION_CLI), "verify"])
+    if r_ver.returncode == 0:
+        return {
+            "schema": "sister.infra.lifecycle.maintenance/1.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "CONVERGED",
+            "action": "NO_OP",
+            "description": "Nenhum drift detectado; ambiente já convergido e íntegro.",
+        }
+
+    # 2. Planejar e executar repair
+    r_rep = run_cmd([str(WORKSTATION_CLI), "repair", "--json"])
+    if r_rep.returncode != 0:
+        doc_err = {}
+        try:
+            doc_err = json.loads(r_rep.stdout)
+        except Exception:
+            pass
+        raise LifecycleError(
+            doc_err.get("code", "MAINTENANCE_REPAIR_FAILED"),
+            doc_err.get("error", f"falha ao executar repair: {r_rep.stderr.strip()}"),
+            "MAINTENANCE",
+            evidence=doc_err,
+        )
+
+    repair_doc = json.loads(r_rep.stdout)
+
+    # 3. Pós-verificação
+    r_post = run_cmd([str(WORKSTATION_CLI), "verify"])
+    if r_post.returncode != 0:
+        raise LifecycleError("MAINTENANCE_POST_VERIFY_FAILED", "ambiente permaneceu inconsistente após repair", "MAINTENANCE")
+
+    return {
+        "schema": "sister.infra.lifecycle.maintenance/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "CONVERGED",
+        "action": "REPAIRED",
+        "repair_evidence": repair_doc,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 6. Cadeia de Evidências (`lifecycle evidence`)
+# -----------------------------------------------------------------------------
+
+def get_lifecycle_evidence(target_filter: str = "all") -> dict[str, Any]:
+    """Consolida as evidências do ciclo de vida sem expor segredos."""
+    roots = get_lifecycle_state_roots()
+    lifecycle_files = sorted(roots["lifecycle_evidence"].glob("*.json"))
+    promotion_files = sorted(roots["promotion_evidence"].glob("*.json"))
+
+    chain: dict[str, Any] = {
+        "schema": "sister.infra.lifecycle.evidence.chain/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "evidence_root": str(roots["state_root"]),
+        "lifecycle_runs": [str(f) for f in lifecycle_files],
+        "promotion_records": [str(f) for f in promotion_files],
+    }
+
+    if promotion_files:
+        try:
+            chain["latest_promotion"] = json.loads(promotion_files[-1].read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if lifecycle_files:
+        try:
+            chain["latest_lifecycle_run"] = json.loads(lifecycle_files[-1].read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    return chain
+
+
+# -----------------------------------------------------------------------------
+# CLI Parser
+# -----------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-lifecycle",
+        description="Controlador e orquestrador de ciclo de vida do SisTer (OPS-08).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # 1. plan
+    p_plan = sub.add_parser("plan", help="Projeta os estágios necessários do ciclo de vida (read-only)")
+    p_plan.add_argument("--target", choices=["dev", "lab", "production"], default="lab", help="Alvo operacional pretendido")
+    p_plan.add_argument("--composition", help="Caminho para composition.json")
+    p_plan.add_argument("--deployment", help="Caminho para deployment.json")
+    p_plan.add_argument("--candidate", help="Caminho para candidata já materializada")
+    p_plan.add_argument("--component", help="Referência de componente para preview em dev")
+    p_plan.add_argument("--out", help="Arquivo de destino para o plano JSON")
+    p_plan.add_argument("--json", action="store_true", help="Saída em JSON puro")
+
+    # 2. run
+    p_run = sub.add_parser("run", help="Orquestra e executa o ciclo de vida até o target especificado")
+    p_run.add_argument("--target", choices=["dev", "lab", "production"], default="lab", help="Alvo operacional pretendido")
+    p_run.add_argument("--composition", help="Caminho para composition.json")
+    p_run.add_argument("--deployment", help="Caminho para deployment.json")
+    p_run.add_argument("--candidate", help="Caminho para candidata já materializada")
+    p_run.add_argument("--component", help="Referência de componente para preview em dev")
+    p_run.add_argument("--duration", type=int, default=5, help="Duração em segundos para preview em DEV")
+    p_run.add_argument("--port", type=int, help="Porta para preview em DEV")
+    p_run.add_argument("--json", action="store_true", help="Saída em JSON puro")
+
+    # 3. status
+    p_stat = sub.add_parser("status", help="Observação read-only do estado consolidado de todas as camadas")
+    p_stat.add_argument("--json", action="store_true", help="Saída em JSON puro")
+
+    # 4. maintain
+    p_maint = sub.add_parser("maintain", help="Manutenção reflexiva one-shot (verify + repair sob drift)")
+    p_maint.add_argument("--json", action="store_true", help="Saída em JSON puro")
+
+    # 5. evidence
+    p_ev = sub.add_parser("evidence", help="Exibe e localiza a cadeia de evidências operacionais")
+    p_ev.add_argument("--target", default="all", help="Filtro de evidências (all, dev, lab, promotion, production)")
+    p_ev.add_argument("--json", action="store_true", help="Saída em JSON puro")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "plan":
+            comp_p, dep_p = resolve_canonical_paths(args.composition, args.deployment, args.target)
+            cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
+            plan = build_lifecycle_plan(
+                target=args.target,
+                composition_path=comp_p,
+                deployment_path=dep_p,
+                candidate_path=cand_p,
+                component_ref=args.component,
+            )
+            out_str = json.dumps(plan, indent=2, ensure_ascii=False)
+            if args.out:
+                Path(args.out).write_text(out_str + "\n", encoding="utf-8")
+            if args.json or not args.out:
+                print(out_str)
+            return 0
+
+        elif args.command == "run":
+            comp_p, dep_p = resolve_canonical_paths(args.composition, args.deployment, args.target)
+            cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
+            res = execute_lifecycle_run(
+                target=args.target,
+                composition_path=comp_p,
+                deployment_path=dep_p,
+                candidate_path=cand_p,
+                component_ref=args.component,
+                preview_port=args.port,
+                preview_duration=args.duration,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(f"[OK] Ciclo de vida concluído com sucesso para target '{args.target}'.")
+                print(f"     Evidência: {res.get('evidence_file')}")
+            return 0
+
+        elif args.command == "status":
+            stat = get_lifecycle_status()
+            if args.json:
+                print(json.dumps(stat, indent=2, ensure_ascii=False))
+            else:
+                print("=== SisTer Lifecycle Status ===")
+                for layer, data in stat.get("layers", {}).items():
+                    print(f"  {layer:12s}: {data.get('status')}")
+            return 0
+
+        elif args.command == "maintain":
+            res = execute_lifecycle_maintain()
+            if args.json:
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+            else:
+                print(f"[OK] Manutenção concluída: {res.get('action')} ({res.get('status')}).")
+            return 0
+
+        elif args.command == "evidence":
+            ev = get_lifecycle_evidence(args.target)
+            print(json.dumps(ev, indent=2, ensure_ascii=False))
+            return 0
+
+        else:
+            parser.print_help()
+            return 1
+
+    except LifecycleError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps(exc.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"[FAIL-CLOSED] {exc.stage}: [{exc.code}] {exc.message}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
