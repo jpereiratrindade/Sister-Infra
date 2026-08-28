@@ -156,7 +156,7 @@ efetivamente comprovadas:
 - `REMOVE` com preservação de dados persistentes;
 - releases imutáveis (`OLD_RELEASE` byte-identical);
 - rollback transacional integrado em ordem inversa;
-- lifecycle lock compartilhado (`workstation-lifecycle.lock`);
+- installation lock canônico escopado por instalação (`installation.lock`);
 - atomic release switch (`release-switch`);
 - atomic ecosystem projection refresh (`tmp + rename(2)`);
 - graceful gateway reload (`-sf`) com rollback sobre processo ativo;

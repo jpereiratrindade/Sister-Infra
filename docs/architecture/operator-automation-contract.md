@@ -178,8 +178,24 @@ não altera retroativamente os códigos dos entrypoints internos durante 10B.
 
 ## 7. Serialização, idempotência e recuperação
 
-Toda mutação de uma instalação usa um lock comum por installation identity.
-Locks locais de engines não substituem o lock do use case.
+Toda mutação de uma instalação usa um lock comum identificado por *installation identity*.
+Locks locais de engines não substituem o lock do use case. O caso de uso de topo (`sister-lab apply`,
+`sister-production apply`) é o proprietário primário da aquisição do lock de instalação antes de qualquer
+mutação. Os motores internos aninhados (`sister-reconcile`, `sister-workstation`) herdam e validam
+o descritor aberto via `SISTER_INSTALLATION_LOCK_FD` em vez de competirem entre si.
+
+O lock é escopado rigorosamente por instalação:
+- **LAB / Workstation**: `<SISTER_WORKSTATION_STATE_ROOT>/locks/installation.lock`
+- **Produção**: `<SISTER_PRODUCTION_ROOT>/var/lib/sister/locks/installation.lock` (produção materializa somente `installation.lock`, sem qualquer path legado de workstation).
+
+### Regras Normativas do Lock de Instalação:
+1. **Use-Case Lock Ownership**: `sister-lab apply` e `sister-production apply` adquirem o lock da instalação antes de delegar a qualquer motor subordinado.
+2. **Variável de Ambiente Canônica de FD**: `SISTER_INSTALLATION_LOCK_FD` (com `SISTER_WORKSTATION_LOCK_FD` aceito temporariamente como alias de compatibilidade legado).
+3. **Validação Estrita de Inode na Herança**: Motores internos inspecionam `/proc/<PID>/fd/<FD>` e conferem o inode contra o alvo canônico. Descritores para arquivos não-relacionados são sumariamente rejeitados.
+4. **Resolução de Conflitos e Imunidade a Split-Brain**:
+   - Em novas instalações LAB, `installation.lock` é criado e `workstation-lifecycle.lock` é link simbólico.
+   - Em instalações legadas com arquivo regular preexistente `workstation-lifecycle.lock`, `installation.lock` é linkado simbolicamente para o mesmo inode.
+   - A presença simultânea de dois arquivos regulares distintos com inodes diferentes (`inode A != inode B`) ou links espúrios é detectada e **falha fechada** com `INSTALLATION_LOCK_IDENTITY_CONFLICT`.
 
 Uma evidência de execução registra:
 

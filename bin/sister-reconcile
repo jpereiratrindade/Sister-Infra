@@ -734,22 +734,93 @@ def verify_component_health(
     return False, last_err
 
 
+def resolve_installation_lock_path(locks_dir: Path) -> Path:
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    canonical = locks_dir / "installation.lock"
+    legacy = locks_dir / "workstation-lifecycle.lock"
+
+    canonical_exists = canonical.exists()
+    canonical_is_symlink = canonical.is_symlink()
+    legacy_exists = legacy.exists()
+    legacy_is_symlink = legacy.is_symlink()
+
+    # Caso 1: Conflito de dual-regular files com inodes distintos
+    if canonical_exists and not canonical_is_symlink and legacy_exists and not legacy_is_symlink:
+        if canonical.stat().st_ino != legacy.stat().st_ino:
+            raise ReconcileError(
+                f"INSTALLATION_LOCK_IDENTITY_CONFLICT: foram encontrados dois arquivos regulares de lock "
+                f"com inodes distintos ({canonical} != {legacy}). A migração requer intervenção administrativa."
+            )
+
+    # Caso 2: Symlink apontando para terceiro target inesperado
+    if canonical_is_symlink:
+        target = canonical.resolve()
+        if target != legacy.resolve() and target != canonical:
+            if not target.is_relative_to(locks_dir) or (target.name != "workstation-lifecycle.lock" and target.name != "installation.lock"):
+                raise ReconcileError(
+                    f"INSTALLATION_LOCK_IDENTITY_CONFLICT: link simbólico de lock {canonical} aponta para "
+                    f"alvo não reconhecido: {target}"
+                )
+    if legacy_is_symlink:
+        target = legacy.resolve()
+        if target != canonical.resolve() and target != legacy:
+            if not target.is_relative_to(locks_dir) or (target.name != "workstation-lifecycle.lock" and target.name != "installation.lock"):
+                raise ReconcileError(
+                    f"INSTALLATION_LOCK_IDENTITY_CONFLICT: link simbólico de lock legado {legacy} aponta para "
+                    f"alvo não reconhecido: {target}"
+                )
+
+    # Caso 3: Upgraded install — apenas legacy existe como arquivo regular
+    if legacy_exists and not legacy_is_symlink and not canonical_exists:
+        try:
+            canonical.symlink_to("workstation-lifecycle.lock")
+        except OSError:
+            pass
+        return legacy.resolve()
+
+    # Caso 4: Fresh install ou canonical já existente
+    if not canonical_exists:
+        canonical.touch(mode=0o600, exist_ok=True)
+
+    if not legacy_exists:
+        try:
+            legacy.symlink_to("installation.lock")
+        except OSError:
+            pass
+
+    return canonical.resolve()
+
+
 class ReconcileLock:
     def __init__(self, state_root: Path):
         self.lock_dir = state_root / "locks"
-        self.lock_file = self.lock_dir / "workstation-lifecycle.lock"
         self._fd: int | None = None
+        self._inherited: bool = False
 
     def __enter__(self) -> "ReconcileLock":
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        canonical_target = resolve_installation_lock_path(self.lock_dir)
+
+        inherited_fd_str = os.environ.get("SISTER_INSTALLATION_LOCK_FD") or os.environ.get("SISTER_WORKSTATION_LOCK_FD")
+        if inherited_fd_str:
+            try:
+                inherited_fd = int(inherited_fd_str)
+                fd_path = Path(f"/proc/{os.getpid()}/fd/{inherited_fd}")
+                if fd_path.exists() and fd_path.resolve() == canonical_target:
+                    self._fd = inherited_fd
+                    self._inherited = True
+                    return self
+            except (ValueError, OSError):
+                pass
+
         try:
             self._fd = os.open(
-                str(self.lock_file),
+                str(canonical_target),
                 os.O_CREAT | os.O_RDWR,
                 0o600,
             )
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.set_inheritable(self._fd, True)
+            os.environ["SISTER_INSTALLATION_LOCK_FD"] = str(self._fd)
             os.environ["SISTER_WORKSTATION_LOCK_FD"] = str(self._fd)
         except (BlockingIOError, OSError) as exc:
             if self._fd is not None:
@@ -759,14 +830,16 @@ class ReconcileLock:
                     pass
                 self._fd = None
             raise ReconcileError(
-                f"outra operação de lifecycle está em execução (lock ativo em {self.lock_file})"
+                f"outra operação de lifecycle está em execução (lock ativo em {canonical_target})"
             ) from exc
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if "SISTER_WORKSTATION_LOCK_FD" in os.environ:
-            del os.environ["SISTER_WORKSTATION_LOCK_FD"]
-        if self._fd is not None:
+        if not self._inherited and self._fd is not None:
+            if os.environ.get("SISTER_INSTALLATION_LOCK_FD") == str(self._fd):
+                del os.environ["SISTER_INSTALLATION_LOCK_FD"]
+            if os.environ.get("SISTER_WORKSTATION_LOCK_FD") == str(self._fd):
+                del os.environ["SISTER_WORKSTATION_LOCK_FD"]
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
             except OSError:
@@ -942,7 +1015,7 @@ def generate_leaf_certificate(
         if res.returncode != 0:
             raise ReconcileError(f"falha ao assinar certificado TLS com a CA: {res.stderr.decode('utf-8', 'replace')}")
 
-        pem_content = crt_file.read_bytes() + b"\n" + key_file.read_bytes() + b"\n"
+        pem_content = crt_file.read_bytes() + b"\n" + key_file.read_bytes() + b"\n" + ca_cert.read_bytes() + b"\n"
 
         tmp_pem = tls_pem.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
         try:
@@ -1259,9 +1332,6 @@ def execute_apply(
     with ReconcileLock(state_root):
         # 1. OBSERVE & PLAN sob lock operacional
         current = load_current_state(current_release_arg, probe_runtime=True)
-        if not current:
-            raise ReconcileError("apply requer uma release current ativa declarada")
-
         desired = load_desired_state(desired_candidate_arg, desired_deployment_arg)
         plan = compute_plan(current, desired, mode=mode, probe_runtime=True)
 
@@ -1298,9 +1368,9 @@ def execute_apply(
                 "projection": plan["projection"],
             }
 
-        current_dir = Path(current["current_dir"])
-        current_resolved_file = Path(current["resolved_file"])
-        current_resolved_doc = load_json(current_resolved_file, "deployment atual resolvido")
+        current_dir = Path(current["current_dir"]) if current else None
+        current_resolved_file = Path(current["resolved_file"]) if current else None
+        current_resolved_doc = load_json(current_resolved_file, "deployment atual resolvido") if current_resolved_file else None
 
         target_release_dir: Path | None = None
         target_resolved_file: Path | None = None
@@ -1322,18 +1392,19 @@ def execute_apply(
                     f"apply com mutação de topologia/recursos requer deployment declarativo 'sister.infra.deployment/1.0.0' (obtido: {dep_doc.get('schema')})"
                 )
 
-            # 4a. Valida integridade da OLD_RELEASE
-            verify_old = subprocess.run(
-                [str(WORKSTATION_CLI), "release-verify", str(current_dir), "--json"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=False,
-                check=False,
-            )
-            if verify_old.returncode != 0:
-                err = verify_old.stderr.strip() or verify_old.stdout.strip()
-                raise ReconcileError(f"release atual (OLD_RELEASE) falhou na verificação de integridade: {err}")
+            # 4a. Valida integridade da OLD_RELEASE (se houver)
+            if current_dir is not None:
+                verify_old = subprocess.run(
+                    [str(WORKSTATION_CLI), "release-verify", str(current_dir), "--json"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=False,
+                    check=False,
+                )
+                if verify_old.returncode != 0:
+                    err = verify_old.stderr.strip() or verify_old.stdout.strip()
+                    raise ReconcileError(f"release atual (OLD_RELEASE) falhou na verificação de integridade: {err}")
 
             # 4b. Cria TARGET_RELEASE via sister-workstation release-create
             dep_arg = desired_deployment_arg
@@ -1391,7 +1462,12 @@ def execute_apply(
 
         projection_file: Path | None = None
         if plan["projection"]["action"] != "KEEP":
-            projection_file = resolve_projection_file_path(state_root, config_root, current["components"], desired["components"])
+            projection_file = resolve_projection_file_path(
+                state_root,
+                config_root,
+                current["components"] if current else None,
+                desired["components"],
+            )
             if projection_file.is_file():
                 tx.old_projection_tsv = projection_file.read_text(encoding="utf-8")
 
@@ -1575,7 +1651,10 @@ def execute_apply(
                 refresh_ecosystem_projection(projection_file, target_resolved_doc)
 
                 expected_cids = {c["component_id"] for c in target_resolved_doc.get("components", [])}
-                ok, detail = verify_ecosystem_observation(current["components"], expected_cids)
+                ok, detail = verify_ecosystem_observation(
+                    current["components"] if current else {},
+                    expected_cids,
+                )
                 if not ok:
                     raise ReconcileError(f"verificação da ecosystem projection em /api/ecosystem falhou: {detail}")
 

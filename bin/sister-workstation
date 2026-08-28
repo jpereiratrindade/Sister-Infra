@@ -1118,27 +1118,62 @@ acquire_lifecycle_lock() {
   materialize_layout
   mkdir -p "$STATE_ROOT/locks"
 
-  local lock_file="$STATE_ROOT/locks/workstation-lifecycle.lock"
-  touch "$lock_file"
+  local lock_file="$STATE_ROOT/locks/installation.lock"
+  local legacy_lock_file="$STATE_ROOT/locks/workstation-lifecycle.lock"
+
+  # Detecção de conflito de autoridade dual-regular
+  if [[ -f "$lock_file" && ! -L "$lock_file" && -f "$legacy_lock_file" && ! -L "$legacy_lock_file" ]]; then
+    local ino1 ino2
+    ino1="$(stat -c %i "$lock_file" 2>/dev/null || true)"
+    ino2="$(stat -c %i "$legacy_lock_file" 2>/dev/null || true)"
+    if [[ -n "$ino1" && -n "$ino2" && "$ino1" != "$ino2" ]]; then
+      die "INSTALLATION_LOCK_IDENTITY_CONFLICT: arquivos de lock concorrentes com inodes distintos ($lock_file != $legacy_lock_file)"
+    fi
+  fi
+
+  # Detecção de symlink para alvo espúrio
+  if [[ -L "$lock_file" ]]; then
+    local target
+    target="$(readlink -f "$lock_file" 2>/dev/null || true)"
+    local target_dir
+    target_dir="$(dirname "$target")"
+    if [[ "$target_dir" != "$STATE_ROOT/locks" ]]; then
+      die "INSTALLATION_LOCK_IDENTITY_CONFLICT: link de lock $lock_file aponta para alvo fora do diretório de locks: $target"
+    fi
+  fi
+
+  if [[ -f "$legacy_lock_file" && ! -L "$legacy_lock_file" && ! -f "$lock_file" ]]; then
+    ln -s "workstation-lifecycle.lock" "$lock_file" 2>/dev/null || true
+  else
+    touch "$lock_file"
+    if [[ ! -e "$legacy_lock_file" ]]; then
+      ln -s "installation.lock" "$legacy_lock_file" 2>/dev/null || true
+    fi
+  fi
+
   local canonical_lock_file
   canonical_lock_file="$(readlink -f "$lock_file")"
 
-  if [[ -n "${SISTER_WORKSTATION_LOCK_FD:-}" ]]; then
+  local inherited_fd="${SISTER_INSTALLATION_LOCK_FD:-${SISTER_WORKSTATION_LOCK_FD:-}}"
+  if [[ -n "$inherited_fd" ]]; then
     local fd_target=""
-    if [[ -e "/proc/$$/fd/${SISTER_WORKSTATION_LOCK_FD}" ]]; then
-      fd_target="$(readlink -f "/proc/$$/fd/${SISTER_WORKSTATION_LOCK_FD}" 2>/dev/null || true)"
+    if [[ -e "/proc/$$/fd/${inherited_fd}" ]]; then
+      fd_target="$(readlink -f "/proc/$$/fd/${inherited_fd}" 2>/dev/null || true)"
     fi
     if [[ -n "$fd_target" && "$fd_target" == "$canonical_lock_file" ]]; then
-      if (exec <&"${SISTER_WORKSTATION_LOCK_FD}") 2>/dev/null; then
+      if (exec <&"${inherited_fd}") 2>/dev/null; then
         return 0
       fi
     fi
   fi
 
-  eval "exec $LIFECYCLE_LOCK_FD>\"\$lock_file\""
+  eval "exec $LIFECYCLE_LOCK_FD>\"\$canonical_lock_file\""
   if ! flock -n "$LIFECYCLE_LOCK_FD"; then
-    die "outra operação de lifecycle está em execução (lock ativo em $lock_file)"
+    die "outra operação de lifecycle está em execução (lock ativo em $canonical_lock_file)"
   fi
+
+  export SISTER_INSTALLATION_LOCK_FD="$LIFECYCLE_LOCK_FD"
+  export SISTER_WORKSTATION_LOCK_FD="$LIFECYCLE_LOCK_FD"
 
   trap 'flock -u '$LIFECYCLE_LOCK_FD' 2>/dev/null || true; eval "exec '$LIFECYCLE_LOCK_FD'>&-" 2>/dev/null || true' EXIT
 }

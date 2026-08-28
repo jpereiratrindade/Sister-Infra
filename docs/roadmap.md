@@ -430,6 +430,8 @@ Comandos históricos top-level (`up`, `down`, `status`, `verify`, `client-env`,
 de depreciação para seus donos estáveis ou adapter privado e possuem cobertura
 pelo gate de aceitação `tests/public_cli_contract_test.py`.
 
+Quarto corte (OPS-10D Frente A — Unificação e Fechamento do Contrato de Installation Lock): fechamento completo do contrato de lock por *installation identity* (OPS-10B §7). Implementação do use-case lock ownership (`sister-lab apply` e `sister-production apply` adquirem o lock antes da invocação dos motores internos, passando `SISTER_INSTALLATION_LOCK_FD` para herança segura), unificação do caminho canônico para `installation.lock` (com ponte de link simbólico e detecção fail-closed `INSTALLATION_LOCK_IDENTITY_CONFLICT` contra split-brain), isolamento rigoroso do estado de produção (sem materialização de paths legados de workstation) e validação de todos os gates em `tests/installation_lock_contract_test.py`.
+
 ## Visão de chegada
 
 A interface final desejada permite que o operador pense em intenção, não em procedimentos mecânicos:

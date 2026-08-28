@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -43,6 +44,70 @@ class ProductionAuthorityError(ProductionError):
 
 class ProductionRollbackError(ProductionError):
     pass
+
+
+def resolve_installation_lock_path(locks_dir: Path) -> Path:
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    canonical = locks_dir / "installation.lock"
+    if not canonical.exists():
+        canonical.touch(mode=0o600, exist_ok=True)
+    return canonical.resolve()
+
+
+class ProductionInstallationLock:
+    def __init__(self, locks_dir: Path):
+        self.locks_dir = locks_dir
+        self.lock_target = resolve_installation_lock_path(locks_dir)
+        self._fd: int | None = None
+        self._inherited: bool = False
+
+    def __enter__(self) -> "ProductionInstallationLock":
+        inherited_fd_str = os.environ.get("SISTER_INSTALLATION_LOCK_FD") or os.environ.get("SISTER_WORKSTATION_LOCK_FD")
+        if inherited_fd_str:
+            try:
+                inherited_fd = int(inherited_fd_str)
+                fd_path = Path(f"/proc/{os.getpid()}/fd/{inherited_fd}")
+                if fd_path.exists() and fd_path.resolve() == self.lock_target:
+                    self._fd = inherited_fd
+                    self._inherited = True
+                    return self
+            except (ValueError, OSError):
+                pass
+
+        try:
+            self._fd = os.open(str(self.lock_target), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.set_inheritable(self._fd, True)
+            os.environ["SISTER_INSTALLATION_LOCK_FD"] = str(self._fd)
+            os.environ["SISTER_WORKSTATION_LOCK_FD"] = str(self._fd)
+        except (BlockingIOError, OSError) as exc:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            raise ProductionError(
+                "INSTALLATION_LOCKED",
+                f"outra operação de produção/lifecycle está em execução (lock ativo em {self.lock_target})",
+            ) from exc
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if not self._inherited and self._fd is not None:
+            if os.environ.get("SISTER_INSTALLATION_LOCK_FD") == str(self._fd):
+                del os.environ["SISTER_INSTALLATION_LOCK_FD"]
+            if os.environ.get("SISTER_WORKSTATION_LOCK_FD") == str(self._fd):
+                del os.environ["SISTER_WORKSTATION_LOCK_FD"]
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
 
 
 def resolve_authority_context(
@@ -650,6 +715,15 @@ def execute_production_apply(
     if fhs is None:
         fhs = get_fhs_paths()
 
+    with ProductionInstallationLock(fhs["locks"]):
+        return _execute_production_apply_unlocked(plan_path, expected_digest, fhs=fhs)
+
+
+def _execute_production_apply_unlocked(
+    plan_path: Path,
+    expected_digest: str,
+    fhs: dict[str, Path],
+) -> dict[str, Any]:
     # -------------------------------------------------------------------------
     # 1. Authority Gate: Digest Validation (PRD-003)
     # -------------------------------------------------------------------------
@@ -1135,6 +1209,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(doc, indent=2))
         else:
             print(f"[FAIL] [{exc.code}] {exc.message}", file=sys.stderr)
+        if exc.code == "INSTALLATION_LOCKED":
+            return 4
         return 1
 
 

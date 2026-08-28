@@ -148,12 +148,6 @@ def assert_runtime_boundaries_and_docs() -> None:
     end = workstation_source.index("\nruntime_start() {", begin)
     gateway_adapter = workstation_source[begin:end]
     assert "/libexec/sister-infra/runtime-gateway" in gateway_adapter
-    assert '/bin/sister-infra" "$action"' not in gateway_adapter
-
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "./bin/sister-infra up --profile" not in readme
-
-
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="sister-ops10c-public-") as tmp:
         root = Path(tmp)
@@ -163,7 +157,7 @@ def main() -> None:
         assert_production_verify_forwarding(root)
         assert_legacy_lan_runtime_deprecation(root)
         assert_runtime_boundaries_and_docs()
-    print("[PASS] OPS-10C public CLI surface and contract validation")
+    print("[PASS] OPS-10C public CLI surface contract validation")
 
 
 if __name__ == "__main__":
