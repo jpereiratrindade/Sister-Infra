@@ -157,12 +157,21 @@ atua somente no change-set autorizado.
 
 ### 2.3 PROD
 
-A interface reconciliada de produção é o próximo incremento do roadmap
-(OPS-07).
+Disponível desde OPS-07:
 
-Código, contratos e políticas podem permanecer públicos. Credenciais, chaves,
-segredos, configuração produtiva real e autoridade institucional devem ficar
-fora do repositório.
+```bash
+./bin/sister-infra production plan --desired-candidate <cand> --desired-deployment <dep> --json
+./bin/sister-infra production apply --plan <plan> --plan-digest <digest> --json
+./bin/sister-infra production verify --json
+```
+
+A interface reconciliada de produção opera sob travas institucionais de autoridade,
+digest selado criptograficamente, preflights estritos (clean source, TLS externo institucional,
+DNS passivo e portas livres) e layout FHS (`/opt/sister`, `/etc/sister`, `/var/lib/sister`, `/run/sister`).
+
+> [!WARNING]
+> A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
+> por esta missão (PRD-019). O adaptador foi comprovado integralmente em sandbox hermético.
 
 ---
 

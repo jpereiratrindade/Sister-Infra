@@ -313,22 +313,29 @@ Propriedades comprovadas pelos 13 Gates de `tests/workstation_repair_test.py`:
 
 ### OPS-07 — Production Adapter / Authority Gates
 
-**NEXT (PLANNED)**
+**DONE**
 
-Objetivo:
+Materialização do adaptador produtivo de autoridade institucional:
 
-usar o mesmo modelo declarativo e reconciliador sob políticas produtivas.
+```bash
+sister-infra production plan
+sister-infra production apply
+sister-infra production verify
+```
 
-Inclui, potencialmente:
+Propriedades comprovadas e invariantes (PRD-001 a PRD-019):
+- **Plan Read-Only & Digest Selado**: `production plan` é estritamente read-only e gera digest criptográfico determinístico SHA-256 sobre o payload canônico (PRD-001, PRD-002, PRD-003);
+- **Travas de Autoridade Institucional**: `production apply` exige `--plan` e `--plan-digest` correspondentes, aprovação explícita institucional (`PRODUCTION_APPROVED=YES`, `SISTER_INFRA_PRODUCTION_CONFIRM=YES`) e comando de gate externo (`PRODUCTION_GATE_CMD`), falhando fechado em qualquer ausência ou divergência (PRD-004, PRD-016);
+- **Preflights Rigorosos**: Preflight completo antes de qualquer mutação, englobando fontes 100% limpas no control plane e componentes (`clean-source gate`), validação de certificado TLS externo (data, chave, parse e cobertura de SANs), verificação passiva de readiness de DNS e detecção de colisão de portas (PRD-005, PRD-006, PRD-008, PRD-010, PRD-018);
+- **FHS & Sandbox Hermético**: Estrutura FHS institucional (`/opt/sister`, `/etc/sister`, `/var/lib/sister`, `/run/sister`), isolável via `$SISTER_PRODUCTION_ROOT` (PRD-011);
+- **Transacionalidade e Rollback**: Materialização isolada em staging, rollback automático em falha de start, health probe ou service manager, e commit point atômico via comutação do symlink `/opt/sister/current` (PRD-013);
+- **Idempotência & Verificação**: Reaplicação idempotente (`NO_OP` com 0 ações) e `production verify` estritamente read-only (PRD-015, PRD-001);
+- **Auditoria Sanitizada**: Geração de evidências auditáveis sem qualquer vazamento de segredos ou chaves privadas (PRD-014, PRD-007);
+- **Preservação Ontológica**: O modelo canônico (`component → composition → candidate → deployment → plan → reconcile`) e os ambientes LAB/Workstation permanecem intactos e intocados (PRD-017, PRD-018).
 
-- DNS real;
-- TLS real;
-- secrets;
-- autoridade institucional;
-- observabilidade;
-- evidências;
-- rollback;
-- gates de implantação.
+> [!WARNING]
+> **Fronteira Institucional de Autoridade (PRD-019)**:
+> A execução e implantação em servidores de produção reais permanece explicitamente **NÃO EXECUTADA E NÃO AUTORIZADA POR ESTA MISSÃO**. Toda a prova foi executada e validada em sandboxes herméticos nos 24 Gates de `tests/production_adapter_test.py`.
 
 ## Visão de chegada
 

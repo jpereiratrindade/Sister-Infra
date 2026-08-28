@@ -197,11 +197,22 @@ Produção deve introduzir políticas mais rigorosas para:
 
 ### Estado atual
 
-**PLANEJADO como interface operacional reconciliada.**
+**DISPONÍVEL (OPS-07)**
 
-Existem mecanismos de profile `production` no harness histórico, porém eles
-não devem ser confundidos automaticamente com a interface final desejada de
-`production apply`.
+Disponível via:
+
+```bash
+sister-infra production plan
+sister-infra production apply
+sister-infra production verify
+```
+
+Suportado por FHS institucional, digest criptográfico selado, preflights rigorosos,
+rollback automático e travas de autoridade institucional.
+
+> [!WARNING]
+> A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
+> por esta missão (PRD-019). O adaptador e suas travas foram integralmente validados em sandbox.
 
 ## 5. Comparação
 
@@ -210,7 +221,7 @@ não devem ser confundidos automaticamente com a interface final desejada de
 | DEV | testar componente isoladamente | não | disponível (OPS-05) |
 | LAB plan | observar diferença | não | disponível, UX canônica (OPS-06) |
 | LAB apply | convergir incrementalmente | somente o necessário | disponível, UX canônica (OPS-03/OPS-04/OPS-06) |
-| PROD reconciliado | implantação governada | não se aplica | planejado |
+| PROD reconciliado | implantação governada sob autoridade | não | disponível (OPS-07, sandbox) |
 
 ## 6. Regra de autoridade
 
