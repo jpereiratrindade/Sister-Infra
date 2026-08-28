@@ -9,7 +9,7 @@ Invariantes validados:
 - TLSA-022: runtime-start nunca emite ou renova leaf.
 - TLSA-023: ausência do leaf necessário resulta em fail-closed.
 - TLSA-024: cold-start e cold-stop do HAProxy permanecem funcionais.
-- TLSA-025: generate_lab_tls permanece temporariamente existente, mas deixa de ser alcançável por cmd_up.
+- TLSA-025: ciclo de vida TLS legado aposentado e inalcançável por comandos de runtime.
 
 Casos:
   Caso A: TLS existente permite cold-start do gateway preservando CA e leaf byte a byte.
