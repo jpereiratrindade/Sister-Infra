@@ -128,10 +128,11 @@ def test_caso_a_explicit_existing(secrets_repo: Path) -> None:
 
 def test_caso_b_explicit_nonexistent(secrets_repo: Path) -> None:
     print("[TEST] Caso B — caminhos explícitos inexistentes (rejeição de fallback)...")
-    # Prova que arquivos físicos em secrets/ existem deliberadamente no repositório
-    assert (secrets_repo / "ecosystem-lab.pem").is_file(), "ecosystem-lab.pem deve existir em secrets/ para validar ausência de fallback"
-    assert (secrets_repo / "ecosystem-lab-ca.crt").is_file(), "ecosystem-lab-ca.crt deve existir em secrets/"
-    assert (secrets_repo / "ecosystem-lab-ca.key").is_file(), "ecosystem-lab-ca.key deve existir em secrets/"
+    # Prova que secrets/ do repositório foi higienizado e não contém autoridade
+    assert (secrets_repo / ".gitkeep").is_file(), ".gitkeep deve existir em secrets/"
+    assert not (secrets_repo / "ecosystem-lab.pem").exists(), "secrets/ não deve conter material TLS residual"
+    assert not (secrets_repo / "ecosystem-lab-ca.crt").exists()
+    assert not (secrets_repo / "ecosystem-lab-ca.key").exists()
 
     with tempfile.TemporaryDirectory() as td:
         tmp_b = Path(td)

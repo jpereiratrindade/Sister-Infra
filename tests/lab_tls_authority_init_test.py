@@ -328,9 +328,9 @@ def test_caso_f_secrets_repo_untouched(secrets_repo: Path) -> None:
     print("[TEST] Caso F — <repo>/secrets/ intocado durante toda a execução...")
     # Registra estado de <repo>/secrets/
     secrets_before = {f.name: sha_file(f) for f in secrets_repo.iterdir() if f.is_file()}
-    assert "ecosystem-lab.pem" in secrets_before
-    assert "ecosystem-lab-ca.crt" in secrets_before
-    assert "ecosystem-lab-ca.key" in secrets_before
+    assert ".gitkeep" in secrets_before
+    assert "ecosystem-lab.pem" not in secrets_before
+    assert "ecosystem-lab-ca.crt" not in secrets_before
 
     with tempfile.TemporaryDirectory(prefix="sister_lab_tls_f_") as td:
         cfg = Path(td) / "config"

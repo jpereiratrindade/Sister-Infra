@@ -281,7 +281,8 @@ def test_caso_c_tls_pem_ausente_fail_closed(secrets_repo: Path) -> None:
 def test_caso_d_runtime_real_e_secrets_preservados(secrets_repo: Path) -> None:
     print("[TEST] Caso D — prova de isolamento e não-mutação de <repo>/secrets/...")
     secrets_before = {f.name: sha_file(f) for f in secrets_repo.iterdir() if f.is_file()}
-    assert "ecosystem-lab.pem" in secrets_before
+    assert ".gitkeep" in secrets_before
+    assert "ecosystem-lab.pem" not in secrets_before
 
     # Garante que nenhum processo de gateway real foi tocado
     res_ps = subprocess.run(["ps", "-ef"], stdout=subprocess.PIPE, text=True)
