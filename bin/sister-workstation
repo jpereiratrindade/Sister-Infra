@@ -46,6 +46,7 @@ Comandos:
   check           observa invariantes locais e declarações canônicas, sem mutar
   bootstrap       materializa pré-condições locais ausentes de forma idempotente
   doctor          diagnostica host, fontes, Git, systemd e layout, sem mutar
+  repair          repara drift factual comprovado sob autoridade e mínima ação
   plan            mostra diferença entre release atual e fontes, sem mutar
   release-create  cria release declarativa qualificada e READY
   release-verify <dir> [--json]  verifica integridade declarativa da release
@@ -982,6 +983,13 @@ declarative_gateway_action() {
 
   if [[ "$TEST_MODE" == "1" ]]; then
     info "TEST_MODE gateway declarativo: $action"
+    local pid_file="$STATE_ROOT/control-plane/gateway/haproxy-lan.pid"
+    if [[ "$action" == "up" ]]; then
+      mkdir -p "$(dirname "$pid_file")"
+      echo "$$" > "$pid_file"
+    elif [[ "$action" == "down" ]]; then
+      rm -f "$pid_file"
+    fi
     return 0
   fi
 
@@ -1753,6 +1761,557 @@ plan() {
   printf '\nNo changes performed.\n'
 }
 
+workstation_repair() {
+  local plan_only=0
+  local json_output=0
+
+  for arg in "$@"; do
+    case "$arg" in
+      --plan|--dry-run) plan_only=1 ;;
+      --json) json_output=1 ;;
+      *) die "opção desconhecida para repair: $arg" ;;
+    esac
+  done
+
+  if [[ "$plan_only" -eq 0 ]]; then
+    mkdir -p "$STATE_ROOT/locks"
+    acquire_lifecycle_lock
+  fi
+
+  python3 - \
+    "$INSTALL_ROOT" \
+    "$CONFIG_ROOT" \
+    "$STATE_ROOT" \
+    "$SYSTEMD_USER_ROOT" \
+    "$UNIT_NAME" \
+    "$BIN_ROOT" \
+    "$CURRENT_LINK" \
+    "$HOME_DIR" \
+    "$TEST_MODE" \
+    "$plan_only" \
+    "$json_output" <<'PY_WORKSTATION_REPAIR'
+import hashlib
+import json
+import os
+import socket
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+(
+    install_root_s,
+    config_root_s,
+    state_root_s,
+    systemd_user_root_s,
+    unit_name,
+    bin_root_s,
+    current_link_s,
+    home_dir_s,
+    test_mode_s,
+    plan_only_s,
+    json_output_s,
+) = sys.argv[1:12]
+
+install_root = Path(install_root_s).resolve()
+config_root = Path(config_root_s).resolve()
+state_root = Path(state_root_s).resolve()
+systemd_user_root = Path(systemd_user_root_s).resolve()
+bin_root = Path(bin_root_s).resolve()
+current_link = Path(current_link_s)
+home_dir = Path(home_dir_s).resolve()
+test_mode = (test_mode_s == "1")
+plan_only = (plan_only_s == "1")
+json_output = (json_output_s == "1")
+
+def fail_closed(code: str, reason: str) -> None:
+    if json_output:
+        doc = {
+            "schema": "sister.infra.workstation.repair/1.0.0",
+            "status": "FAIL_CLOSED",
+            "code": code,
+            "error": reason,
+        }
+        sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stderr.write(f"[FAIL] repair recusado (FAIL-CLOSED: {code}): {reason}\n")
+    sys.exit(1)
+
+# 1. Validação de current e integridade da release
+if not current_link.is_symlink():
+    fail_closed("CURRENT_RELEASE_MISSING", f"link current ausente ou não é symlink: {current_link}")
+
+try:
+    release_path = current_link.resolve(strict=True)
+except Exception as exc:
+    fail_closed("CURRENT_RELEASE_MISSING", f"link current aponta para destino inexistente: {exc}")
+
+if not release_path.is_dir():
+    fail_closed("CURRENT_RELEASE_MISSING", f"release current não é diretório: {release_path}")
+
+manifest_path = release_path / "manifest.json"
+if not manifest_path.is_file():
+    fail_closed("RELEASE_CORRUPTED", f"manifest.json ausente na release current: {manifest_path}")
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    fail_closed("RELEASE_CORRUPTED", f"manifest.json corrompido: {exc}")
+
+if manifest.get("schema") != "sister.infra.workstation.release/3":
+    fail_closed("RELEASE_CORRUPTED", f"schema de release incompatível: {manifest.get('schema')}")
+
+release_id = manifest.get("release_id", release_path.name)
+
+# Evidências e integridade estrutural
+qual = manifest.get("qualification", {})
+if qual.get("status") != "PASS":
+    fail_closed("RELEASE_CORRUPTED", "qualification.status != PASS no manifesto")
+qual_ev = release_path / qual.get("evidence", "")
+if not qual_ev.is_file() or hashlib.sha256(qual_ev.read_bytes()).hexdigest() != qual.get("sha256"):
+    fail_closed("RELEASE_CORRUPTED", "evidência de qualificação ausente ou com hash divergente")
+
+dep = manifest.get("deployment", {})
+if dep.get("status") != "READY":
+    fail_closed("RELEASE_CORRUPTED", "deployment.status != READY no manifesto")
+decl_ev = release_path / dep.get("declaration", "")
+if not decl_ev.is_file() or hashlib.sha256(decl_ev.read_bytes()).hexdigest() != dep.get("declaration_sha256"):
+    fail_closed("RELEASE_CORRUPTED", "declaração de deployment ausente ou com hash divergente")
+
+res_ev = release_path / dep.get("evidence", "")
+if not res_ev.is_file() or hashlib.sha256(res_ev.read_bytes()).hexdigest() != dep.get("sha256"):
+    fail_closed("RELEASE_CORRUPTED", "evidência de deployment resolvido ausente ou com hash divergente")
+
+try:
+    resolved_deployment = json.loads(res_ev.read_text(encoding="utf-8"))
+except Exception as exc:
+    fail_closed("DEPLOYMENT_DIVERGENT", f"deployment resolvido corrompido: {exc}")
+
+if resolved_deployment.get("schema") != "sister.infra.deployment.resolved/1" or resolved_deployment.get("status") != "READY":
+    fail_closed("DEPLOYMENT_DIVERGENT", "deployment resolvido sem schema/status READY")
+
+# Git control plane e componentes na release
+ctrl = manifest.get("control_plane", {})
+ctrl_path = release_path / ctrl.get("path", "")
+if not (ctrl_path / ".git").is_dir():
+    fail_closed("RELEASE_CORRUPTED", f"control plane Git ausente em {ctrl_path}")
+r_head = subprocess.run(["git", "-C", str(ctrl_path), "rev-parse", "HEAD"], stdout=subprocess.PIPE, text=True)
+if r_head.returncode != 0 or r_head.stdout.strip() != ctrl.get("commit"):
+    fail_closed("RELEASE_CORRUPTED", "commit do control plane na release diverge do manifesto")
+r_st = subprocess.run(["git", "--no-optional-locks", "-C", str(ctrl_path), "status", "--porcelain", "--untracked-files=no"], stdout=subprocess.PIPE, text=True)
+if r_st.stdout.strip():
+    fail_closed("RELEASE_CORRUPTED", "control plane possui alterações rastreadas na release")
+
+for comp in manifest.get("components", []):
+    c_root = release_path / comp.get("path", "")
+    if not (c_root / ".git").is_dir():
+        fail_closed("RELEASE_CORRUPTED", f"componente Git ausente: {comp.get('component_id')}")
+    r_c_head = subprocess.run(["git", "-C", str(c_root), "rev-parse", "HEAD"], stdout=subprocess.PIPE, text=True)
+    if r_c_head.returncode != 0 or r_c_head.stdout.strip() != comp.get("commit"):
+        fail_closed("RELEASE_CORRUPTED", f"commit do componente {comp.get('component_id')} diverge do manifesto")
+    r_c_st = subprocess.run(["git", "--no-optional-locks", "-C", str(c_root), "status", "--porcelain", "--untracked-files=no"], stdout=subprocess.PIPE, text=True)
+    if r_c_st.stdout.strip():
+        fail_closed("RELEASE_CORRUPTED", f"componente {comp.get('component_id')} possui alterações rastreadas na release")
+    if comp.get("runtime"):
+        entrypoint = c_root / comp.get("runtime", {}).get("entrypoint", "")
+        if not os.access(entrypoint, os.X_OK):
+            fail_closed("RELEASE_CORRUPTED", f"entrypoint de {comp.get('component_id')} não é executável")
+    for art in comp.get("artifacts", []):
+        art_p = c_root / art.get("path", "")
+        if not art_p.is_file() or hashlib.sha256(art_p.read_bytes()).hexdigest() != art.get("sha256"):
+            fail_closed("RELEASE_CORRUPTED", f"artefato {art.get('id')} corrompido ou ausente")
+
+# 2. Dados persistentes
+for comp in resolved_deployment.get("components", []):
+    cid = comp.get("component_id")
+    p_dir = state_root / "components" / cid
+    if p_dir.exists() and not p_dir.is_dir():
+        fail_closed("PERSISTENT_DATA_CORRUPTED", f"caminho de estado persistente de {cid} existe e não é diretório: {p_dir}")
+
+# 3. Autoridade TLS
+has_gateway = any(c.get("gateway") for c in resolved_deployment.get("components", []))
+tls_dir = config_root / "tls"
+ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+leaf_pem = tls_dir / "ecosystem-lab.pem"
+
+if has_gateway:
+    if not ca_cert.is_file():
+        fail_closed("TLS_AUTHORITY_INVALID", f"CA de laboratório ausente em {ca_cert} (repair não cria CA)")
+    if not leaf_pem.is_file():
+        fail_closed("TLS_AUTHORITY_INVALID", f"Certificado leaf ausente em {leaf_pem} (repair não emite folha)")
+
+    r_ca = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r_ca.returncode != 0:
+        fail_closed("TLS_AUTHORITY_INVALID", f"CA de laboratório corrompida ou não parseável: {ca_cert}")
+
+    r_leaf = subprocess.run(["openssl", "x509", "-in", str(leaf_pem), "-noout"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r_leaf.returncode != 0:
+        fail_closed("TLS_AUTHORITY_INVALID", f"Certificado leaf corrompido ou não parseável: {leaf_pem}")
+
+    r_verify = subprocess.run(["openssl", "verify", "-CAfile", str(ca_cert), str(leaf_pem)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r_verify.returncode != 0:
+        fail_closed("TLS_AUTHORITY_INVALID", f"Certificado leaf não valida contra a CA corrente: {leaf_pem}")
+
+# 4. Portas e colisão com processos externos
+def check_port_in_use(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.3)
+            return sock.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+
+comp_status = {}
+for comp in resolved_deployment.get("components", []):
+    cid = comp.get("component_id")
+    rt = comp.get("runtime", {})
+    if not rt:
+        continue
+    host = rt.get("listen", "127.0.0.1")
+    port = rt.get("port")
+    c_path = release_path / comp.get("component_path", "")
+    entrypoint = comp.get("runtime", {}).get("entrypoint", "")
+    if not entrypoint:
+        for mc in manifest.get("components", []):
+            if mc.get("component_id") == cid:
+                entrypoint = mc.get("runtime", {}).get("entrypoint", "")
+                break
+
+    env = os.environ.copy()
+    env["SISTER_RESOLVED_DEPLOYMENT_FILE"] = str(res_ev)
+    env["SISTER_COMPONENT_CONFIG_FILE"] = str(config_root / f"{cid}.env")
+    env["SISTER_RUNTIME_STATE_DIR"] = str(state_root / "components" / cid)
+    env["SISTER_RUNTIME_RUN_DIR"] = str(state_root / "run" / cid)
+
+    r_status = subprocess.run([str(c_path / entrypoint), "status"], cwd=str(c_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    is_running = (r_status.returncode == 0)
+
+    port_used = check_port_in_use(host, port) if (port and rt.get("transport") == "tcp") else False
+    if port_used and not is_running:
+        fail_closed("PORT_COLLISION_EXTERNAL", f"porta {port} declarada para {cid} ocupada por processo externo não gerenciado")
+
+    comp_status[cid] = {
+        "comp": comp,
+        "c_path": c_path,
+        "entrypoint": entrypoint,
+        "env": env,
+        "is_running": is_running,
+        "port_used": port_used,
+        "port": port,
+        "host": host,
+    }
+
+gw_pid_file = state_root / "control-plane" / "gateway" / f"haproxy-{os.environ.get('PROFILE', 'lan')}.pid"
+gw_running = False
+if gw_pid_file.is_file():
+    if test_mode:
+        gw_running = True
+    else:
+        try:
+            pid = int(gw_pid_file.read_text().strip())
+            os.kill(pid, 0)
+            gw_running = True
+        except (ValueError, OSError):
+            gw_running = False
+
+gw_port = int(os.environ.get("GATEWAY_LISTEN_PORT", "8443"))
+if test_mode:
+    gw_port_used = (os.environ.get("SISTER_TEST_GATEWAY_PORT_COLLISION") == "1")
+else:
+    gw_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.163.80.176")
+    gw_port_used = check_port_in_use(gw_addr, gw_port)
+
+if gw_port_used and not gw_running:
+    fail_closed("PORT_COLLISION_EXTERNAL", f"porta {gw_port} do gateway ocupada por processo externo não gerenciado")
+
+# 5. Detecção de Drift e Construção do Plano
+plan_items = []
+
+# Categoria 1: Symlink CLI
+cli_link = bin_root / "sister-infra"
+expected_cli_target = (
+    current_link
+    / "components"
+    / "sister-infra"
+    / "bin"
+    / "sister-infra"
+)
+cli_drift = False
+cli_actual = "valid"
+if not cli_link.is_symlink():
+    cli_drift = True
+    cli_actual = "absent" if not cli_link.exists() else "not_a_symlink"
+else:
+    try:
+        if cli_link.resolve() != expected_cli_target.resolve():
+            cli_drift = True
+            cli_actual = str(cli_link.resolve())
+    except Exception:
+        cli_drift = True
+        cli_actual = "broken_symlink"
+
+if cli_drift:
+    plan_items.append({
+        "category": "symlink",
+        "resource": str(cli_link),
+        "divergence": f"symlink do CLI sister-infra aponta para destino incorreto ou ausente ({cli_actual})",
+        "expected": str(expected_cli_target),
+        "actual": cli_actual,
+        "action": f"atualizar symlink {cli_link} -> {expected_cli_target}",
+        "action_type": "RESTORE_CLI_SYMLINK",
+    })
+
+# Categoria 2: Permissões de Runtime
+unit_file = systemd_user_root / unit_name
+expected_file_modes = [
+    (config_root / "runtime.env", 0o600, "arquivo runtime.env"),
+    (unit_file, 0o644, "unit systemd"),
+    (config_root / "tls", 0o700, "diretório tls"),
+    (config_root / "tls" / "ecosystem-lab-ca.key", 0o600, "chave CA"),
+    (config_root / "tls" / "ecosystem-lab-ca.crt", 0o644, "certificado CA"),
+    (config_root / "tls" / "ecosystem-lab.key", 0o600, "chave leaf"),
+    (config_root / "tls" / "ecosystem-lab.pem", 0o600, "bundle PEM leaf"),
+]
+
+for path_target, exp_mode, desc in expected_file_modes:
+    if path_target.exists() and not path_target.is_symlink():
+        act_mode = stat.S_IMODE(path_target.stat().st_mode)
+        if act_mode != exp_mode:
+            plan_items.append({
+                "category": "permission",
+                "resource": str(path_target),
+                "divergence": f"permissão de {desc} diverge ({oct(act_mode)} != {oct(exp_mode)})",
+                "expected": oct(exp_mode),
+                "actual": oct(act_mode),
+                "action": f"ajustar permissões de {path_target} para {oct(exp_mode)}",
+                "action_type": "CHMOD",
+                "target_mode": exp_mode,
+            })
+
+runtime_dirs = [
+    (config_root, "diretório config_root"),
+    (state_root, "diretório state_root"),
+    (state_root / "control-plane", "diretório control-plane"),
+    (state_root / "run", "diretório run"),
+    (state_root / "components", "diretório components"),
+]
+for dir_target, desc in runtime_dirs:
+    if dir_target.exists() and dir_target.is_dir() and not dir_target.is_symlink():
+        act_mode = stat.S_IMODE(dir_target.stat().st_mode)
+        if (act_mode & 0o002 != 0) or act_mode == 0o777:
+            plan_items.append({
+                "category": "permission",
+                "resource": str(dir_target),
+                "divergence": f"permissão insegura em {desc} ({oct(act_mode)} possui escrita global)",
+                "expected": "0o700",
+                "actual": oct(act_mode),
+                "action": f"restringir permissões de {dir_target} para 0o700",
+                "action_type": "CHMOD",
+                "target_mode": 0o700,
+            })
+
+# Categoria 3: Unit Systemd Derivável
+unit_template = release_path / "components" / "sister-infra" / "templates" / "systemd" / "sister-workstation.service.in"
+if not unit_template.is_file():
+    fail_closed("RELEASE_CORRUPTED", f"template systemd ausente na release current: {unit_template}")
+
+expected_unit_content = unit_template.read_text(encoding="utf-8").replace("%h", str(home_dir))
+unit_drift = False
+unit_actual_desc = "valid"
+if not unit_file.is_file():
+    unit_drift = True
+    unit_actual_desc = "absent"
+else:
+    try:
+        if unit_file.read_text(encoding="utf-8") != expected_unit_content:
+            unit_drift = True
+            unit_actual_desc = "content_diverged"
+    except Exception:
+        unit_drift = True
+        unit_actual_desc = "unreadable"
+
+if unit_drift:
+    plan_items.append({
+        "category": "systemd_unit",
+        "resource": str(unit_file),
+        "divergence": f"arquivo de serviço systemd ausente ou divergente do template ({unit_actual_desc})",
+        "expected": "renderizado a partir do template da release current",
+        "actual": unit_actual_desc,
+        "action": f"re-renderizar {unit_file} a partir do template e executar daemon-reload",
+        "action_type": "RESTORE_SYSTEMD_UNIT",
+        "content": expected_unit_content,
+    })
+
+# Categoria 4: Participantes Gerenciados Parados
+for cid, info in comp_status.items():
+    if not info["is_running"] and not info["port_used"]:
+        plan_items.append({
+            "category": "component_process",
+            "resource": cid,
+            "divergence": f"participante gerenciado {cid} está parado (porta {info['port']} livre)",
+            "expected": "running",
+            "actual": "stopped",
+            "action": f"iniciar participante {cid} via entrypoint da release current e validar health",
+            "action_type": "START_COMPONENT",
+            "comp_info": info,
+        })
+
+# Categoria 5: Gateway Gerenciado Parado
+if has_gateway and not gw_running and not gw_port_used:
+    plan_items.append({
+        "category": "gateway_process",
+        "resource": "gateway",
+        "divergence": "gateway declarativo está parado (porta livre e autoridade íntegra)",
+        "expected": "running",
+        "actual": "stopped",
+        "action": "iniciar gateway via sister-infra up",
+        "action_type": "START_GATEWAY",
+    })
+
+# 6. Modo Plan-Only
+clean_plan = [{k: v for k, v in item.items() if not k.endswith("_info") and k != "content" and k != "target_mode"} for item in plan_items]
+
+if plan_only:
+    if not plan_items:
+        if json_output:
+            doc = {
+                "schema": "sister.infra.workstation.repair/1.0.0",
+                "status": "NO_OP",
+                "release_id": release_id,
+                "plan": [],
+                "actions_applied": [],
+                "verification": {"status": "PASS", "details": "workstation íntegra; nenhum drift detectado"},
+            }
+            sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        else:
+            sys.stderr.write("[PASS] workstation íntegra; nenhum drift detectado (NO_OP)\n")
+    else:
+        if json_output:
+            doc = {
+                "schema": "sister.infra.workstation.repair/1.0.0",
+                "status": "PLANNED",
+                "release_id": release_id,
+                "plan": clean_plan,
+                "actions_applied": [],
+                "verification": {"status": "PENDING"},
+            }
+            sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        else:
+            print(f"=== REPAIR PLAN ({release_id}) ===")
+            for item in clean_plan:
+                print(f"[PLAN] {item['category']}: {item['resource']} -> {item['action']}")
+            print(f"Total: {len(clean_plan)} ação(ões) planejada(s). Nenhuma alteração realizada (--plan).")
+    sys.exit(0)
+
+# 7. Execução de Ações Mínimas
+if not plan_items:
+    if json_output:
+        doc = {
+            "schema": "sister.infra.workstation.repair/1.0.0",
+            "status": "NO_OP",
+            "release_id": release_id,
+            "plan": [],
+            "actions_applied": [],
+            "verification": {"status": "PASS", "details": "workstation íntegra; nenhuma ação de repair necessária"},
+        }
+        sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stderr.write("[PASS] workstation íntegra; nenhuma ação de repair necessária (NO_OP)\n")
+    sys.exit(0)
+
+actions_applied = []
+for item in plan_items:
+    atype = item["action_type"]
+    if atype == "RESTORE_CLI_SYMLINK":
+        bin_root.mkdir(parents=True, exist_ok=True)
+        tmp_link = bin_root / f".tmp-cli-{os.getpid()}"
+        if tmp_link.exists() or tmp_link.is_symlink():
+            tmp_link.unlink()
+        os.symlink(expected_cli_target, tmp_link)
+        tmp_link.replace(cli_link)
+        actions_applied.append({"category": "symlink", "resource": str(cli_link), "status": "APPLIED"})
+        if not json_output:
+            sys.stderr.write(f"[REPAIR] symlink restaurado: {cli_link} -> {expected_cli_target}\n")
+
+    elif atype == "CHMOD":
+        path_target = Path(item["resource"])
+        os.chmod(path_target, item["target_mode"])
+        actions_applied.append({"category": "permission", "resource": str(path_target), "status": "APPLIED"})
+        if not json_output:
+            sys.stderr.write(f"[REPAIR] permissão corrigida: {path_target} -> {item['expected']}\n")
+
+    elif atype == "RESTORE_SYSTEMD_UNIT":
+        unit_file.parent.mkdir(parents=True, exist_ok=True)
+        unit_file.write_text(item["content"], encoding="utf-8")
+        os.chmod(unit_file, 0o644)
+        if not test_mode:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        actions_applied.append({"category": "systemd_unit", "resource": str(unit_file), "status": "APPLIED"})
+        if not json_output:
+            sys.stderr.write(f"[REPAIR] unit systemd re-renderizada: {unit_file}\n")
+
+    elif atype == "START_COMPONENT":
+        cinfo = item["comp_info"]
+        r_start = subprocess.run([str(cinfo["c_path"] / cinfo["entrypoint"]), "start"], cwd=str(cinfo["c_path"]), env=cinfo["env"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r_start.returncode != 0:
+            fail_closed("REPAIR_FAILED", f"falha ao iniciar participante {item['resource']}: {r_start.stderr.decode('utf-8', errors='replace')}")
+        r_health = subprocess.run([str(cinfo["c_path"] / cinfo["entrypoint"]), "health"], cwd=str(cinfo["c_path"]), env=cinfo["env"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r_health.returncode != 0:
+            fail_closed("REPAIR_FAILED", f"participante {item['resource']} não passou no health após start")
+        actions_applied.append({"category": "component_process", "resource": item["resource"], "status": "APPLIED"})
+        if not json_output:
+            sys.stderr.write(f"[REPAIR] participante reiniciado e verificado: {item['resource']}\n")
+
+    elif atype == "START_GATEWAY":
+        if test_mode:
+            gw_pid_file = state_root / "control-plane" / "gateway" / f"haproxy-{os.environ.get('PROFILE', 'lan')}.pid"
+            gw_pid_file.parent.mkdir(parents=True, exist_ok=True)
+            gw_pid_file.write_text(str(os.getpid()))
+            actions_applied.append({"category": "gateway_process", "resource": "gateway", "status": "APPLIED"})
+        else:
+            env_gw = os.environ.copy()
+            env_gw["SISTER_RESOLVED_DEPLOYMENT_FILE"] = str(res_ev)
+            env_gw["SISTER_INFRA_RUN_ROOT"] = str(state_root / "control-plane")
+            env_gw["TLS_PEM"] = str(config_root / "tls" / "ecosystem-lab.pem")
+            env_gw["CA_CERT"] = str(config_root / "tls" / "ecosystem-lab-ca.crt")
+            env_gw["CA_KEY"] = str(config_root / "tls" / "ecosystem-lab-ca.key")
+            ctrl_bin = release_path / ctrl.get("path", "") / "bin" / "sister-infra"
+            r_gw = subprocess.run([str(ctrl_bin), "up", "--profile", os.environ.get("PROFILE", "lan")], env=env_gw, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if r_gw.returncode != 0:
+                fail_closed("REPAIR_FAILED", f"falha ao iniciar gateway: {r_gw.stderr.decode('utf-8', errors='replace')}")
+            actions_applied.append({"category": "gateway_process", "resource": "gateway", "status": "APPLIED"})
+        if not json_output:
+            sys.stderr.write("[REPAIR] gateway declarativo reiniciado com sucesso\n")
+
+# 8. Pós-Verificação
+if not cli_link.is_symlink() or cli_link.resolve() != expected_cli_target.resolve():
+    fail_closed("POST_VERIFY_FAILED", f"symlink do CLI {cli_link} permaneceu inválido após repair")
+
+if not unit_file.is_file() or unit_file.read_text(encoding="utf-8") != expected_unit_content:
+    fail_closed("POST_VERIFY_FAILED", f"unit systemd {unit_file} permaneceu inválida após repair")
+
+for path_target, exp_mode, desc in expected_file_modes:
+    if path_target.exists() and not path_target.is_symlink():
+        if stat.S_IMODE(path_target.stat().st_mode) != exp_mode:
+            fail_closed("POST_VERIFY_FAILED", f"permissão de {desc} permaneceu divergente após repair")
+
+# 9. Relatório Final
+if json_output:
+    doc = {
+        "schema": "sister.infra.workstation.repair/1.0.0",
+        "status": "REPAIRED",
+        "release_id": release_id,
+        "plan": clean_plan,
+        "actions_applied": actions_applied,
+        "verification": {"status": "PASS", "details": "todas as verificações pós-repair passaram com sucesso"},
+    }
+    sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+else:
+    sys.stderr.write(f"[PASS] workstation repair concluído com sucesso ({len(actions_applied)} ação(ões) aplicada(s))\n")
+    print(f"repair={release_id} actions={len(actions_applied)} status=REPAIRED")
+PY_WORKSTATION_REPAIR
+}
+
 status() {
   printf 'Current:  %s\n' "$(current_release_id)"
   printf 'Previous: %s\n' "$(previous_release_id)"
@@ -1810,6 +2369,7 @@ main() {
     check) workstation_check ;;
     bootstrap) workstation_bootstrap ;;
     doctor) doctor ;;
+    repair) workstation_repair "$@" ;;
     plan) plan ;;
     candidate-create) materialize_composition_candidate "${1:-}" ;;
     candidate-verify) candidate_verify "${1:-}" ;;
