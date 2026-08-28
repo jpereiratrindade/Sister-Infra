@@ -19,6 +19,7 @@ Uso:
   ./bin/sister-infra lab <comando> [opções]
   ./bin/sister-infra workstation <comando> [opções]
   ./bin/sister-infra candidate <comando> [opções]
+  ./bin/sister-infra production <comando> [opções]
 
 Comandos gerais:
   up          inicia gateway derivado do deployment resolvido
@@ -31,6 +32,7 @@ Modos operacionais:
   lab         operações do ambiente LAB (ex.: ./bin/sister-infra lab plan)
   workstation gerenciador de releases de workstation
   candidate   materialização e verificação de candidatas
+  production  operações governadas de produção (plan, apply, verify)
 
 Exemplos:
   ./bin/sister-infra dev preview <component> [--port <porta>] [--duration <seg>]
@@ -435,6 +437,11 @@ fi
 if [[ "${1:-}" == "workstation" ]]; then
   shift
   exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-workstation" "$@"
+fi
+
+if [[ "${1:-}" == "production" ]]; then
+  shift
+  exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/sister-production" "$@"
 fi
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

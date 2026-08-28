@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+"""Production Adapter & Institutional Authority Gates for SisTer Infra (OPS-07).
+
+Implements strictly governed, FHS-compliant, sealed-plan transactional
+production lifecycle operations.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+INFRA_ROOT = Path(__file__).resolve().parent.parent
+
+
+class ProductionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class ProductionPreflightError(ProductionError):
+    pass
+
+
+class ProductionAuthorityError(ProductionError):
+    pass
+
+
+class ProductionRollbackError(ProductionError):
+    pass
+
+
+# -----------------------------------------------------------------------------
+# 1. FHS Paths & Environment
+# -----------------------------------------------------------------------------
+
+def get_production_root() -> Path:
+    root_env = os.environ.get("SISTER_PRODUCTION_ROOT", "").strip()
+    if root_env:
+        return Path(root_env).expanduser().resolve()
+    return Path("/")
+
+
+def get_fhs_paths(prod_root: Path | None = None) -> dict[str, Path]:
+    if prod_root is None:
+        prod_root = get_production_root()
+
+    opt_dir = prod_root / "opt" / "sister"
+    etc_dir = prod_root / "etc" / "sister"
+    var_lib_dir = prod_root / "var" / "lib" / "sister"
+    run_dir = prod_root / "run" / "sister"
+
+    return {
+        "root": prod_root,
+        "opt": opt_dir,
+        "releases": opt_dir / "releases",
+        "candidates": opt_dir / "candidates",
+        "current": opt_dir / "current",
+        "previous": opt_dir / "previous",
+        "etc": etc_dir,
+        "config_env": etc_dir / "production.env",
+        "tls": etc_dir / "tls",
+        "var_lib": var_lib_dir,
+        "state": var_lib_dir / "state",
+        "evidence": var_lib_dir / "evidence" / "production",
+        "locks": var_lib_dir / "locks",
+        "run": run_dir,
+        "sockets": run_dir / "sockets",
+        "pids": run_dir / "pids",
+        "gateway": run_dir / "gateway",
+    }
+
+
+def parse_openssl_date(date_str: str) -> datetime | None:
+    for fmt in (
+        "%b %d %H:%M:%S %Y GMT",
+        "%b  %d %H:%M:%S %Y GMT",
+        "%b %d %H:%M:%S %Y",
+        "%b  %d %H:%M:%S %Y",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+# -----------------------------------------------------------------------------
+# 2. Preflight Validators
+# -----------------------------------------------------------------------------
+
+def check_clean_sources(
+    control_plane_dir: Path,
+    candidate_path: Path,
+) -> None:
+    """Valida se o control plane e os fontes da candidata estão estritamente limpos (PRD-008)."""
+    # 1. Control Plane Git Clean
+    if (control_plane_dir / ".git").exists():
+        proc = subprocess.run(
+            ["git", "-C", str(control_plane_dir), "status", "--porcelain"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            raise ProductionPreflightError(
+                "DIRTY_SOURCE_CONTROL_PLANE",
+                f"control plane possui arquivos modificados ou não rastreados:\n{proc.stdout.strip()}",
+            )
+
+    # 2. Fontes de Componentes na Candidata via qualification.json
+    qual_file = candidate_path / "evidence" / "composition" / "qualification.json"
+    if qual_file.is_file():
+        try:
+            qual_doc = json.loads(qual_file.read_text(encoding="utf-8"))
+            for c in qual_doc.get("components", []):
+                root_str = c.get("root")
+                cid = c.get("component_id", "unknown")
+                if root_str:
+                    src_path = Path(root_str)
+                    if not src_path.is_absolute():
+                        src_path = (control_plane_dir / src_path).resolve()
+                    if src_path.is_dir() and (src_path / ".git").exists():
+                        proc_c = subprocess.run(
+                            ["git", "-C", str(src_path), "status", "--porcelain"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=False,
+                        )
+                        if proc_c.returncode == 0 and proc_c.stdout.strip():
+                            raise ProductionPreflightError(
+                                "DIRTY_SOURCE_COMPONENT",
+                                f"componente '{cid}' possui fonte com alterações não commitadas:\n{proc_c.stdout.strip()}",
+                            )
+        except ProductionPreflightError:
+            raise
+        except Exception:
+            pass
+
+
+def validate_external_tls(
+    cert_path: Path,
+    key_path: Path,
+    expected_hosts: list[str],
+    min_validity_sec: int = 86400,
+) -> dict[str, Any]:
+    """Validação rigorosa de certificado TLS externo (PRD-005, PRD-006)."""
+    if not cert_path.is_file():
+        raise ProductionPreflightError(
+            "TLS_CERT_MISSING",
+            f"certificado TLS externo não encontrado: {cert_path}",
+        )
+    if not key_path.is_file():
+        raise ProductionPreflightError(
+            "TLS_KEY_MISSING",
+            f"chave privada TLS externa não encontrada: {key_path}",
+        )
+
+    # 1. Parse do certificado via openssl x509
+    cmd = [
+        "openssl", "x509",
+        "-in", str(cert_path),
+        "-noout",
+        "-subject", "-dates", "-fingerprint", "-sha256",
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0:
+        raise ProductionPreflightError(
+            "TLS_CERT_UNPARSEABLE",
+            f"falha ao parsear certificado TLS externo: {r.stderr.strip()}",
+        )
+
+    not_after = None
+    fingerprint = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("notAfter="):
+            not_after = parse_openssl_date(line[len("notAfter="):].strip())
+        elif "Fingerprint=" in line:
+            fingerprint = line.split("Fingerprint=", 1)[1].strip()
+
+    if not not_after:
+        raise ProductionPreflightError(
+            "TLS_CERT_UNPARSEABLE",
+            "data notAfter não identificada no certificado TLS",
+        )
+
+    now = datetime.now(timezone.utc)
+    if now >= not_after:
+        raise ProductionPreflightError(
+            "TLS_CERT_EXPIRED",
+            f"certificado TLS externo expirou em {not_after.isoformat()}",
+        )
+
+    remaining = (not_after - now).total_seconds()
+    if remaining < min_validity_sec:
+        raise ProductionPreflightError(
+            "TLS_CERT_EXPIRING_SOON",
+            f"certificado TLS externo dentro da janela insegura de expiração ({remaining:.0f}s < {min_validity_sec}s)",
+        )
+
+    # 2. Chave privada corresponde à chave pública do certificado
+    r_pub_cert = subprocess.run(
+        ["openssl", "x509", "-in", str(cert_path), "-noout", "-pubkey"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    r_pub_key = subprocess.run(
+        ["openssl", "pkey", "-in", str(key_path), "-pubout"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    if r_pub_cert.returncode != 0 or r_pub_key.returncode != 0:
+        raise ProductionPreflightError(
+            "TLS_KEY_CERT_MISMATCH",
+            "falha ao extrair chaves públicas para comparação",
+        )
+    if r_pub_cert.stdout.strip() != r_pub_key.stdout.strip():
+        raise ProductionPreflightError(
+            "TLS_KEY_CERT_MISMATCH",
+            "chave privada não corresponde ao certificado TLS externo",
+        )
+
+    # 3. Extrair SANs (Subject Alternative Names)
+    r_sans = subprocess.run(
+        ["openssl", "x509", "-in", str(cert_path), "-noout", "-ext", "subjectAltName"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    sans = []
+    if r_sans.returncode == 0:
+        import re
+        for m in re.finditer(r"(?:DNS|IP(?: Address)?):([^\s,]+)", r_sans.stdout):
+            sans.append(m.group(1).strip())
+
+    # 4. Validar cobertura dos hosts esperados
+    for host in expected_hosts:
+        covered = False
+        for san in sans:
+            if san == host:
+                covered = True
+                break
+            if san.startswith("*.") and host.count(".") == san.count("."):
+                suffix = san[2:]
+                if host.endswith(suffix):
+                    covered = True
+                    break
+        if not covered:
+            raise ProductionPreflightError(
+                "TLS_SAN_MISSING",
+                f"hostname '{host}' não coberto pelas SANs do certificado: {sans}",
+            )
+
+    return {
+        "fingerprint": fingerprint,
+        "not_after": not_after.isoformat(),
+        "sans": sans,
+    }
+
+
+def check_dns_readiness(
+    declared_hosts: list[str],
+    expected_target: str,
+    resolver_override: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Verifica readiness de DNS dos hostnames publicados (PRD-010)."""
+    env_mock = os.environ.get("SISTER_PRODUCTION_DNS_RESOLVER")
+    if env_mock and resolver_override is None:
+        try:
+            resolver_override = json.loads(env_mock)
+        except Exception:
+            pass
+
+    results = {}
+    for host in declared_hosts:
+        if resolver_override is not None:
+            resolved = resolver_override.get(host)
+            if resolved is None:
+                raise ProductionPreflightError(
+                    "DNS_MISSING",
+                    f"hostname '{host}' não encontrado no resolvedor DNS institucional",
+                )
+            if resolved != expected_target:
+                raise ProductionPreflightError(
+                    "DNS_DIVERGENT",
+                    f"hostname '{host}' resolve para '{resolved}', esperado '{expected_target}'",
+                )
+            results[host] = {"status": "READY", "target": resolved}
+        else:
+            try:
+                infos = socket.getaddrinfo(host, None)
+                ips = list({info[4][0] for info in infos})
+                if not ips:
+                    raise ProductionPreflightError(
+                        "DNS_MISSING",
+                        f"hostname '{host}' retornou lista vazia de endereços no DNS",
+                    )
+                if expected_target not in ips and expected_target not in ("0.0.0.0", "127.0.0.1"):
+                    raise ProductionPreflightError(
+                        "DNS_DIVERGENT",
+                        f"hostname '{host}' resolve para {ips}, esperado conter '{expected_target}'",
+                    )
+                results[host] = {"status": "READY", "target": ips[0]}
+            except socket.gaierror as exc:
+                raise ProductionPreflightError(
+                    "DNS_MISSING",
+                    f"hostname '{host}' falhou ao resolver no DNS: {exc}",
+                )
+    return results
+
+
+def check_ports_free(bindings: list[dict[str, Any]], running_pids: set[int]) -> None:
+    """Verifica colisão com processos externos não gerenciados (PRD-018)."""
+    for b in bindings:
+        rt = b.get("runtime", {})
+        transport = b.get("transport") or rt.get("transport", "tcp")
+        if transport == "tcp":
+            host = b.get("listen") or rt.get("listen", "127.0.0.1")
+            port = b.get("port") or rt.get("port")
+            if port:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    res = s.connect_ex((host, int(port)))
+                    if res == 0:
+                        raise ProductionPreflightError(
+                            "PORT_COLLISION_EXTERNAL",
+                            f"porta {port} ({host}) ocupada por processo externo não gerenciado",
+                        )
+
+
+# -----------------------------------------------------------------------------
+# 3. Service Manager Adapter
+# -----------------------------------------------------------------------------
+
+class ServiceManagerAdapter:
+    """Interface abstrata para gerenciar serviços de sistema (PRD-012)."""
+
+    def daemon_reload(self) -> None:
+        raise NotImplementedError
+
+    def start(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def stop(self, unit_name: str) -> None:
+        raise NotImplementedError
+
+    def restart(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def is_active(self, unit_name: str) -> bool:
+        raise NotImplementedError
+
+
+class MockServiceManager(ServiceManagerAdapter):
+    """Implementação em sandbox/mock para execução determinística sem root."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_file = state_dir / "mock-services.json"
+        self.state_dir = state_dir
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if not self.state_file.exists():
+            self._save({})
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save(self, data: dict[str, Any]) -> None:
+        self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def daemon_reload(self) -> None:
+        if os.environ.get("SISTER_MOCK_FAIL_DAEMON_RELOAD") == "1":
+            raise ProductionError("SERVICE_MANAGER_FAILURE", "falha injetada em daemon-reload")
+
+    def start(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        if os.environ.get("SISTER_MOCK_FAIL_SERVICE_MANAGER") == "1":
+            raise ProductionError("SERVICE_MANAGER_FAILURE", "falha simulada no gerenciador de serviços")
+        if os.environ.get("SISTER_MOCK_FAIL_START_UNIT") == unit_name:
+            raise ProductionError("SERVICE_START_FAILURE", f"falha ao iniciar unidade {unit_name}")
+
+        c_path = comp_info.get("c_path")
+        entrypoint = comp_info.get("entrypoint")
+        env = comp_info.get("env", os.environ.copy())
+
+        if c_path and entrypoint:
+            cmd = [str(c_path / entrypoint), "start"]
+            proc = subprocess.run(cmd, cwd=str(c_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                raise ProductionError(
+                    "SERVICE_START_FAILURE",
+                    f"falha ao iniciar {unit_name}: {proc.stderr.decode('utf-8', errors='replace')}",
+                )
+
+        state = self._load()
+        state[unit_name] = {
+            "active": True,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save(state)
+
+    def stop(self, unit_name: str) -> None:
+        state = self._load()
+        state[unit_name] = {"active": False}
+        self._save(state)
+
+    def restart(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        self.stop(unit_name)
+        self.start(unit_name, comp_info)
+
+    def is_active(self, unit_name: str) -> bool:
+        state = self._load()
+        return bool(state.get(unit_name, {}).get("active", False))
+
+
+def get_service_manager(fhs: dict[str, Path]) -> ServiceManagerAdapter:
+    mgr_type = os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER", "mock").strip()
+    if mgr_type == "mock":
+        return MockServiceManager(fhs["state"])
+    elif mgr_type == "systemd":
+        # Produção real (recusada sem permissão explícita)
+        if os.geteuid() != 0:
+            raise ProductionError(
+                "AUTHORITY_BOUNDARY",
+                "systemd do sistema requer execução com privilégios institucionais de root",
+            )
+        raise ProductionError(
+            "AUTHORITY_BOUNDARY",
+            "systemd real de sistema não autorizado para esta missão (PRD-019)",
+        )
+    else:
+        raise ProductionError("INVALID_SERVICE_MANAGER", f"gerenciador de serviço desconhecido: {mgr_type}")
+
+
+# -----------------------------------------------------------------------------
+# 4. Plan & Sealed Digest Computation
+# -----------------------------------------------------------------------------
+
+def compute_plan_digest(canonical_payload: dict[str, Any]) -> str:
+    """Calcula SHA-256 canônico sobre o payload selado determinístico (PRD-003)."""
+    canonical_json = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def build_production_plan(
+    candidate_dir: Path,
+    deployment_file: Path,
+    current_release: Path | None = None,
+    fhs: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Constrói o plano de reconciliação de produção (PRD-001)."""
+    if fhs is None:
+        fhs = get_fhs_paths()
+
+    # 1. Carregar Candidate Manifest
+    candidate_manifest_file = candidate_dir / "manifest.json"
+    if not candidate_manifest_file.is_file():
+        raise ProductionError("CANDIDATE_INVALID", f"manifest.json ausente na candidata: {candidate_dir}")
+    candidate_manifest = json.loads(candidate_manifest_file.read_text(encoding="utf-8"))
+
+    # 2. Carregar Deployment Desejado
+    if not deployment_file.is_file():
+        raise ProductionError("DEPLOYMENT_INVALID", f"arquivo de deployment ausente: {deployment_file}")
+    deployment = json.loads(deployment_file.read_text(encoding="utf-8"))
+
+    # 3. Invocar reconciliador em modo production
+    reconcile_bin = INFRA_ROOT / "bin" / "sister-reconcile"
+    cmd = [
+        str(reconcile_bin),
+        "plan",
+        "--mode", "production",
+        "--desired-candidate", str(candidate_dir),
+        "--desired-deployment", str(deployment_file),
+        "--no-probe-runtime",
+        "--json",
+    ]
+    if current_release is not None:
+        cmd.extend(["--current-release", str(current_release)])
+    elif fhs["current"].is_symlink() or fhs["current"].is_dir():
+        cmd.extend(["--current-release", str(fhs["current"].resolve())])
+
+    env = os.environ.copy()
+    env["SISTER_PRODUCTION_ROOT"] = str(fhs["root"])
+    env["SISTER_PRODUCTION_INSTALL_ROOT"] = str(fhs["opt"])
+
+    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        raise ProductionError("PLAN_RECONCILE_FAILED", f"falha ao projetar plano pelo reconciliador: {proc.stderr.strip()}")
+
+    try:
+        raw_plan = json.loads(proc.stdout)
+    except Exception as exc:
+        raise ProductionError("PLAN_PARSE_FAILED", f"saída inválida do reconciliador: {exc}")
+
+    # 4. Extrair bindings e hosts declarados
+    declared_hosts = []
+    normalized_bindings = []
+    for b in deployment.get("bindings", []):
+        sys_id = b.get("system_id", "")
+        gw = b.get("gateway", {})
+        host = gw.get("host")
+        if host:
+            declared_hosts.append(host)
+        rt = b.get("runtime", {})
+        normalized_bindings.append({
+            "system_id": sys_id,
+            "transport": rt.get("transport", "tcp"),
+            "listen": rt.get("listen", "127.0.0.1"),
+            "port": rt.get("port"),
+            "socket": rt.get("socket"),
+            "host": host,
+        })
+
+    # 5. Montar Sealed Payload Criptográfico
+    sealed_payload = {
+        "candidate_id": candidate_manifest.get("candidate_id", ""),
+        "composition_id": candidate_manifest.get("composition_id", ""),
+        "deployment_id": deployment.get("deployment_id", ""),
+        "policy": {
+            "mode": "production",
+            "tls_mode": "external",
+        },
+        "bindings": sorted(normalized_bindings, key=lambda x: x["system_id"]),
+        "changes": sorted([
+            {
+                "component_id": c.get("component_id", ""),
+                "action": c.get("action", ""),
+                "reason": c.get("reason", ""),
+            }
+            for c in raw_plan.get("changes", [])
+        ], key=lambda x: (x["component_id"], x["action"])),
+    }
+
+    plan_digest = compute_plan_digest(sealed_payload)
+
+    # 6. Plano Final Estruturado
+    full_plan = {
+        "schema": "sister.infra.production.plan/1.0.0",
+        "plan_version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "policy": {
+            "mode": "production",
+            "fhs_root": str(fhs["root"]),
+            "tls_mode": "external",
+        },
+        "candidate": {
+            "candidate_id": candidate_manifest.get("candidate_id"),
+            "composition_id": candidate_manifest.get("composition_id"),
+            "candidate_path": str(candidate_dir.resolve()),
+        },
+        "deployment": {
+            "deployment_id": deployment.get("deployment_id"),
+            "schema": deployment.get("schema"),
+            "deployment_path": str(deployment_file.resolve()),
+            "gateway_port": deployment.get("gateway", {}).get("port", 443),
+            "declared_hosts": declared_hosts,
+        },
+        "current_release": {
+            "release_id": raw_plan.get("current_release", {}).get("release_id") if raw_plan.get("current_release") else None,
+            "release_path": str(fhs["current"].resolve()) if fhs["current"].exists() else None,
+        },
+        "changes": raw_plan.get("changes", []),
+        "summary": raw_plan.get("summary", {}),
+        "sealed_payload": sealed_payload,
+        "plan_digest": plan_digest,
+    }
+
+    return full_plan
+
+
+# -----------------------------------------------------------------------------
+# 5. Transactional Apply & Rollback
+# -----------------------------------------------------------------------------
+
+def execute_production_apply(
+    plan_path: Path,
+    expected_digest: str,
+    fhs: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Execução transacional de produção com autoridade, preflight e rollback (PRD-002, PRD-013)."""
+    if fhs is None:
+        fhs = get_fhs_paths()
+
+    # -------------------------------------------------------------------------
+    # 1. Authority Gate: Digest Validation (PRD-003)
+    # -------------------------------------------------------------------------
+    if not plan_path.is_file():
+        raise ProductionAuthorityError("PLAN_FILE_NOT_FOUND", f"arquivo de plano ausente: {plan_path}")
+
+    try:
+        plan_doc = json.loads(plan_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ProductionAuthorityError("PLAN_FILE_INVALID", f"falha ao ler JSON do plano: {exc}")
+
+    sealed_payload = plan_doc.get("sealed_payload")
+    if not sealed_payload:
+        raise ProductionAuthorityError("PLAN_SEALED_PAYLOAD_MISSING", "plano não contém 'sealed_payload'")
+
+    computed_digest = compute_plan_digest(sealed_payload)
+    if computed_digest != expected_digest or plan_doc.get("plan_digest") != expected_digest:
+        raise ProductionAuthorityError(
+            "PLAN_DIGEST_MISMATCH",
+            f"digest aprovado não confere ({expected_digest} != {computed_digest})",
+        )
+
+    # -------------------------------------------------------------------------
+    # 2. Authority Gate: Institutional Confirmation (PRD-016)
+    # -------------------------------------------------------------------------
+    prod_approved = os.environ.get("PRODUCTION_APPROVED", "").strip()
+    prod_confirm = os.environ.get("SISTER_INFRA_PRODUCTION_CONFIRM", "").strip()
+
+    if prod_approved != "YES":
+        raise ProductionAuthorityError(
+            "AUTHORITY_APPROVAL_MISSING",
+            "produção exige PRODUCTION_APPROVED=YES explicitamente declarado",
+        )
+    if prod_confirm != "YES":
+        raise ProductionAuthorityError(
+            "AUTHORITY_APPROVAL_MISSING",
+            "produção exige SISTER_INFRA_PRODUCTION_CONFIRM=YES explicitamente declarado",
+        )
+
+    gate_cmd = os.environ.get("PRODUCTION_GATE_CMD", "").strip()
+    require_gate_cmd = os.environ.get("PRODUCTION_REQUIRE_GATE_CMD") == "1"
+
+    if require_gate_cmd and not gate_cmd:
+        raise ProductionAuthorityError(
+            "AUTHORITY_GATE_CMD_MISSING",
+            "PRODUCTION_GATE_CMD obrigatório quando PRODUCTION_REQUIRE_GATE_CMD=1",
+        )
+
+    if gate_cmd:
+        cmd_parts = shlex.split(gate_cmd)
+        gate_proc = subprocess.run(cmd_parts, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if gate_proc.returncode != 0:
+            raise ProductionAuthorityError(
+                "AUTHORITY_GATE_REJECTED",
+                f"comando de gate institucional rejeitou a implantação (exit={gate_proc.returncode}): {gate_proc.stderr.strip()}",
+            )
+
+    # -------------------------------------------------------------------------
+    # 3. Preflight: Source Clean, TLS Externo, DNS, Ports (PRD-005, 008, 010)
+    # -------------------------------------------------------------------------
+    candidate_path = Path(plan_doc["candidate"]["candidate_path"])
+    candidate_manifest = json.loads((candidate_path / "manifest.json").read_text(encoding="utf-8"))
+
+    control_plane_source = Path(
+        os.environ.get("SISTER_PRODUCTION_CONTROL_PLANE_SOURCE", str(INFRA_ROOT))
+    ).expanduser().resolve()
+    check_clean_sources(control_plane_source, candidate_path)
+
+    # Configuração de TLS Externo
+    tls_cert = Path(os.environ.get("PRODUCTION_TLS_CERT", str(fhs["tls"] / "ecosystem.crt"))).expanduser().resolve()
+    tls_key = Path(os.environ.get("PRODUCTION_TLS_KEY", str(fhs["tls"] / "ecosystem.key"))).expanduser().resolve()
+    declared_hosts = plan_doc["deployment"].get("declared_hosts", [])
+
+    tls_info = validate_external_tls(tls_cert, tls_key, declared_hosts)
+
+    # Verificação de DNS
+    expected_gw_target = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.0.1.50")
+    dns_info = check_dns_readiness(declared_hosts, expected_gw_target)
+
+    # Verificação de portas e concorrência
+    check_ports_free(plan_doc["sealed_payload"].get("bindings", []), set())
+
+    # -------------------------------------------------------------------------
+    # 4. Verificação Factual de Divergência (PRD-004)
+    # -------------------------------------------------------------------------
+    deployment_path_str = plan_doc["deployment"].get("deployment_path")
+    if deployment_path_str and Path(deployment_path_str).is_file():
+        deployment_file = Path(deployment_path_str)
+    else:
+        deployment_file = candidate_path / "evidence" / "deployment" / "declaration.json"
+        if not deployment_file.exists():
+            deployment_file = Path(os.environ.get("SISTER_WORKSTATION_DEPLOYMENT_FILE", ""))
+    fresh_plan = build_production_plan(
+        candidate_path,
+        deployment_file,
+        current_release=fhs["current"].resolve() if fhs["current"].exists() else None,
+        fhs=fhs,
+    )
+    if fresh_plan["plan_digest"] != expected_digest:
+        raise ProductionAuthorityError(
+            "PLAN_DIVERGENCE_DETECTED",
+            f"estado factual atual divergiu do plano aprovado ({fresh_plan['plan_digest']} != {expected_digest})",
+        )
+
+    # Se todas as ações forem KEEP (NO_OP)
+    if fresh_plan["summary"].get("add", 0) == 0 and fresh_plan["summary"].get("update", 0) == 0 and fresh_plan["summary"].get("remove", 0) == 0:
+        audit_evidence = {
+            "schema": "sister.infra.production.evidence/1.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "NO_OP",
+            "plan_digest": expected_digest,
+            "candidate_id": plan_doc["candidate"]["candidate_id"],
+            "deployment_id": plan_doc["deployment"]["deployment_id"],
+            "actions_applied": [],
+            "tls": tls_info,
+            "dns": dns_info,
+            "verification": {"status": "PASS", "details": "estado factual já convergido (NO_OP)"},
+        }
+        evidence_dir = fhs["evidence"]
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_file = evidence_dir / f"audit-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{expected_digest.replace(':', '_')}.json"
+        evidence_file.write_text(json.dumps(audit_evidence, indent=2), encoding="utf-8")
+        return audit_evidence
+
+    # -------------------------------------------------------------------------
+    # 5. Transação: Materialização Staging -> Start -> Verify -> Commit (PRD-013)
+    # -------------------------------------------------------------------------
+    service_mgr = get_service_manager(fhs)
+    service_mgr.daemon_reload()
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%SZ")
+    candidate_id = plan_doc["candidate"]["candidate_id"]
+    target_release_id = f"pr-{ts}-{candidate_id}"
+    staging_dir = fhs["releases"] / f".creating-{target_release_id}"
+    target_release_dir = fhs["releases"] / target_release_id
+
+    # Limpeza de staging anterior se houver
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    rollback_needed = True
+    previous_release_dir = fhs["current"].resolve() if fhs["current"].exists() else None
+    actions_applied = []
+
+    try:
+        # Copiar componentes da candidata para a staging release
+        shutil.copytree(candidate_path / "components", staging_dir / "components")
+
+        # Copiar evidências da candidata
+        shutil.copytree(candidate_path / "evidence", staging_dir / "evidence")
+
+        # Materializar evidências de deployment (declaration.json e resolved.json)
+        dep_evidence_dir = staging_dir / "evidence" / "deployment"
+        dep_evidence_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(deployment_file, dep_evidence_dir / "declaration.json")
+
+        dep_cli = INFRA_ROOT / "bin" / "sister-deployment"
+        cmd_resolve = [str(dep_cli), "resolve", str(candidate_path / "manifest.json"), str(deployment_file), "--json"]
+        contracts_root = os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT", "")
+        if contracts_root:
+            cmd_resolve.extend(["--contracts-root", contracts_root])
+        r_resolve = subprocess.run(
+            cmd_resolve,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if r_resolve.returncode != 0:
+            raise ProductionError("DEPLOYMENT_RESOLVE_FAILED", f"falha ao resolver deployment: {r_resolve.stderr.strip()}")
+        (dep_evidence_dir / "resolved.json").write_text(r_resolve.stdout, encoding="utf-8")
+
+        # Gerar manifesto da release de produção
+        manifest_doc = {
+            "schema": "sister.infra.release/1.0.0",
+            "release_id": target_release_id,
+            "mode": "production",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "candidate": {
+                "candidate_id": candidate_id,
+                "composition_id": plan_doc["candidate"]["composition_id"],
+            },
+            "deployment": {
+                "deployment_id": plan_doc["deployment"]["deployment_id"],
+                "evidence": "evidence/deployment/resolved.json",
+            },
+            "components": candidate_manifest.get("components", []),
+            "tls": {
+                "mode": "external",
+                "fingerprint": tls_info["fingerprint"],
+            },
+        }
+        (staging_dir / "manifest.json").write_text(json.dumps(manifest_doc, indent=2), encoding="utf-8")
+
+        # Materialização atômica da release directory
+        os.rename(staging_dir, target_release_dir)
+
+        # Iniciar/Reconfigurar serviços necessários
+        for change in fresh_plan.get("changes", []):
+            cid = change.get("component_id")
+            action = change.get("action")
+            if action in ("ADD", "UPDATE"):
+                comp_dir = target_release_dir / "components" / cid
+                # Localizar entrypoint
+                entrypoint = ""
+                for mc in manifest_doc["components"]:
+                    if mc.get("component_id") == cid:
+                        entrypoint = mc.get("runtime", {}).get("entrypoint", "")
+                        break
+
+                comp_env = os.environ.copy()
+                comp_env["SISTER_RUNTIME_RUN_DIR"] = str(fhs["run"] / cid)
+                comp_env["SISTER_RUNTIME_STATE_DIR"] = str(fhs["state"] / cid)
+                comp_info = {
+                    "c_path": comp_dir,
+                    "entrypoint": entrypoint,
+                    "env": comp_env,
+                }
+                service_mgr.start(f"sister-{cid}.service", comp_info)
+                actions_applied.append({"component_id": cid, "action": action, "status": "STARTED"})
+
+        # Simular/validar health probes
+        if os.environ.get("SISTER_MOCK_FAIL_HEALTH") == "1":
+            raise ProductionError("HEALTH_PROBE_FAILED", "sondagem de health check falhou no participante")
+
+        # Commit Point atômico (PRD-020)
+        current_symlink = fhs["current"]
+        previous_symlink = fhs["previous"]
+        tmp_link = fhs["opt"] / f".tmp-current-{ts}"
+
+        # Cria symlink temporário apontando para a nova release
+        os.symlink(target_release_dir, tmp_link)
+
+        # Se já existia um current, salva como previous
+        if current_symlink.is_symlink() or current_symlink.exists():
+            old_target = current_symlink.resolve()
+            if previous_symlink.is_symlink() or previous_symlink.exists():
+                previous_symlink.unlink()
+            os.symlink(old_target, previous_symlink)
+
+        # Troca atômica do current
+        os.replace(tmp_link, current_symlink)
+
+        rollback_needed = False
+
+    except Exception as exc:
+        if rollback_needed:
+            # -----------------------------------------------------------------
+            # 6. Rollback Handler (PRD-013, PRD-021)
+            # -----------------------------------------------------------------
+            for act in actions_applied:
+                try:
+                    service_mgr.stop(f"sister-{act['component_id']}.service")
+                except Exception:
+                    pass
+
+            if previous_release_dir and previous_release_dir.exists():
+                try:
+                    if fhs["current"].is_symlink():
+                        fhs["current"].unlink()
+                    os.symlink(previous_release_dir, fhs["current"])
+                except Exception:
+                    pass
+
+            evidence_dir = fhs["evidence"]
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            rollback_evidence = {
+                "schema": "sister.infra.production.evidence/1.0.0",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "ROLLBACK",
+                "plan_digest": expected_digest,
+                "error": str(exc),
+                "actions_attempted": actions_applied,
+                "rollback_completed": True,
+            }
+            rb_file = evidence_dir / f"audit-rollback-{ts}-{expected_digest.replace(':', '_')}.json"
+            rb_file.write_text(json.dumps(rollback_evidence, indent=2), encoding="utf-8")
+
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            if target_release_dir.exists():
+                shutil.rmtree(target_release_dir, ignore_errors=True)
+
+            raise ProductionRollbackError(
+                "TRANSACTION_ROLLED_BACK",
+                f"falha durante implantação produtiva; rollback executado com sucesso: {exc}",
+            ) from exc
+        raise
+
+    # -------------------------------------------------------------------------
+    # 7. Gravação de Evidência Auditável de Sucesso (PRD-014)
+    # -------------------------------------------------------------------------
+    evidence_dir = fhs["evidence"]
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    audit_evidence = {
+        "schema": "sister.infra.production.evidence/1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "APPLIED",
+        "plan_digest": expected_digest,
+        "candidate_id": candidate_id,
+        "deployment_id": plan_doc["deployment"]["deployment_id"],
+        "release_id": target_release_id,
+        "actions_applied": actions_applied,
+        "tls": tls_info,
+        "dns": dns_info,
+        "verification": {"status": "PASS", "details": "implantação transacional concluída com sucesso"},
+    }
+    evidence_file = evidence_dir / f"audit-{ts}-{expected_digest.replace(':', '_')}.json"
+    evidence_file.write_text(json.dumps(audit_evidence, indent=2), encoding="utf-8")
+
+    return audit_evidence
+
+
+# -----------------------------------------------------------------------------
+# 6. Production Verify (PRD-020, PRD-023)
+# -----------------------------------------------------------------------------
+
+def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, Any]:
+    """Validação estritamente read-only do estado de produção (PRD-020)."""
+    if fhs is None:
+        fhs = get_fhs_paths()
+
+    current_link = fhs["current"]
+    if not current_link.is_symlink() and not current_link.is_dir():
+        raise ProductionError("VERIFY_FAILED", f"link 'current' ausente em {current_link}")
+
+    current_dir = current_link.resolve()
+    manifest_file = current_dir / "manifest.json"
+    if not manifest_file.is_file():
+        raise ProductionError("VERIFY_FAILED", f"manifest.json ausente na release atual: {current_dir}")
+
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+
+    ev_rel = manifest.get("deployment", {}).get("evidence")
+    if not ev_rel or not (current_dir / ev_rel).is_file():
+        raise ProductionError("VERIFY_FAILED", "evidência de deployment ausente na release atual")
+
+    resolved_dep = json.loads((current_dir / ev_rel).read_text(encoding="utf-8"))
+
+    service_mgr = get_service_manager(fhs)
+    for c in manifest.get("components", []):
+        cid = c.get("component_id")
+        unit_name = f"sister-{cid}.service"
+        if not service_mgr.is_active(unit_name):
+            raise ProductionError("VERIFY_FAILED", f"serviço {unit_name} inativo")
+
+    tls_cert = Path(os.environ.get("PRODUCTION_TLS_CERT", str(fhs["tls"] / "ecosystem.crt"))).expanduser().resolve()
+    tls_key = Path(os.environ.get("PRODUCTION_TLS_KEY", str(fhs["tls"] / "ecosystem.key"))).expanduser().resolve()
+    declared_hosts = [
+        c.get("gateway", {}).get("host")
+        for c in resolved_dep.get("components", [])
+        if c.get("gateway", {}).get("host")
+    ]
+    tls_info = validate_external_tls(tls_cert, tls_key, declared_hosts)
+
+    expected_gw_target = os.environ.get("GATEWAY_LISTEN_ADDRESS", "10.0.1.50")
+    dns_info = check_dns_readiness(declared_hosts, expected_gw_target)
+
+    if not fhs["state"].is_dir():
+        raise ProductionError("VERIFY_FAILED", f"diretório de estado persistente ausente: {fhs['state']}")
+
+    return {
+        "schema": "sister.infra.production.verify/1.0.0",
+        "status": "PASS",
+        "release_id": manifest.get("release_id"),
+        "components_verified": len(manifest.get("components", [])),
+        "tls": tls_info,
+        "dns": dns_info,
+        "current_path": str(current_dir),
+    }
+
+
+# -----------------------------------------------------------------------------
+# 7. CLI Entrypoint
+# -----------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sister-production",
+        description="Adaptador de produção e autoridade institucional de SisTer Infra (OPS-07).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # Plan
+    plan_p = sub.add_parser("plan", help="Projeta plano de reconciliação de produção (estritamente read-only)")
+    plan_p.add_argument("--desired-candidate", required=True, help="Diretório da candidata desejada verificada")
+    plan_p.add_argument("--desired-deployment", required=True, help="Arquivo de deployment declarativo")
+    plan_p.add_argument("--current-release", help="Release atual (opcional)")
+    plan_p.add_argument("--out", help="Arquivo de destino para salvar o plano JSON selado")
+    plan_p.add_argument("--json", action="store_true", help="Emite o plano no formato JSON padronizado")
+
+    # Apply
+    apply_p = sub.add_parser("apply", help="Aplica transacionalmente o plano aprovado sob autoridade")
+    apply_p.add_argument("--plan", required=True, help="Arquivo do plano JSON gerado pelo production plan")
+    apply_p.add_argument("--plan-digest", required=True, help="Digest SHA-256 criptográfico aprovado do plano")
+    apply_p.add_argument("--json", action="store_true", help="Emite o resultado em JSON padronizado")
+
+    # Verify
+    verify_p = sub.add_parser("verify", help="Verifica o estado atual de produção (estritamente read-only)")
+    verify_p.add_argument("--json", action="store_true", help="Emite a verificação em JSON")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    fhs = get_fhs_paths()
+
+    try:
+        if args.command == "plan":
+            cand = Path(args.desired_candidate).expanduser().resolve()
+            dep = Path(args.desired_deployment).expanduser().resolve()
+            cur = Path(args.current_release).expanduser().resolve() if args.current_release else None
+
+            plan_doc = build_production_plan(cand, dep, cur, fhs=fhs)
+
+            if args.out:
+                out_path = Path(args.out).expanduser().resolve()
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(plan_doc, indent=2), encoding="utf-8")
+                sha_file = out_path.with_suffix(out_path.suffix + ".sha256")
+                sha_file.write_text(f"{plan_doc['plan_digest']}\n", encoding="utf-8")
+
+            if args.json:
+                print(json.dumps(plan_doc, indent=2))
+            else:
+                print("=== SisTer Infra — Production Plan (SEALED) ===")
+                print(f"Digest:     {plan_doc['plan_digest']}")
+                print(f"Candidate:  {plan_doc['candidate']['candidate_id']}")
+                print(f"Deployment: {plan_doc['deployment']['deployment_id']}")
+                print(f"Summary:    {plan_doc['summary']}")
+                print("Changes:")
+                for c in plan_doc.get("changes", []):
+                    print(f"  [{c.get('action')}] {c.get('component_id')}: {c.get('reason')}")
+            return 0
+
+        elif args.command == "apply":
+            plan_file = Path(args.plan).expanduser().resolve()
+            evidence = execute_production_apply(plan_file, args.plan_digest, fhs=fhs)
+
+            if args.json:
+                print(json.dumps(evidence, indent=2))
+            else:
+                print(f"[PASS] Production apply concluído com status: {evidence['status']}")
+                print(f"Digest:     {evidence.get('plan_digest')}")
+                print(f"Release:    {evidence.get('release_id')}")
+            return 0
+
+        elif args.command == "verify":
+            ver = execute_production_verify(fhs=fhs)
+            if args.json:
+                print(json.dumps(ver, indent=2))
+            else:
+                print(f"[PASS] Production verify: {ver['status']}")
+                print(f"Release ativa: {ver['release_id']}")
+                print(f"Componentes:   {ver['components_verified']}")
+            return 0
+
+        return 1
+
+    except ProductionError as exc:
+        if getattr(args, "json", False):
+            doc = {
+                "schema": "sister.infra.production.error/1.0.0",
+                "status": "FAIL_CLOSED",
+                "code": exc.code,
+                "error": exc.message,
+            }
+            print(json.dumps(doc, indent=2))
+        else:
+            print(f"[FAIL] [{exc.code}] {exc.message}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

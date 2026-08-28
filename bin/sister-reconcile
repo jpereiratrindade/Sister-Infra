@@ -145,15 +145,24 @@ def load_current_state(
         if env_release:
             current_dir = Path(env_release).expanduser().resolve()
         else:
-            install_root = os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT")
-            if install_root:
-                cand = Path(install_root).expanduser() / "current"
+            prod_install_root = os.environ.get("SISTER_PRODUCTION_INSTALL_ROOT")
+            if not prod_install_root and os.environ.get("SISTER_PRODUCTION_ROOT"):
+                prod_install_root = str(Path(os.environ["SISTER_PRODUCTION_ROOT"]) / "opt" / "sister")
+
+            if prod_install_root:
+                cand = Path(prod_install_root).expanduser() / "current"
                 if cand.is_symlink() or cand.is_dir():
                     current_dir = cand.resolve()
             else:
-                default_cand = Path.home() / ".local" / "share" / "sister" / "current"
-                if default_cand.is_symlink() or default_cand.is_dir():
-                    current_dir = default_cand.resolve()
+                install_root = os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT")
+                if install_root:
+                    cand = Path(install_root).expanduser() / "current"
+                    if cand.is_symlink() or cand.is_dir():
+                        current_dir = cand.resolve()
+                else:
+                    default_cand = Path.home() / ".local" / "share" / "sister" / "current"
+                    if default_cand.is_symlink() or default_cand.is_dir():
+                        current_dir = default_cand.resolve()
 
     if not current_dir or not current_dir.exists():
         return None
