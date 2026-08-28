@@ -35,6 +35,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
+RUNTIME_GATEWAY = ROOT / "libexec" / "sister-infra" / "runtime-gateway"
+
 from derived_resources_apply_test import (
     create_mock_runtime_script,
     setup_ca,
@@ -181,9 +183,9 @@ def test_caso_a_tls_existente(secrets_repo: Path) -> None:
             sha_ca_key_before = sha_file(ca_key)
             sha_leaf_before = sha_file(tls_pem)
 
-            # Inicia via sister-infra up
-            res_up = subprocess.run([str(INFRA_CLI), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert res_up.returncode == 0, f"sister-infra up falhou: {res_up.stderr}"
+            # Inicia via adapter privado de runtime
+            res_up = subprocess.run([str(RUNTIME_GATEWAY), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert res_up.returncode == 0, f"runtime-gateway up falhou: {res_up.stderr}"
 
             gateway_pid_file = Path(env["GATEWAY_PID"])
             pid_gw = lifecycle.track_haproxy_pid_file(gateway_pid_file)
@@ -199,8 +201,8 @@ def test_caso_a_tls_existente(secrets_repo: Path) -> None:
             assert sha_file(tls_pem) == sha_leaf_before, "Leaf cert foi modificado durante cold-start!"
 
             # TLSA-024: Cold-stop funcional
-            res_down = subprocess.run([str(INFRA_CLI), "down", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert res_down.returncode == 0, f"sister-infra down falhou: {res_down.stderr}"
+            res_down = subprocess.run([str(RUNTIME_GATEWAY), "down", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert res_down.returncode == 0, f"runtime-gateway down falhou: {res_down.stderr}"
             assert not gateway_pid_file.exists(), "gateway PID file deveria ter sido removido após down"
 
             print("[PASS] Caso A — cold-start e cold-stop funcionais com preservação byte a byte do material TLS")
@@ -225,9 +227,9 @@ def test_caso_b_ca_em_janela_de_expiracao(secrets_repo: Path) -> None:
             sha_ca_key_before = sha_file(ca_key)
             sha_leaf_before = sha_file(tls_pem)
 
-            # Executa sister-infra up
-            res_up = subprocess.run([str(INFRA_CLI), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert res_up.returncode == 0, f"sister-infra up falhou: {res_up.stderr}"
+            # Executa runtime-gateway up
+            res_up = subprocess.run([str(RUNTIME_GATEWAY), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert res_up.returncode == 0, f"runtime-gateway up falhou: {res_up.stderr}"
 
             gateway_pid_file = Path(env["GATEWAY_PID"])
             pid_gw = lifecycle.track_haproxy_pid_file(gateway_pid_file)
@@ -238,7 +240,7 @@ def test_caso_b_ca_em_janela_de_expiracao(secrets_repo: Path) -> None:
             assert sha_file(ca_key) == sha_ca_key_before, "CA key foi rotacionada indevidamente pelo up!"
             assert sha_file(tls_pem) == sha_leaf_before, "Leaf foi reemitido indevidamente pelo up!"
 
-            res_down = subprocess.run([str(INFRA_CLI), "down", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            res_down = subprocess.run([str(RUNTIME_GATEWAY), "down", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert res_down.returncode == 0
 
             print("[PASS] Caso B — ausência de rotação comprovada sob CA em janela preventiva")
@@ -259,11 +261,11 @@ def test_caso_c_tls_pem_ausente_fail_closed(secrets_repo: Path) -> None:
 
             gateway_pid_file = Path(env["GATEWAY_PID"])
 
-            # Executa sister-infra up
-            res_up = subprocess.run([str(INFRA_CLI), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Executa runtime-gateway up
+            res_up = subprocess.run([str(RUNTIME_GATEWAY), "up", "--profile", "lan"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             # Invariante TLSA-023: Falha fechado
-            assert res_up.returncode != 0, "sister-infra up deveria falhar fechado com TLS_PEM ausente"
+            assert res_up.returncode != 0, "runtime-gateway up deveria falhar fechado com TLS_PEM ausente"
             assert "certificado TLS do gateway ausente ou ilegível" in res_up.stderr
 
             # Gateway não iniciado

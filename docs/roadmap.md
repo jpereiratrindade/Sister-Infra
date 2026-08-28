@@ -377,6 +377,59 @@ Gates UX33–UX45 comprovam mudança de domínio/IP sem código, source read-onl
 fail-closed sem authority, identidade consistente, bootstrap não criador e
 preservação byte a byte da configuração externa.
 
+### OPS-10 — Control Plane Simplification
+
+**IN PROGRESS**
+
+Objetivo operacional:
+
+> A equipe administra intenção, configuração e autoridade; o SisTer Infra
+> administra e explica o procedimento.
+
+O programa preserva autoridades de domínio coesas, elimina implementações e
+caminhos mutáveis concorrentes, define contratos estáveis para operador e
+automação e só então simplifica entrypoints e topologia de instalação.
+
+Fases incrementais:
+
+```text
+OPS-10A  contratos atuais e grafo de chamadas       DONE
+OPS-10B  operator UX / automation contract          DONE
+OPS-10C  caminhos operacionais canônicos            DONE
+OPS-10D  extração incremental dos mecanismos         IN PROGRESS
+OPS-10E  entrypoints finos e compatibilidade
+OPS-10F  topologia de instalação
+```
+
+A baseline factual do OPS-10A está em
+[`architecture/control-plane-contract-audit.md`](architecture/control-plane-contract-audit.md).
+O contrato arquitetural do OPS-10B está em
+[`architecture/operator-automation-contract.md`](architecture/operator-automation-contract.md).
+
+Nenhum executável foi movido ou removido no OPS-10A. A auditoria encontrou o
+ciclo `sister-infra → sister-workstation → sister-infra up`, rotas mutáveis
+concorrentes para produção e LAB e contratos heterogêneos de JSON, stderr e
+exit codes. Essas evidências definem as decisões obrigatórias do OPS-10B.
+
+Primeiro corte do OPS-10C: `sister-infra up/down --profile production` falha
+antes de qualquer mutação e orienta para o único fluxo governado
+`production plan → production apply`. O comando histórico não pode ser um
+forward seguro porque não identifica plano nem digest aprovado.
+
+Segundo corte: o mecanismo de runtime do gateway foi extraído para o adapter
+privado `libexec/sister-infra/runtime-gateway`. A fachada `sister-infra` e o
+runtime da workstation delegam ao mesmo mecanismo. O ciclo executável
+`sister-infra → sister-workstation → sister-infra up` deixou de existir, e a
+fachada deixou de implementar renderização, PID lifecycle e probes do gateway.
+
+Terceiro corte (OPS-10C3): a superfície pública de `sister-infra --help` foi
+consolidada para expor exclusivamente os namespaces canônicos orientados a
+intenção (`dev`, `lab`, `production`, `lifecycle`, `workstation`, `authority`).
+Comandos históricos top-level (`up`, `down`, `status`, `verify`, `client-env`,
+`hosts-line`) foram retirados da ajuda pública, encaminham com aviso acionável
+de depreciação para seus donos estáveis ou adapter privado e possuem cobertura
+pelo gate de aceitação `tests/public_cli_contract_test.py`.
+
 ## Visão de chegada
 
 A interface final desejada permite que o operador pense em intenção, não em procedimentos mecânicos:

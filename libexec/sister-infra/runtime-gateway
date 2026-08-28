@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+RUN_ROOT="${SISTER_INFRA_RUN_ROOT:-$INFRA_ROOT/.run}"
+GATEWAY_RUN="$RUN_ROOT/gateway"
+LOG_ROOT="$RUN_ROOT/logs"
+PROFILE="lan"
+COMMAND=""
+
+usage() {
+  cat <<'USAGE'
+SisTer Infra — adapter privado do runtime de gateway
+
+Uso:
+  runtime-gateway <up|down|status|verify|client-env|hosts-line> [--profile dev|lan]
+
+Este entrypoint é privado. Operadores devem usar sister-infra.
+USAGE
+}
+
+log()  { printf '[infra] %s\n' "$*"; }
+pass() { printf '[PASS] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[FAIL] %s\n' "$*" >&2; exit 2; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "comando obrigatório ausente: $1"
+}
+
+parse_args() {
+  [[ $# -ge 1 ]] || { usage; exit 2; }
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        [[ $# -ge 2 ]] || die "--profile exige valor"
+        PROFILE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "opção desconhecida: $1"
+        ;;
+    esac
+  done
+
+  case "$PROFILE" in
+    dev|lan) ;;
+    production)
+      die "adapter de runtime não aceita produção; use sister-infra production plan/apply/verify"
+      ;;
+    *) die "perfil inválido: $PROFILE" ;;
+  esac
+}
+
+load_profile() {
+  local default_port="${GATEWAY_LISTEN_PORT:-}"
+  local default_addr="${GATEWAY_LISTEN_ADDRESS:-}"
+  HAPROXY_BIN="${HAPROXY_BIN:-/usr/local/sbin/haproxy-3.2.22}"
+  GATEWAY_LISTEN_PORT="$default_port"
+  GATEWAY_LISTEN_ADDRESS="$default_addr"
+
+  mkdir -p "$GATEWAY_RUN" "$LOG_ROOT"
+  chmod 700 "$RUN_ROOT" "$GATEWAY_RUN" "$LOG_ROOT" 2>/dev/null || true
+
+  local workstation_tls="${SISTER_WORKSTATION_CONFIG_ROOT:-$HOME/.config/sister/workstation}/tls"
+  TLS_PEM="${TLS_PEM:-$workstation_tls/ecosystem-lab.pem}"
+  CA_CERT="${CA_CERT:-$workstation_tls/ecosystem-lab-ca.crt}"
+  GATEWAY_CFG="${GATEWAY_CFG:-$GATEWAY_RUN/haproxy-${PROFILE}.cfg}"
+  GATEWAY_PID="${GATEWAY_PID:-$GATEWAY_RUN/haproxy-${PROFILE}.pid}"
+  GATEWAY_LOG="${GATEWAY_LOG:-$LOG_ROOT/haproxy-${PROFILE}.log}"
+}
+
+runtime_preflight() {
+  require_command curl
+  require_command jq
+  require_command openssl
+
+  if [[ -z "${SISTER_RESOLVED_DEPLOYMENT_FILE:-}" || ! -f "$SISTER_RESOLVED_DEPLOYMENT_FILE" ]]; then
+    local current_link="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME/.local/share/sister}/current"
+    if [[ -L "$current_link" ]]; then
+      local current_path
+      current_path="$(readlink -f "$current_link")/evidence/deployment/resolved.json"
+      if [[ -f "$current_path" ]]; then
+        export SISTER_RESOLVED_DEPLOYMENT_FILE="$current_path"
+      fi
+    fi
+  fi
+
+  local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
+  [[ -n "$resolved" && -f "$resolved" ]] || \
+    die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
+  jq -e '
+    .schema == "sister.infra.deployment.resolved/1"
+    and .status == "READY"
+    and (.components | type == "array" and length > 0)
+  ' "$resolved" >/dev/null || die "deployment resolvido inválido"
+
+  local declared_addr declared_port
+  declared_addr="$(jq -r '.gateway.listen // empty' "$resolved")"
+  declared_port="$(jq -r '.gateway.port // empty' "$resolved")"
+  GATEWAY_LISTEN_ADDRESS="${GATEWAY_LISTEN_ADDRESS:-$declared_addr}"
+  GATEWAY_LISTEN_PORT="${GATEWAY_LISTEN_PORT:-$declared_port}"
+  [[ -n "$GATEWAY_LISTEN_ADDRESS" ]] || die "gateway.listen ausente no deployment resolvido"
+  [[ -n "$GATEWAY_LISTEN_PORT" ]] || die "gateway.port ausente no deployment resolvido"
+
+  if [[ ! -x "$HAPROXY_BIN" ]]; then
+    local detected
+    detected="$(command -v haproxy 2>/dev/null || true)"
+    [[ -n "$detected" ]] || die "HAProxy não encontrado em $HAPROXY_BIN nem no PATH"
+    HAPROXY_BIN="$detected"
+  fi
+  "$HAPROXY_BIN" -vv >/dev/null 2>&1 || \
+    die "HAProxy não executável: $HAPROXY_BIN"
+}
+
+render_gateway() {
+  [[ -f "$TLS_PEM" ]] || die "TLS PEM ausente: $TLS_PEM"
+
+  local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
+  [[ -n "$resolved" && -f "$resolved" ]] || \
+    die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
+
+  "$INFRA_ROOT/bin/sister-gateway" render \
+    "$resolved" \
+    --listen-address "$GATEWAY_LISTEN_ADDRESS" \
+    --listen-port "$GATEWAY_LISTEN_PORT" \
+    --tls-pem "$TLS_PEM" \
+    > "$GATEWAY_CFG" || die "falha ao renderizar gateway declarativo"
+
+  "$HAPROXY_BIN" -c -f "$GATEWAY_CFG" >/dev/null || \
+    die "configuração HAProxy inválida"
+  pass "configuração HAProxy válida"
+}
+
+pid_alive() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  local pid
+  pid="$(cat "$file" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_gateway() {
+  if pid_alive "$GATEWAY_PID"; then
+    local pid
+    pid="$(cat "$GATEWAY_PID")"
+    log "Parando HAProxy PID $pid..."
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "HAProxy não encerrou graciosamente; enviando TERM novamente"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$GATEWAY_PID"
+}
+
+start_gateway() {
+  stop_gateway
+  render_gateway
+  log "Subindo gateway $GATEWAY_LISTEN_ADDRESS:$GATEWAY_LISTEN_PORT..."
+  "$HAPROXY_BIN" -D -f "$GATEWAY_CFG" -p "$GATEWAY_PID" >>"$GATEWAY_LOG" 2>&1
+  sleep 0.4
+  pid_alive "$GATEWAY_PID" || \
+    die "HAProxy não permaneceu ativo; veja $GATEWAY_LOG"
+  pass "gateway ativo"
+}
+
+component_health() {
+  local component_id="$1"
+  local transport="$2"
+  local endpoint_a="$3"
+  local endpoint_b="$4"
+  local health_path="$5"
+
+  [[ -n "$health_path" && "$health_path" != "null" ]] || return 0
+
+  case "$transport" in
+    tcp)
+      curl --noproxy '*' -fsS --max-time 5 \
+        "http://${endpoint_a}:${endpoint_b}${health_path}" >/dev/null
+      ;;
+    unix)
+      curl --noproxy '*' -fsS --max-time 5 \
+        --unix-socket "$endpoint_a" \
+        "http://localhost${health_path}" >/dev/null
+      ;;
+    *) die "transport desconhecido para $component_id: $transport" ;;
+  esac
+}
+
+verify_components() {
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local component_id transport endpoint_a endpoint_b health_path
+  while IFS=$'\t' read -r \
+      component_id transport endpoint_a endpoint_b health_path; do
+    [[ -n "$component_id" ]] || continue
+    component_health \
+      "$component_id" "$transport" "$endpoint_a" "$endpoint_b" "$health_path" \
+      && pass "$component_id saudável" \
+      || die "$component_id não respondeu ao probe declarativo"
+  done < <(
+    jq -r '
+      .components[]
+      | [
+          .component_id,
+          .runtime.transport,
+          (if .runtime.transport == "tcp" then .runtime.listen else .runtime.socket end),
+          (if .runtime.transport == "tcp" then (.runtime.port | tostring) else "-" end),
+          (.probe.health_path // "")
+        ] | @tsv
+    ' "$resolved"
+  )
+}
+
+verify_gateway_urls() {
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local -a cacert_args=()
+  if [[ -f "$CA_CERT" ]]; then
+    cacert_args=(--cacert "$CA_CERT")
+  fi
+
+  local component_id host health_path
+  while IFS=$'\t' read -r component_id host health_path; do
+    [[ -n "$component_id" ]] || continue
+    curl --noproxy '*' -fsS --max-time 5 \
+      "${cacert_args[@]}" \
+      --resolve "$host:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
+      "https://$host:$GATEWAY_LISTEN_PORT$health_path" >/dev/null \
+      && pass "$component_id via gateway" \
+      || die "$component_id não respondeu via gateway"
+  done < <(
+    jq -r '
+      .components[]
+      | select(.gateway != null and (.probe.health_path // "") != "")
+      | [.component_id, .gateway.host, .probe.health_path] | @tsv
+    ' "$resolved"
+  )
+}
+
+cmd_up() {
+  runtime_preflight
+  [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
+    die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  start_gateway
+  if ! verify_components || ! verify_gateway_urls; then
+    stop_gateway
+    die "verificação após start do gateway declarativo falhou"
+  fi
+  pass "gateway declarativo ativo"
+}
+
+cmd_down() {
+  runtime_preflight
+  stop_gateway
+  pass "gateway declarativo parado"
+}
+
+cmd_status() {
+  runtime_preflight
+  verify_components
+  pid_alive "$GATEWAY_PID" || die "gateway declarativo OFFLINE"
+  pass "gateway declarativo PID $(cat "$GATEWAY_PID")"
+}
+
+cmd_verify() {
+  runtime_preflight
+  [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
+    die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  render_gateway
+  verify_components
+  pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"
+  verify_gateway_urls
+  pass "deployment declarativo verificado"
+}
+
+cmd_client_env() {
+  runtime_preflight
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local values
+  values="$(jq -r --arg gw_ip "${GATEWAY_LISTEN_ADDRESS:-}" '
+    ["localhost", "127.0.0.0/8", "127.0.0.1", "::1"]
+    + (if $gw_ip != "" then [$gw_ip] else [] end)
+    + [.components[] | select(.runtime.transport == "tcp") | .runtime.listen]
+    + [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(",")
+  ' "$resolved")"
+  printf 'export NO_PROXY="%s"\n' "$values"
+  printf 'export no_proxy="%s"\n' "$values"
+}
+
+cmd_hosts_line() {
+  runtime_preflight
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+  local hosts_list
+  hosts_list="$(jq -r '
+    [.components[] | select(.gateway != null) | .gateway.host]
+    | unique | join(" ")
+  ' "$resolved")"
+  printf '%s %s\n' "${GATEWAY_LISTEN_ADDRESS:-127.0.0.1}" "$hosts_list"
+}
+
+main() {
+  parse_args "$@"
+  load_profile
+
+  case "$COMMAND" in
+    up) cmd_up ;;
+    down) cmd_down ;;
+    status) cmd_status ;;
+    verify) cmd_verify ;;
+    client-env) cmd_client_env ;;
+    hosts-line|hosts) cmd_hosts_line ;;
+    help|-h|--help) usage ;;
+    *) die "comando desconhecido: $COMMAND" ;;
+  esac
+}
+
+main "$@"

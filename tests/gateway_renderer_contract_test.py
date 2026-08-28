@@ -90,7 +90,9 @@ def invoke(path: Path, tls_pem: Path) -> subprocess.CompletedProcess[str]:
 
 def main() -> None:
     source = CLI.read_text(encoding="utf-8").lower()
-    infra_source = (ROOT / "bin" / "sister-infra").read_text(
+    runtime_source = (
+        ROOT / "libexec" / "sister-infra" / "runtime-gateway"
+    ).read_text(
         encoding="utf-8"
     )
     for forbidden in (
@@ -104,9 +106,9 @@ def main() -> None:
     ):
         assert forbidden not in source, f"renderer contém {forbidden}"
 
-    renderer_start = infra_source.index("render_gateway() {")
-    renderer_end = infra_source.index("\npid_alive() {", renderer_start)
-    infra_renderer = infra_source[renderer_start:renderer_end].lower()
+    renderer_start = runtime_source.index("render_gateway() {")
+    renderer_end = runtime_source.index("\npid_alive() {", renderer_start)
+    infra_renderer = runtime_source[renderer_start:renderer_end].lower()
     for forbidden in ("sister_host", "nexo_host", "praxis_host", "urt_host"):
         assert forbidden not in infra_renderer, (
             f"adapter do renderer contém {forbidden}"

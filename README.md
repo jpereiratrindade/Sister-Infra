@@ -431,6 +431,8 @@ python3 tests/gateway_cold_boot_tls_test.py
 python3 tests/workstation_maintenance_semantics_test.py
 python3 tests/historical_bootstrap_retirement_test.py
 python3 tests/workstation_repair_test.py
+python3 tests/operational_surface_consolidation_test.py
+python3 tests/public_cli_contract_test.py
 ```
 
 Antes de commit:

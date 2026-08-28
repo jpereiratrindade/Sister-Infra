@@ -144,7 +144,7 @@ def main() -> None:
         # 2. Control Plane Fixture Limpa
         control_fixture = tmp / "control_plane"
         control_fixture.mkdir()
-        for d in ("bin", "config", "contracts", "templates"):
+        for d in ("bin", "config", "contracts", "libexec", "templates"):
             if (ROOT / d).exists():
                 shutil.copytree(ROOT / d, control_fixture / d)
         if (ROOT / "README.md").exists():

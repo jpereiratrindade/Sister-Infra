@@ -166,7 +166,11 @@ O ciclo de vida TLS do LAB opera sob estrita separação de responsabilidades:
    Apenas o reconciliador (`sister-reconcile` / `sister-infra lab apply`) emite ou renova o certificado folha (`ecosystem-lab.pem`), derivando automaticamente os SANs dos hosts publicados no deployment resolvido, preservando inalterada a autoridade CA.
 
 4. **Consumo no Boot de Runtime**:
-   O cold-start do gateway (`sister-infra up`) opera exclusivamente como consumidor da autoridade existente. Ele nunca gera, renova ou rotaciona material TLS; caso o `TLS_PEM` necessário esteja ausente ou ilegível, o boot falha fechado imediatamente.
+   O cold-start do gateway opera pelo adapter privado de runtime. O comando
+   histórico `sister-infra up --profile lan` apenas encaminha para esse mesmo
+   mecanismo durante a migração. O boot consome a autoridade existente: nunca
+   gera, renova ou rotaciona material TLS; caso o `TLS_PEM` necessário esteja
+   ausente ou ilegível, falha fechado imediatamente.
 
 Além disso, mecanismos LAB não constituem substitutos arquiteturais para:
 

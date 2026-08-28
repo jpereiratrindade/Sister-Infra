@@ -31,7 +31,7 @@ CLI = ROOT / "bin" / "sister-workstation"
 def make_control_plane(workspace: Path) -> Path:
     target = workspace / "sister-infra"
     target.mkdir(parents=True)
-    for name in ("bin", "config", "contracts", "templates"):
+    for name in ("bin", "config", "contracts", "libexec", "templates"):
         shutil.copytree(ROOT / name, target / name)
     shutil.copy2(ROOT / "README.md", target / "README.md")
     git_init_commit(target)

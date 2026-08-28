@@ -194,7 +194,9 @@ EVIDENCE
 4. **Processo Gerenciado Parado**:
    - Reinicialização seletiva via entrypoint (`start` seguido de `health`) de participante da release corrente parado, desde que sua porta esteja livre e seu estado persistente íntegro.
 5. **Gateway Gerenciado Parado**:
-   - Inicialização do gateway HAProxy via `sister-infra up` quando parado, desde que sua porta esteja livre e sua autoridade TLS e configuração sejam válidas e íntegras.
+   - Inicialização do gateway HAProxy pelo adapter privado de runtime da release
+     quando parado, desde que sua porta esteja livre e sua autoridade TLS e
+     configuração sejam válidas e íntegras.
 
 ### 5.3 Salvaguardas Estritas de FAIL-CLOSED
 

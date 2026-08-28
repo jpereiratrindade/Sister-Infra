@@ -315,7 +315,7 @@ def main() -> None:
         # Control plane fixture com repositório git válido
         infra_src = workspace / "sister-infra"
         infra_src.mkdir(parents=True)
-        for d in ("bin", "config", "contracts", "templates"):
+        for d in ("bin", "config", "contracts", "libexec", "templates"):
             shutil.copytree(ROOT / d, infra_src / d)
         shutil.copy2(ROOT / "README.md", infra_src / "README.md")
         git_init_commit(infra_src)
