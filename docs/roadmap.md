@@ -337,23 +337,54 @@ Propriedades comprovadas e invariantes (PRD-001 a PRD-019):
 > **Fronteira Institucional de Autoridade (PRD-019)**:
 > A execução e implantação em servidores de produção reais permanece explicitamente **NÃO EXECUTADA E NÃO AUTORIZADA POR ESTA MISSÃO**. Toda a prova foi executada e validada em sandboxes herméticos nos 24 Gates de `tests/production_adapter_test.py`.
 
+### OPS-08 — End-to-End Lifecycle Automation
+
+**DONE**
+
+Materialização do controlador de ciclo de vida unificado e declarativo:
+
+```bash
+sister-infra lifecycle plan
+sister-infra lifecycle run
+sister-infra lifecycle status
+sister-infra lifecycle maintain
+sister-infra lifecycle evidence
+```
+
+Propriedades comprovadas e invariantes (Gates L1 a L25):
+- **Orquestração sem Duplicação (`REARIT-P002`)**: Zero reimplementação de compilação, qualificação, reconciliação, repair ou produção. O controlador delega integralmente para as capacidades existentes;
+- **Plan & Status Estritamente Read-Only**: `lifecycle plan` e `lifecycle status` observam o ecossistema com pureza absoluta, sem qualquer mutação de disco (Gates L1, L2);
+- **Fail-Closed em Quebra de Contrato**: Falha de compilação, teste de unidade, ausência de autoridade ou incompatibilidade de deployment bloqueiam o ciclo imediatamente, identificando o estágio falho (`FAILED_STAGE`) e a razão factual (Gates L4, L5, L13, L22);
+- **Preview DEV Isolado**: Preview em loopback sem tocar o runtime LAB (Gate L8);
+- **LAB Apply e Verify Mandatório**: Reconciliação automatizada com verify como gate obrigatório pós-apply (Gates L9, L10);
+- **Manutenção Reflexiva One-Shot (`REARIT-P001`)**: `lifecycle maintain` observa drift factual; se íntegro produz `NO_OP`; se divergente, planeja, executa `repair` mínimo e pós-verifica (Gates L11, L12);
+- **Promoção Formal (`WHAT WAS VERIFIED = WHAT IS PROMOTED`)**: A promoção avalia formalmente a identidade da candidata, pureza de fontes, evidências de qualificação e histórico de LAB, emitindo `promotion evidence` selada sem rebuilds silenciosos (Gates L14, L15);
+- **Produção Governada em Sandbox FHS**: Preflights de produção, plano com digest SHA-256 e aplicação transacional com rollback (Gates L16, L17, L18, L19);
+- **Cadeia de Evidências Rastreável (`REARIT-P004`)**: Genealogia operacional completa acessível via `lifecycle evidence` (Gate L20);
+- **Idempotência Operacional**: Reexecução consecutiva de qualquer estágio é 100% idempotente (Gate L21);
+- **Genericidade Estática (`REARIT-P003`)**: Zero conhecimento embutido de participantes (`urt`, `nexo`, etc.) ou portas fixas (Gate L23);
+- **Prova com Sistema Real Testemunha (URT)**: Prova real executada contra o repositório URT em sandbox efêmero com mutações sintéticas inofensivas, preservando 100% a árvore e branch originais do URT (Gate L24);
+- **Preservação Absoluta do Host**: O runtime de produção real (HAProxy 8443, PID 9488) permaneceu intocado (Gate L25).
+
 ## Visão de chegada
 
-A interface final desejada deve permitir que o operador pense em intenção, não
-em procedimentos mecânicos.
+A interface final desejada permite que o operador pense em intenção, não em procedimentos mecânicos:
 
 ```text
 DEV
-quero testar Atmos isoladamente
+quero testar URT isoladamente:
+sister-infra lifecycle run --target dev --component urt
 
 LAB
-quero que este seja meu ecossistema cotidiano
+quero que este seja meu ecossistema cotidiano:
+sister-infra lifecycle run --target lab
 
 PROD
-quero implantar este estado autorizado
+quero implantar este estado autorizado:
+sister-infra lifecycle run --target production
 ```
 
-O `sister-infra` deve então:
+O `sister-infra` então executa autonomamente:
 
 ```text
 observar

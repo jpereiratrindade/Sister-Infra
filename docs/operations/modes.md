@@ -214,7 +214,21 @@ rollback automático e travas de autoridade institucional.
 > A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
 > por esta missão (PRD-019). O adaptador e suas travas foram integralmente validados em sandbox.
 
-## 5. Comparação
+## 5. Lifecycle Automation (OPS-08)
+
+Orquestrador declarativo unificado de ciclo de vida (`bin/sister-lifecycle`):
+
+```bash
+sister-infra lifecycle plan [--target dev|lab|production]
+sister-infra lifecycle run [--target dev|lab|production]
+sister-infra lifecycle status
+sister-infra lifecycle maintain
+sister-infra lifecycle evidence
+```
+
+Regido por `ORCHESTRATION ≠ DUPLICATION` (`REARIT-P001..P005`), encadeia os modos DEV, LAB e PROD de ponta a ponta sem duplicar lógica de compilação ou reconciliação.
+
+## 6. Comparação
 
 | Modo | Intenção | Perturba LAB | Estado |
 |---|---|---:|---|
@@ -222,8 +236,9 @@ rollback automático e travas de autoridade institucional.
 | LAB plan | observar diferença | não | disponível, UX canônica (OPS-06) |
 | LAB apply | convergir incrementalmente | somente o necessário | disponível, UX canônica (OPS-03/OPS-04/OPS-06) |
 | PROD reconciliado | implantação governada sob autoridade | não | disponível (OPS-07, sandbox) |
+| Lifecycle End-to-End | automação declarativa unificada de ciclo de vida | somente se alvo for LAB | disponível (OPS-08) |
 
-## 6. Regra de autoridade
+## 7. Regra de autoridade
 
 Um modo operacional define não apenas *onde* executar uma operação, mas também
 *quais decisões aquela operação está autorizada a tomar*.

@@ -173,6 +173,20 @@ DNS passivo e portas livres) e layout FHS (`/opt/sister`, `/etc/sister`, `/var/l
 > A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
 > por esta missão (PRD-019). O adaptador foi comprovado integralmente em sandbox hermético.
 
+### 2.4 Lifecycle End-to-End (OPS-08)
+
+Orquestrador declarativo unificado de ciclo de vida:
+
+```bash
+./bin/sister-infra lifecycle plan [--target dev|lab|production]
+./bin/sister-infra lifecycle run [--target dev|lab|production]
+./bin/sister-infra lifecycle status
+./bin/sister-infra lifecycle maintain
+./bin/sister-infra lifecycle evidence
+```
+
+Orquestra todas as capacidades operacionais sob os princípios evolutivos (`REARIT-P001..P005` e `ORCHESTRATION ≠ DUPLICATION`), unificando o ciclo `SOURCE CHANGE → DISCOVER/QUALIFY → BUILD/TEST → CANDIDATE → DEV/PREVIEW → LAB PLAN → LAB APPLY → VERIFY → OBSERVE (drift -> REPAIR) → PROMOTION EVIDENCE → PRODUCTION PLAN → AUTHORITY GATE → PRODUCTION APPLY → VERIFY/EVIDENCE`.
+
 ---
 
 ## 3. Como adicionar um participante
