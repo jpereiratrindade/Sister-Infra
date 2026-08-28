@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import argparse
 import os
+from datetime import datetime, timezone
+import fcntl
+import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Any
 
 INFRA_ROOT = Path(__file__).resolve().parent.parent
 
@@ -101,19 +106,348 @@ def create_ephemeral_candidate(composition: Path, out_dir: Path) -> Path:
 
     return out_dir.resolve()
 
+def lab_config_root() -> Path:
+    return Path(
+        os.environ.get(
+            "SISTER_WORKSTATION_CONFIG_ROOT",
+            str(Path.home() / ".config" / "sister" / "workstation"),
+        )
+    ).expanduser().resolve()
+
+def lab_tls_dir() -> Path:
+    return lab_config_root() / "tls"
+
+def cleanup_abandoned_staging(config_root: Path) -> None:
+    if not config_root.is_dir():
+        return
+    for entry in config_root.iterdir():
+        if entry.is_dir() and entry.name.startswith(".tls-init-"):
+            try:
+                shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+
+def parse_openssl_date(date_str: str) -> datetime | None:
+    for fmt in (
+        "%b %d %H:%M:%S %Y GMT",
+        "%b  %d %H:%M:%S %Y GMT",
+        "%b %d %H:%M:%S %Y",
+        "%b  %d %H:%M:%S %Y",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+def get_ca_status(
+    tls_dir: Path,
+    ca_cert: Path,
+    ca_key: Path,
+    renew_before_sec: int = 2592000,
+) -> dict[str, Any]:
+    if not ca_cert.is_file() and not ca_key.is_file():
+        return {
+            "status": "ABSENT",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "detail": "arquivos de autoridade CA ausentes",
+        }
+    if not ca_cert.is_file() or not ca_key.is_file():
+        detail = (
+            "chave privada ausente"
+            if not ca_key.is_file()
+            else "certificado CA ausente"
+        )
+        return {
+            "status": "INVALID",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "detail": f"estado parcial: {detail}",
+        }
+
+    # 1. Parse do certificado
+    cmd = [
+        "openssl", "x509",
+        "-in", str(ca_cert),
+        "-noout",
+        "-subject", "-dates", "-fingerprint", "-sha256",
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res.returncode != 0:
+        return {
+            "status": "INVALID",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "detail": "certificado CA não parseável via openssl x509",
+        }
+
+    subject = ""
+    not_before_str = ""
+    not_after_str = ""
+    fingerprint = ""
+    for line in res.stdout.splitlines():
+        if line.startswith("subject="):
+            subject = line[len("subject="):].strip()
+        elif line.startswith("notBefore="):
+            not_before_str = line[len("notBefore="):].strip()
+        elif line.startswith("notAfter="):
+            not_after_str = line[len("notAfter="):].strip()
+        elif "Fingerprint=" in line:
+            fingerprint = line.split("Fingerprint=", 1)[1].strip()
+
+    # 2. Chave corresponde ao certificado
+    res1 = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-pubkey", "-noout"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    res2 = subprocess.run(["openssl", "pkey", "-in", str(ca_key), "-pubout"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res1.returncode != 0 or res2.returncode != 0 or not res1.stdout.strip() or res1.stdout.strip() != res2.stdout.strip():
+        return {
+            "status": "INVALID",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "subject": subject,
+            "fingerprint": fingerprint,
+            "detail": "chave privada incompatível com o certificado CA",
+        }
+
+    # 3. Extensões CA: basicConstraints deve conter CA:TRUE
+    res_ext = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-text"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if "CA:TRUE" not in res_ext.stdout:
+        return {
+            "status": "INVALID",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "subject": subject,
+            "fingerprint": fingerprint,
+            "detail": "certificado não possui basicConstraints CA:TRUE",
+        }
+
+    # 4. Validade e expiração
+    dt_end = parse_openssl_date(not_after_str)
+    dt_start = parse_openssl_date(not_before_str)
+    now = datetime.now(timezone.utc)
+
+    days_remaining = None
+    if dt_end:
+        days_remaining = int((dt_end - now).total_seconds() // 86400)
+
+    # Checa expiração via openssl -checkend 0
+    res_exp = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-checkend", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if res_exp.returncode != 0 or (days_remaining is not None and days_remaining <= 0):
+        return {
+            "status": "EXPIRED",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "subject": subject,
+            "fingerprint": fingerprint,
+            "not_before": dt_start.isoformat() if dt_start else not_before_str,
+            "not_after": dt_end.isoformat() if dt_end else not_after_str,
+            "days_remaining": days_remaining,
+            "detail": "CA expirada",
+        }
+
+    # Checa janela preventiva via openssl -checkend renew_before_sec
+    res_renew = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-checkend", str(renew_before_sec)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if res_renew.returncode != 0:
+        return {
+            "status": "EXPIRING",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "subject": subject,
+            "fingerprint": fingerprint,
+            "not_before": dt_start.isoformat() if dt_start else not_before_str,
+            "not_after": dt_end.isoformat() if dt_end else not_after_str,
+            "days_remaining": days_remaining,
+            "detail": f"CA na janela preventiva de renovação ({days_remaining} dias restantes)",
+        }
+
+    return {
+        "status": "VALID",
+        "ca_cert_path": str(ca_cert),
+        "ca_key_path": str(ca_key),
+        "subject": subject,
+        "fingerprint": fingerprint,
+        "not_before": dt_start.isoformat() if dt_start else not_before_str,
+        "not_after": dt_end.isoformat() if dt_end else not_after_str,
+        "days_remaining": days_remaining,
+        "detail": "CA válida e operacional",
+    }
+
+def cmd_tls_status(args: argparse.Namespace) -> int:
+    tls_dir = lab_tls_dir()
+    ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+    ca_key = tls_dir / "ecosystem-lab-ca.key"
+
+    status_info = get_ca_status(tls_dir, ca_cert, ca_key)
+
+    if args.json:
+        print(json.dumps(status_info, indent=2, sort_keys=True))
+    else:
+        st = status_info["status"]
+        if st == "ABSENT":
+            print(f"Status CA:       ABSENT ({status_info.get('detail')})")
+            print(f"Caminho esperado:{ca_cert}")
+        else:
+            print(f"Status CA:       {st}")
+            print(f"Certificado:     {status_info.get('ca_cert_path')}")
+            if "subject" in status_info and status_info["subject"]:
+                print(f"Subject:         {status_info['subject']}")
+            if "fingerprint" in status_info and status_info["fingerprint"]:
+                print(f"Fingerprint:     {status_info['fingerprint']}")
+            if "not_before" in status_info and status_info["not_before"]:
+                print(f"Válido desde:    {status_info['not_before']}")
+            if "not_after" in status_info and status_info["not_after"]:
+                print(f"Válido até:      {status_info['not_after']}")
+            if status_info.get("days_remaining") is not None:
+                print(f"Dias restantes:  {status_info['days_remaining']}")
+            if status_info.get("detail"):
+                print(f"Diagnóstico:     {status_info['detail']}")
+
+    return 0
+
+def cmd_tls_init_ca(args: argparse.Namespace) -> int:
+    config_root = lab_config_root()
+    tls_dir = config_root / "tls"
+    ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+    ca_key = tls_dir / "ecosystem-lab-ca.key"
+
+    config_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = config_root / ".lab-tls-authority.lock"
+
+    with open(lock_path, "a+") as lock_file:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # 1. TLSA-015: RE-OBSERVE autoridade obrigatoriamente sob o lock
+            status_info = get_ca_status(tls_dir, ca_cert, ca_key)
+            st = status_info["status"]
+
+            if st == "VALID":
+                payload = {
+                    "status": "NO_OP",
+                    "ca_cert_path": str(ca_cert),
+                    "fingerprint": status_info["fingerprint"],
+                    "subject": status_info["subject"],
+                    "message": "autoridade CA existente e válida",
+                }
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"[PASS] autoridade CA já existente e válida: {ca_cert} (NO_OP)")
+                return 0
+
+            if st != "ABSENT":
+                detail = status_info.get("detail", "material CA inconsistente")
+                raise LabUxError(
+                    f"init-ca recusado: autoridade existente em estado {st}: {detail} (FAIL-CLOSED)"
+                )
+
+            # 2. TLSA-017: CA ausente não autoriza substituir conteúdo preexistente de tls/
+            if tls_dir.exists():
+                entries = sorted([p.name for p in tls_dir.iterdir()])
+                if entries:
+                    raise LabUxError(
+                        f"init-ca recusado: diretório {tls_dir} já existe e não está vazio "
+                        f"(contém {len(entries)} entrada(s), ex: {entries[0]}). "
+                        "Nenhum conteúdo preexistente pode ser substituído implicitamente (FAIL-CLOSED)"
+                    )
+
+            # 3. TLSA-018: Limpeza segura de staging abandonado anterior (.tls-init-*) sob lock
+            cleanup_abandoned_staging(config_root)
+
+            # 4. TLSA-016: Geração do bundle inteiro em diretório staging irmão de tls/
+            staging_dir = Path(tempfile.mkdtemp(dir=config_root, prefix=".tls-init-"))
+            staging_dir.chmod(0o700)
+            staging_key = staging_dir / "ecosystem-lab-ca.key"
+            staging_crt = staging_dir / "ecosystem-lab-ca.crt"
+
+            try:
+                # 4a. Gera chave privada 4096-bit
+                res_key = subprocess.run(
+                    ["openssl", "genrsa", "-out", str(staging_key), "4096"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if res_key.returncode != 0:
+                    raise LabUxError(f"falha ao gerar chave privada da CA: {res_key.stderr.decode('utf-8', 'replace')}")
+                os.chmod(staging_key, 0o600)
+
+                # 4b. Gera certificado auto-assinado da CA
+                cmd_req = [
+                    "openssl", "req", "-x509", "-new", "-nodes",
+                    "-key", str(staging_key),
+                    "-sha256",
+                    "-days", "3650",
+                    "-subj", "/CN=SisTer Infra Lab CA",
+                    "-addext", "basicConstraints=critical,CA:TRUE",
+                    "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                    "-addext", "subjectKeyIdentifier=hash",
+                    "-out", str(staging_crt),
+                ]
+                res_req = subprocess.run(
+                    cmd_req,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if res_req.returncode != 0:
+                    raise LabUxError(f"falha ao gerar certificado da CA: {res_req.stderr.decode('utf-8', 'replace')}")
+                os.chmod(staging_crt, 0o644)
+
+                # 4c. Validação prévia completa do material em staging
+                staged_info = get_ca_status(staging_dir, staging_crt, staging_key)
+                if staged_info["status"] != "VALID":
+                    raise LabUxError(f"material CA em staging falhou na validação: {staged_info.get('detail')}")
+
+                # 4d. Publicação atômica do bundle em operação única (rename/replace do diretório)
+                os.replace(staging_dir, tls_dir)
+                os.chmod(tls_dir, 0o700)
+                os.chmod(tls_dir / "ecosystem-lab-ca.key", 0o600)
+                os.chmod(tls_dir / "ecosystem-lab-ca.crt", 0o644)
+
+            finally:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+            # 5. Re-observação final da autoridade publicada
+            final_info = get_ca_status(tls_dir, ca_cert, ca_key)
+            if final_info["status"] != "VALID":
+                raise LabUxError("autoridade CA publicada falhou na verificação final")
+
+            payload = {
+                "status": "CREATE",
+                "ca_cert_path": str(ca_cert),
+                "fingerprint": final_info["fingerprint"],
+                "subject": final_info["subject"],
+                "message": "autoridade CA de laboratório criada com sucesso",
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(f"[PASS] autoridade CA de laboratório criada: {ca_cert} (CREATE)")
+
+            return 0
+
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sister-infra lab",
-        description=(
-            "LAB control plane: usa declaração canônica quando "
-            "--desired-candidate/--desired-deployment são omitidos"
-        ),
+        prog="sister-lab",
+        description="Resolvedor de intenção canônica de LAB para a workstation.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     plan = sub.add_parser(
         "plan",
-        help="calcula o plano LAB; sem --desired-* deriva a intenção canônica",
+        help="projeta o plano de reconciliação para a intenção LAB",
     )
     plan.add_argument(
         "--desired-candidate",
@@ -173,6 +507,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="emite o resultado JSON do reconciliador",
     )
 
+    tls = sub.add_parser(
+        "tls",
+        help="gerenciamento de autoridade TLS do LAB",
+    )
+    tls_sub = tls.add_subparsers(dest="tls_command", required=True)
+
+    tls_status_p = tls_sub.add_parser(
+        "status",
+        help="inspeção estritamente observacional da autoridade CA de laboratório",
+    )
+    tls_status_p.add_argument(
+        "--json",
+        action="store_true",
+        help="emite o resultado em JSON puro",
+    )
+
+    tls_init_p = tls_sub.add_parser(
+        "init-ca",
+        help="inicializa a autoridade CA de laboratório em ambiente novo",
+    )
+    tls_init_p.add_argument(
+        "--json",
+        action="store_true",
+        help="emite o resultado em JSON puro",
+    )
+
     return parser
 
 def invoke_reconcile(
@@ -208,6 +568,14 @@ def invoke_reconcile(
     return proc.returncode
 
 def run(args: argparse.Namespace) -> int:
+    if args.command == "tls":
+        if args.tls_command == "status":
+            return cmd_tls_status(args)
+        elif args.tls_command == "init-ca":
+            return cmd_tls_init_ca(args)
+        else:
+            raise LabUxError(f"subcomando tls desconhecido: {args.tls_command}")
+
     canonical_composition, canonical_deployment = canonical_paths()
 
     explicit_candidate = None
