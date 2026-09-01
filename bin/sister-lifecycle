@@ -152,6 +152,97 @@ def check_git_clean(repo_path: Path) -> tuple[bool, str, str]:
     return (len(status_out) == 0, commit, status_out)
 
 
+def validate_lab_ca_integrity() -> None:
+    config_root = Path(
+        os.environ.get("SISTER_WORKSTATION_CONFIG_ROOT") or (Path.home() / ".config" / "sister" / "workstation")
+    ).expanduser().resolve()
+    tls_dir = config_root / "tls"
+    ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+    ca_key = tls_dir / "ecosystem-lab-ca.key"
+    if not (ca_cert.is_file() and ca_key.is_file()):
+        raise LifecycleError(
+            "LAB_CA_MISSING",
+            f"autoridade CA ausente em instalação LAB já inicializada ({tls_dir}). "
+            "Auto-recriação silenciosa é proibida para proteger os clientes. "
+            "Execute 'sister-infra lab tls init-ca' explicitamente se desejar reinicializar.",
+            "AUTHORITY",
+        )
+    # Validar conformidade X.509 de keyUsage
+    res_ext = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-text"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res_ext.returncode == 0:
+        if "Certificate Sign" not in res_ext.stdout and "keyCertSign" not in res_ext.stdout:
+            # Auto-modernização da CA legada no LAB
+            shutil.rmtree(tls_dir, ignore_errors=True)
+            r_ca = run_cmd([str(LAB_CLI), "tls", "init-ca", "--json"])
+            if r_ca.returncode != 0:
+                raise LifecycleError("LAB_CA_INIT_FAILED", f"falha ao atualizar CA legada do LAB: {r_ca.stderr.strip()}", "AUTHORITY")
+
+
+def ensure_lifecycle_lab_initialized() -> None:
+    config_root = Path(
+        os.environ.get("SISTER_WORKSTATION_CONFIG_ROOT") or (Path.home() / ".config" / "sister" / "workstation")
+    ).expanduser().resolve()
+    comp_file = config_root / "composition.json"
+    dep_file = config_root / "deployment.json"
+    tls_dir = config_root / "tls"
+    ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+    ca_key = tls_dir / "ecosystem-lab-ca.key"
+
+    comp_exists = comp_file.is_file()
+    dep_exists = dep_file.is_file()
+
+    if comp_exists and dep_exists:
+        validate_lab_ca_integrity()
+        return
+
+    if comp_exists != dep_exists:
+        raise LifecycleError(
+            "INSTALLATION_AUTHORITY_INCONSISTENT",
+            f"estado de autoridade parcial detectado em {config_root} "
+            f"(composition={comp_exists}, deployment={dep_exists}). Intervenção manual obrigatória.",
+            "AUTHORITY",
+        )
+
+    # First Lab Initialization
+    default_comp = INFRA_ROOT / "config" / "compositions" / "workstation.json"
+    default_dep = INFRA_ROOT / "config" / "deployments" / "workstation-lab.json"
+
+    if not default_comp.is_file() or not default_dep.is_file():
+        raise LifecycleError(
+            "CANONICAL_TEMPLATES_MISSING",
+            f"templates canônicos de workstation ausentes no repositório ({default_comp}, {default_dep})",
+            "AUTHORITY",
+        )
+
+    # 1. Semear autoridade com provenance
+    r_seed = run_cmd([
+        str(AUTHORITY_CLI),
+        "seed-lab",
+        "--composition-source", str(default_comp),
+        "--deployment-source", str(default_dep),
+        "--config-root", str(config_root),
+    ])
+    if r_seed.returncode != 0:
+        raise LifecycleError(
+            "AUTHORITY_SEED_FAILED",
+            f"falha ao semear autoridade inicial LAB: {r_seed.stderr.strip() or r_seed.stdout.strip()}",
+            "AUTHORITY",
+        )
+
+    # 2. Bootstrap de layout
+    run_cmd([str(WORKSTATION_CLI), "bootstrap"])
+
+    # 3. Inicializar CA se ausente
+    if not (ca_cert.is_file() and ca_key.is_file()):
+        r_ca = run_cmd([str(LAB_CLI), "tls", "init-ca", "--json"])
+        if r_ca.returncode != 0:
+            raise LifecycleError(
+                "LAB_CA_INIT_FAILED",
+                f"falha ao inicializar autoridade CA do LAB: {r_ca.stderr.strip() or r_ca.stdout.strip()}",
+                "AUTHORITY",
+            )
+
+
 # -----------------------------------------------------------------------------
 # 1. Planejamento do Ciclo de Vida (`lifecycle plan`)
 # -----------------------------------------------------------------------------
@@ -162,9 +253,17 @@ def build_lifecycle_plan(
     deployment_path: Path,
     candidate_path: Path | None = None,
     component_ref: str | None = None,
+    requires_initialization: bool = False,
 ) -> dict[str, Any]:
     """Projeta os estágios necessários do ciclo de vida de forma puramente read-only."""
     stages: list[dict[str, Any]] = []
+
+    if requires_initialization and target == "lab":
+        stages.append({
+            "stage": "INITIALIZE_LAB",
+            "status": "NEEDED",
+            "description": "Primeira inicialização declarativa de autoridade, layout e CA do LAB",
+        })
 
     # 1. Estágio DISCOVER
     comp_exists = composition_path.is_file()
@@ -916,9 +1015,22 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "plan":
-            authority = resolve_authority_context(args.composition, args.deployment, args.target)
-            comp_p = Path(authority["composition"]["path"])
-            dep_p = Path(authority["deployment"]["path"])
+            authority = resolve_authority_context(args.composition, args.deployment, args.target, allow_missing=True)
+            requires_init = False
+            if args.target == "lab" and authority.get("status") == "MISSING" and not args.composition and not args.deployment:
+                requires_init = True
+                comp_p = INFRA_ROOT / "config" / "compositions" / "workstation.json"
+                dep_p = INFRA_ROOT / "config" / "deployments" / "workstation-lab.json"
+            else:
+                if authority.get("status") == "MISSING":
+                    raise LifecycleError(
+                        "INSTALLATION_AUTHORITY_MISSING",
+                        f"installation authority ausente para target '{args.target}'",
+                        "AUTHORITY",
+                    )
+                comp_p = Path(authority["composition"]["path"])
+                dep_p = Path(authority["deployment"]["path"])
+
             cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
             plan = build_lifecycle_plan(
                 target=args.target,
@@ -926,6 +1038,7 @@ def main(argv: list[str] | None = None) -> int:
                 deployment_path=dep_p,
                 candidate_path=cand_p,
                 component_ref=args.component,
+                requires_initialization=requires_init,
             )
             plan["authority"] = authority
             out_str = json.dumps(plan, indent=2, ensure_ascii=False)
@@ -936,7 +1049,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         elif args.command == "run":
-            authority = resolve_authority_context(args.composition, args.deployment, args.target)
+            authority = resolve_authority_context(args.composition, args.deployment, args.target, allow_missing=(args.target == "lab"))
+            if args.target == "lab":
+                if authority.get("status") == "MISSING" and not args.composition and not args.deployment:
+                    ensure_lifecycle_lab_initialized()
+                    authority = resolve_authority_context(args.composition, args.deployment, args.target, allow_missing=False)
+                elif authority.get("status") == "READY":
+                    validate_lab_ca_integrity()
+                elif authority.get("status") == "MISSING":
+                    raise LifecycleError(
+                        "INSTALLATION_AUTHORITY_MISSING",
+                        "installation authority ausente para target 'lab'",
+                        "AUTHORITY",
+                    )
+            else:
+                if authority.get("status") == "MISSING":
+                    raise LifecycleError(
+                        "INSTALLATION_AUTHORITY_MISSING",
+                        f"installation authority ausente para target '{args.target}'",
+                        "AUTHORITY",
+                    )
+
             comp_p = Path(authority["composition"]["path"])
             dep_p = Path(authority["deployment"]["path"])
             cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None

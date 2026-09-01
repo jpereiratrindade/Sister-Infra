@@ -909,9 +909,12 @@ def check_ca_valid(ca_cert: Path, ca_key: Path, renew_before_sec: int = 2592000)
         text=True,
         check=False,
     )
-    if res1.returncode != 0 or res2.returncode != 0:
+    if res1.returncode != 0 or res2.returncode != 0 or res1.stdout.strip() != res2.stdout.strip() or not res1.stdout.strip():
         return False
-    return res1.stdout.strip() == res2.stdout.strip() and len(res1.stdout.strip()) > 0
+    res_ext = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-text"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if res_ext.returncode != 0 or "CA:TRUE" not in res_ext.stdout:
+        return False
+    return "Certificate Sign" in res_ext.stdout or "keyCertSign" in res_ext.stdout
 
 
 def get_cert_sans(tls_pem: Path) -> set[str]:
@@ -1231,10 +1234,8 @@ def resolve_projection_file_path(
         if (run_dir / "ecosystem_projection.tsv").is_file():
             return (run_dir / "ecosystem_projection.tsv").resolve()
 
-    raise ReconcileError(
-        "autoridade da ecosystem projection não pôde ser determinada: "
-        "defina SISTER_ECOSYSTEM_PROJECTION_FILE no ambiente ou configure runtime.env"
-    )
+    # 4. Canonical Workstation default
+    return (state_root / "run" / "ecosystem_projection.tsv").resolve()
 
 
 def render_ecosystem_projection(resolved_doc: dict[str, Any]) -> str:

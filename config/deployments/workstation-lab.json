@@ -63,6 +63,20 @@
       "gateway": {
         "host": "urt-gateway.test"
       }
+    },
+    {
+      "system_id": "sister_atmos",
+      "runtime": {
+        "transport": "tcp",
+        "listen": "127.0.0.1",
+        "port": 8095
+      },
+      "probe": {
+        "health_path": "/_sister/health"
+      },
+      "gateway": {
+        "host": "atmos-gateway.test"
+      }
     }
   ]
 }

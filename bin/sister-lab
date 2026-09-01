@@ -330,7 +330,7 @@ def get_ca_status(
             "detail": "chave privada incompatível com o certificado CA",
         }
 
-    # 3. Extensões CA: basicConstraints deve conter CA:TRUE
+    # 3. Extensões CA: basicConstraints deve conter CA:TRUE e keyUsage deve conter Certificate Sign / keyCertSign
     res_ext = subprocess.run(["openssl", "x509", "-in", str(ca_cert), "-noout", "-text"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if "CA:TRUE" not in res_ext.stdout:
         return {
@@ -340,6 +340,16 @@ def get_ca_status(
             "subject": subject,
             "fingerprint": fingerprint,
             "detail": "certificado não possui basicConstraints CA:TRUE",
+        }
+
+    if "Certificate Sign" not in res_ext.stdout and "keyCertSign" not in res_ext.stdout:
+        return {
+            "status": "INCOMPATIBLE",
+            "ca_cert_path": str(ca_cert),
+            "ca_key_path": str(ca_key),
+            "subject": subject,
+            "fingerprint": fingerprint,
+            "detail": "certificado CA legado: falta extensão X.509 keyUsage com Certificate Sign / keyCertSign (exigida por Python 3.12+ / OpenSSL moderno)",
         }
 
     # 4. Validade e expiração
@@ -728,6 +738,84 @@ def invoke_reconcile(
         sys.stdout.write(proc.stdout)
     return proc.returncode
 
+def ensure_lab_initialized_for_apply() -> None:
+    config_root = lab_config_root()
+    comp_file = config_root / "composition.json"
+    dep_file = config_root / "deployment.json"
+    tls_dir = lab_tls_dir()
+    ca_cert = tls_dir / "ecosystem-lab-ca.crt"
+    ca_key = tls_dir / "ecosystem-lab-ca.key"
+
+    comp_exists = comp_file.is_file()
+    dep_exists = dep_file.is_file()
+
+    if comp_exists and dep_exists:
+        if not (ca_cert.is_file() and ca_key.is_file()):
+            raise LabUxError(
+                f"LAB_CA_MISSING: autoridade CA ausente em instalação LAB já inicializada ({tls_dir}). "
+                "Auto-recriação silenciosa é proibida para proteger os clientes. "
+                "Execute 'sister-infra lab tls init-ca' explicitamente se desejar reinicializar."
+            )
+        ca_st = get_ca_status(tls_dir, ca_cert, ca_key)
+        if ca_st.get("status") == "INCOMPATIBLE":
+            # Auto-modernização assistida da CA legada incompatível no LAB
+            shutil.rmtree(tls_dir, ignore_errors=True)
+            cmd_tls_init_ca(argparse.Namespace(json=True, command="tls", tls_command="init-ca"))
+            return
+        elif ca_st.get("status") not in ("VALID", "EXPIRING"):
+            raise LabUxError(
+                f"LAB_CA_INVALID: autoridade CA inválida em instalação LAB já inicializada ({tls_dir}: {ca_st.get('detail')}). "
+                "Execute 'sister-infra lab tls init-ca' para reconfigurar."
+            )
+        return
+
+    if comp_exists != dep_exists:
+        raise LabUxError(
+            f"INSTALLATION_AUTHORITY_INCONSISTENT: estado de autoridade parcial detectado em {config_root} "
+            f"(composition={comp_exists}, deployment={dep_exists}). Intervenção manual obrigatória."
+        )
+
+    default_comp = INFRA_ROOT / "config" / "compositions" / "workstation.json"
+    default_dep = INFRA_ROOT / "config" / "deployments" / "workstation-lab.json"
+
+    if not default_comp.is_file() or not default_dep.is_file():
+        raise LabUxError(
+            f"Templates canônicos de workstation ausentes no repositório ({default_comp}, {default_dep})"
+        )
+
+    # 1. Semear autoridade com provenance
+    proc_seed = subprocess.run(
+        [
+            str(AUTHORITY_CLI),
+            "seed-lab",
+            "--composition-source", str(default_comp),
+            "--deployment-source", str(default_dep),
+            "--config-root", str(config_root),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc_seed.returncode != 0:
+        raise LabUxError(f"falha ao semear autoridade inicial LAB: {proc_seed.stderr.strip() or proc_seed.stdout.strip()}")
+
+    # 2. Bootstrap de layout
+    workstation_cli = INFRA_ROOT / "bin" / "sister-workstation"
+    if workstation_cli.is_file():
+        subprocess.run(
+            [str(workstation_cli), "bootstrap"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    # 3. Inicializar CA do LAB se ausente
+    if not (ca_cert.is_file() and ca_key.is_file()):
+        cmd_tls_init_ca(argparse.Namespace(json=True, command="tls", tls_command="init-ca"))
+
+
 def run(args: argparse.Namespace) -> int:
     if args.command == "tls":
         if args.tls_command == "status":
@@ -736,6 +824,9 @@ def run(args: argparse.Namespace) -> int:
             return cmd_tls_init_ca(args)
         else:
             raise LabUxError(f"subcomando tls desconhecido: {args.tls_command}")
+
+    if args.command == "apply" and not args.desired_candidate and not args.desired_deployment:
+        ensure_lab_initialized_for_apply()
 
     canonical_composition, canonical_deployment = canonical_paths()
 
