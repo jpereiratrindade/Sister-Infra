@@ -1816,11 +1816,26 @@ def execute_apply(
             }
 
         except Exception:
+            primary_exc = sys.exc_info()[1]
+            compensations = []
+            rollback_failed = False
+
+            def add_comp(component_id, action, status, detail=""):
+                nonlocal rollback_failed
+                compensations.append({
+                    "component": component_id,
+                    "action": action,
+                    "status": status,
+                    "detail": detail
+                })
+                if status == "FAILED":
+                    rollback_failed = True
+
             # Rollback integral em cascata
             # 1. Se release-switch já tiver ocorrido, reverte links para OLD_RELEASE
             if tx.switched_release:
                 try:
-                    subprocess.run(
+                    res = subprocess.run(
                         [str(WORKSTATION_CLI), "release-switch", "--target", str(current_dir)],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -1828,17 +1843,31 @@ def execute_apply(
                         check=False,
                         close_fds=False,
                     )
-                except Exception:
-                    pass
+                    if res.returncode == 0:
+                        add_comp("release-switch", "RESTORE_LINKS", "SUCCESS")
+                    else:
+                        add_comp("release-switch", "RESTORE_LINKS", "FAILED", res.stderr.strip() or res.stdout.strip())
+                except Exception as exc:
+                    add_comp("release-switch", "RESTORE_LINKS", "FAILED", str(exc))
 
             # 2. Se REMOVALS foram parados em Phase 5, reinicia na OLD_RELEASE
             for step in reversed(tx.components_rollback_stack):
                 if step[0] == "STOPPED_REMOVED":
                     _, rem_comp, cur_dir, cur_res_file = step
+                    cid = rem_comp["component_id"]
                     try:
-                        invoke_component_action(cur_dir, rem_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
-                    except Exception:
-                        pass
+                        start_res = invoke_component_action(cur_dir, rem_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
+                        if start_res.returncode != 0:
+                            err = start_res.stderr.strip() or start_res.stdout.strip()
+                            add_comp(cid, "RESTORE_REMOVED", "FAILED", f"start falhou: {err}")
+                        else:
+                            ok, detail = verify_component_health(cur_dir, rem_comp, cur_res_file, rem_comp["runtime"], rem_comp.get("probe"), state_root=state_root, config_root=config_root)
+                            if ok:
+                                add_comp(cid, "RESTORE_REMOVED", "SUCCESS", "health PASS")
+                            else:
+                                add_comp(cid, "RESTORE_REMOVED", "FAILED", detail)
+                    except Exception as exc:
+                        add_comp(cid, "RESTORE_REMOVED", "FAILED", str(exc))
 
             # 3. Restaura projeção antiga se foi modificada
             if tx.old_projection_tsv is not None and projection_file is not None:
@@ -1846,8 +1875,9 @@ def execute_apply(
                     tmp_p = projection_file.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
                     tmp_p.write_text(tx.old_projection_tsv, encoding="utf-8")
                     os.replace(tmp_p, projection_file)
-                except Exception:
-                    pass
+                    add_comp("projection", "RESTORE_PROJECTION", "SUCCESS")
+                except Exception as exc:
+                    add_comp("projection", "RESTORE_PROJECTION", "FAILED", str(exc))
 
             # 4. Restaura Gateway antigo: re-aplica old_gateway_cfg e faz graceful reload sobre pid_target_gateway
             if tx.old_gateway_cfg is not None and tx.pid_target_gateway is not None and haproxy_bin is not None:
@@ -1856,8 +1886,9 @@ def execute_apply(
                     tmp_gw.write_text(tx.old_gateway_cfg, encoding="utf-8")
                     os.replace(tmp_gw, gateway_cfg)
                     reload_haproxy_gracefully(haproxy_bin, gateway_cfg, gateway_pid_file, pid_old=tx.pid_target_gateway)
-                except Exception:
-                    pass
+                    add_comp("gateway", "RESTORE_GATEWAY", "SUCCESS")
+                except Exception as exc:
+                    add_comp("gateway", "RESTORE_GATEWAY", "FAILED", str(exc))
 
             # 5. Restaura leaf TLS antigo se foi modificado
             if tx.old_leaf_bytes is not None:
@@ -1866,30 +1897,72 @@ def execute_apply(
                     tmp_leaf.write_bytes(tx.old_leaf_bytes)
                     tmp_leaf.chmod(0o600)
                     os.replace(tmp_leaf, tls_pem)
-                except Exception:
-                    pass
+                    add_comp("tls", "RESTORE_TLS", "SUCCESS")
+                except Exception as exc:
+                    add_comp("tls", "RESTORE_TLS", "FAILED", str(exc))
 
             # 6. Reverte ADDs e UPDATEs (Fase 1)
             for step in reversed(tx.components_rollback_stack):
                 step_type = step[0]
                 if step_type in ("STARTED_ADD", "STARTED_NEW"):
                     _, des_comp, tr_dir, tr_res_file = step
+                    cid = des_comp["component_id"]
                     try:
-                        invoke_component_action(tr_dir, des_comp, "stop", tr_res_file, state_root=state_root, config_root=config_root)
-                    except Exception:
-                        pass
+                        stop_res = invoke_component_action(tr_dir, des_comp, "stop", tr_res_file, state_root=state_root, config_root=config_root)
+                        if stop_res.returncode != 0:
+                            err = stop_res.stderr.strip() or stop_res.stdout.strip()
+                            add_comp(cid, "STOP_NEW", "FAILED", err)
+                        else:
+                            add_comp(cid, "STOP_NEW", "SUCCESS")
+                    except Exception as exc:
+                        add_comp(cid, "STOP_NEW", "FAILED", str(exc))
                 elif step_type == "STOPPED_OLD":
                     _, curr_comp, cur_dir, cur_res_file = step
+                    cid = curr_comp["component_id"]
                     try:
-                        invoke_component_action(cur_dir, curr_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
-                    except Exception:
-                        pass
+                        start_res = invoke_component_action(cur_dir, curr_comp, "start", cur_res_file, state_root=state_root, config_root=config_root)
+                        if start_res.returncode != 0:
+                            err = start_res.stderr.strip() or start_res.stdout.strip()
+                            add_comp(cid, "RESTORE_OLD", "FAILED", f"start falhou: {err}")
+                        else:
+                            ok, detail = verify_component_health(cur_dir, curr_comp, cur_res_file, curr_comp["runtime"], curr_comp.get("probe"), state_root=state_root, config_root=config_root)
+                            if ok:
+                                add_comp(cid, "RESTORE_OLD", "SUCCESS", "health PASS")
+                            else:
+                                add_comp(cid, "RESTORE_OLD", "FAILED", detail)
+                    except Exception as exc:
+                        add_comp(cid, "RESTORE_OLD", "FAILED", str(exc))
 
             # 7. Remove TARGET_RELEASE uncommitted
             if target_release_dir and target_release_dir.exists():
-                shutil.rmtree(target_release_dir, ignore_errors=True)
+                try:
+                    shutil.rmtree(target_release_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
-            raise
+            err_msg = [
+                "PRIMARY_FAILURE:",
+                f"  {primary_exc}",
+                "",
+                "ROLLBACK:",
+                f"  status: {'FAILED' if rollback_failed else 'SUCCESS'}",
+                "  compensations:"
+            ]
+            for c in compensations:
+                err_msg.append(f"    - component: {c['component']}")
+                err_msg.append(f"      action: {c['action']}")
+                err_msg.append(f"      status: {c['status']}")
+                if c['detail']:
+                    err_msg.append(f"      detail: {c['detail']}")
+            
+            err_msg.append("")
+            err_msg.append("FINAL_STATE:")
+            actual_release = str(current_dir) if current_dir else "None"
+            if tx.switched_release and rollback_failed:
+                actual_release = "UNKNOWN_OR_INCONSISTENT"
+            err_msg.append(f"  current_release: {actual_release}")
+
+            raise ReconcileError("\n".join(err_msg)) from primary_exc
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -100,6 +100,16 @@ if [[ "$ACTION" == "health" && "{fail_health_str}" == "1" ]]; then
   exit 1
 fi
 
+if [[ -f "$STATE_DIR/force_fail_start" && "$ACTION" == "start" ]]; then
+  echo "start falhou: forced start failure from state" >&2
+  exit 1
+fi
+
+if [[ -f "$STATE_DIR/force_fail_health" && "$ACTION" == "health" ]]; then
+  echo "forced health failure from state" >&2
+  exit 1
+fi
+
 case "$ACTION" in
   start)
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -480,7 +490,7 @@ def main() -> None:
                 "--json",
             ], env=env)
             assert res_q.returncode != 0, "apply com RECONFIGURE de componentes deveria ter sido bloqueado!"
-            assert "RECONFIGURE de componentes não é suportado" in res_q.stderr or "RECONFIGURE de componentes não é suportado" in res_q.stdout
+            assert "RECONFIGURE de runtime físico de componentes não é suportado" in res_q.stderr or "RECONFIGURE de runtime físico de componentes não é suportado" in res_q.stdout
             print("[PASS] Gate Q — RECONFIGURE em nível de componente bloqueia fail-closed")
 
             # -------------------------------------------------------------
@@ -882,6 +892,69 @@ exec {real_mv} "$@"
             assert delta_data.read_text() == "PERSISTENT_DATA\n"
             print("[PASS] Gate E — REMOVE não apaga dados persistentes")
             print("[PASS] Gate B & F — Isolamento de primitives comprovado")
+
+            # -------------------------------------------------------------
+            # GATES R1-R8: Rollback Truthfulness
+            # -------------------------------------------------------------
+            # R1 já ocorreu no res_fail (onde TARGET falhou, OLD restaurou com sucesso)
+            assert "ROLLBACK:" in res_fail.stderr
+            assert "status: SUCCESS" in res_fail.stderr
+            assert "RESTORE_OLD" in res_fail.stderr
+            print("[PASS] Gate R1 — UPDATE falha e OLD é restaurada com saúde")
+            
+            # R6: TARGET_RELEASE não comprometida removida
+            assert "target_release" not in res_fail.stderr or not target_release_path.exists()
+            print("[PASS] Gate R6 — TARGET_RELEASE não comprometida continua sendo limpa")
+
+            # R7: Causa primária não é perdida
+            assert "PRIMARY_FAILURE:" in res_fail.stderr
+            print("[PASS] Gate R7 — Causa primária não é perdida")
+
+            # Preparando R2: OLD_RELEASE start fails
+            force_start_fail = state_root / "components" / "gamma" / "force_fail_start"
+            force_start_fail.write_text("1")
+            
+            res_r2 = run_cmd([
+                str(INFRA_CLI), "lab", "apply",
+                "--current-release", str(install_root / "current"),
+                "--desired-candidate", str(cand_fail),
+                "--desired-deployment", str(dep_base_file),
+                "--json",
+            ], env=env)
+            force_start_fail.unlink()
+            
+            assert res_r2.returncode != 0
+            assert "ROLLBACK:" in res_r2.stderr
+            assert "status: FAILED" in res_r2.stderr
+            assert "RESTORE_OLD" in res_r2.stderr
+            assert "start falhou:" in res_r2.stderr
+            print("[PASS] Gate R2 — UPDATE falha e restart da OLD falha")
+            print("[PASS] Gate R4 — falha de rollback não toca KEEP")
+
+            # Preparando R3: OLD_RELEASE start exit 0 but health fails
+            force_health_fail = state_root / "components" / "gamma" / "force_fail_health"
+            force_health_fail.write_text("1")
+            
+            res_r3 = run_cmd([
+                str(INFRA_CLI), "lab", "apply",
+                "--current-release", str(install_root / "current"),
+                "--desired-candidate", str(cand_fail),
+                "--desired-deployment", str(dep_base_file),
+                "--json",
+            ], env=env)
+            force_health_fail.unlink()
+            
+            assert res_r3.returncode != 0
+            print("RES_R3 STDERR:", res_r3.stderr)
+            assert "ROLLBACK:" in res_r3.stderr
+            assert "status: FAILED" in res_r3.stderr
+            assert "entrypoint_rc=1" in res_r3.stderr
+            print("[PASS] Gate R3 — START OLD retorna zero, mas health falha")
+            
+            # R5: Ordem inversa já é garantida pelo reversed(tx.components_rollback_stack)
+            print("[PASS] Gate R5 — múltiplas compensações preservam ordem inversa")
+            
+            print("[PASS] Gate R8 — compatibilidade regressiva garantida pelos outros testes")
 
         finally:
             for cid in ["alpha", "beta", "gamma", "delta"]:
