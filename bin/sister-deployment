@@ -157,6 +157,9 @@ def validate_bindings(
     tcp_endpoints: set[tuple[str, int]] = set()
     gateway_hosts: set[str] = set()
 
+    gw_config = deployment.get("gateway") or {}
+    base_domain = gw_config.get("domain") or gw_config.get("base_domain")
+
     for binding in deployment["bindings"]:
         system_id = binding["system_id"]
         if system_id in by_system:
@@ -166,6 +169,16 @@ def validate_bindings(
         if system_id not in expected:
             raise DeploymentError(f"binding desconhecido: {system_id}")
         by_system[system_id] = binding
+
+        if base_domain:
+            if binding.get("gateway") is not None or any(
+                k in binding for k in ("domain", "proxy", "certificate", "tls")
+            ):
+                raise DeploymentError(
+                    f"configuração inválida no binding '{system_id}': nenhum "
+                    "sistema integrado deve conter configuração própria de "
+                    "domínio, proxy ou certificado quando o domínio-base é declarado no gateway"
+                )
 
         runtime = binding["runtime"]
         if runtime["transport"] == "tcp":
@@ -177,14 +190,15 @@ def validate_bindings(
                 )
             tcp_endpoints.add(endpoint)
 
-        gateway = binding.get("gateway")
-        if gateway is not None:
-            normalized_host = gateway["host"].lower()
-            if normalized_host in gateway_hosts:
-                raise DeploymentError(
-                    f"gateway host duplicado: {gateway['host']}"
-                )
-            gateway_hosts.add(normalized_host)
+        if not base_domain:
+            gateway = binding.get("gateway")
+            if gateway is not None:
+                normalized_host = gateway["host"].lower()
+                if normalized_host in gateway_hosts:
+                    raise DeploymentError(
+                        f"gateway host duplicado: {gateway['host']}"
+                    )
+                gateway_hosts.add(normalized_host)
 
     missing = sorted(expected - by_system.keys())
     if missing:
@@ -256,6 +270,7 @@ def resolve(
     gateway_config = deployment.get("gateway") or {}
     default_protocol = gateway_config.get("protocol", "https")
     default_port = gateway_config.get("port", 8443)
+    base_domain = gateway_config.get("domain") or gateway_config.get("base_domain")
 
     bindings = validate_bindings(components, deployment)
     resolved_components = []
@@ -269,7 +284,21 @@ def resolve(
         }
         if "probe" in binding:
             resolved["probe"] = binding["probe"]
-        if "gateway" in binding:
+
+        if base_domain:
+            identity = component["component_id"].lower().replace("_", "-")
+            host = f"{identity}.{base_domain}"
+            if (default_protocol == "https" and default_port == 443) or (
+                default_protocol == "http" and default_port == 80
+            ):
+                public_url = f"{default_protocol}://{host}"
+            else:
+                public_url = f"{default_protocol}://{host}:{default_port}"
+            resolved["gateway"] = {
+                "host": host,
+                "public_url": public_url,
+            }
+        elif "gateway" in binding:
             gw = dict(binding["gateway"])
             host = gw["host"]
             if not gw.get("public_url"):

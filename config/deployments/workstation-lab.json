@@ -5,7 +5,8 @@
   "gateway": {
     "protocol": "https",
     "listen": "127.0.0.1",
-    "port": 8443
+    "port": 8443,
+    "domain": "lab.sister.local"
   },
   "bindings": [
     {
@@ -17,9 +18,6 @@
       },
       "probe": {
         "health_path": "/api/health"
-      },
-      "gateway": {
-        "host": "sister-gateway.test"
       }
     },
     {
@@ -31,9 +29,6 @@
       },
       "probe": {
         "health_path": "/api/health"
-      },
-      "gateway": {
-        "host": "nexo-gateway.test"
       }
     },
     {
@@ -45,9 +40,6 @@
       },
       "probe": {
         "health_path": "/health"
-      },
-      "gateway": {
-        "host": "praxis-gateway.test"
       }
     },
     {
@@ -59,9 +51,6 @@
       },
       "probe": {
         "health_path": "/_sister/health"
-      },
-      "gateway": {
-        "host": "urt-gateway.test"
       }
     },
     {
@@ -73,9 +62,6 @@
       },
       "probe": {
         "health_path": "/_sister/health"
-      },
-      "gateway": {
-        "host": "atmos-gateway.test"
       }
     }
   ]

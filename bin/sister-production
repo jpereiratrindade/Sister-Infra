@@ -622,13 +622,26 @@ def build_production_plan(
 
     # 4. Extrair bindings e hosts declarados
     declared_hosts = []
+    gw_config = deployment.get("gateway") or {}
+    base_domain = gw_config.get("domain") or gw_config.get("base_domain")
+    if base_domain:
+        for c in candidate_manifest.get("components", []):
+            cid = c.get("component_id", "")
+            if cid:
+                identity = cid.lower().replace("_", "-")
+                declared_hosts.append(f"{identity}.{base_domain}")
+    else:
+        for b in deployment.get("bindings", []):
+            gw = b.get("gateway", {})
+            host = gw.get("host")
+            if host:
+                declared_hosts.append(host)
+
     normalized_bindings = []
     for b in deployment.get("bindings", []):
         sys_id = b.get("system_id", "")
         gw = b.get("gateway", {})
         host = gw.get("host")
-        if host:
-            declared_hosts.append(host)
         rt = b.get("runtime", {})
         normalized_bindings.append({
             "system_id": sys_id,
