@@ -22,7 +22,9 @@ Produção **NÃO** introduz:
 
 > [!IMPORTANT]
 > **Fronteira Institucional de Autoridade (PRD-019)**:
-> Esta implementação fornece o adaptador de produção, as travas de autoridade e a suíte de testes em sandbox hermético. **A execução ou implantação em servidores de produção reais NÃO FOI EXECUTADA e NÃO É AUTORIZADA POR ESTA MISSÃO**. Qualquer implantação real exige processo formal independente e aprovação corporativa.
+> O caminho de produção real está implementado e é executável, mas continua condicionado
+> às aprovações explícitas do operador e da instituição. As suítes herméticas comprovam
+> o contrato do executor; não constituem registro de uma implantação institucional.
 
 ---
 
@@ -32,7 +34,7 @@ Produção **NÃO** introduz:
 | :--- | :--- |
 | **PRD-001** | `production plan` é estritamente **read-only** (zero mutações no filesystem, rede ou processos). |
 | **PRD-002** | `production apply` jamais executa sem um plano prévio materializado (`--plan <file>` e `--plan-digest <sha256>`). |
-| **PRD-003** | O plano aplicado deve ser rigorosamente idêntico ao plano aprovado (selado via digest criptográfico canônico). |
+| **PRD-003** | O plano aplicado e a árvore materializada completa da candidata devem ser rigorosamente idênticos aos aprovados (digests SHA-256 canônicos). |
 | **PRD-004** | Qualquer divergência factual entre o momento do plan e o momento do apply resulta em **fail-closed** imediato. |
 | **PRD-005** | TLS em produção é exclusivamente externo (`TLS_MODE=external`), fornecido pela autoridade institucional. |
 | **PRD-006** | Produção nunca gera, renova ou auto-rotaciona certificados. |
@@ -41,7 +43,7 @@ Produção **NÃO** introduz:
 | **PRD-009** | A candidata de produção deve estar plenamente qualificada antes da projeção do plano. |
 | **PRD-010** | DNS é passivo de verificação institucional de readiness (resolução esperada), jamais administrado pelo SisTer. |
 | **PRD-011** | Layout FHS institucional estrito (`/opt/sister`, `/etc/sister`, `/var/lib/sister`, `/run/sister`), isolável via sandbox (`SISTER_PRODUCTION_ROOT`). |
-| **PRD-012** | Gerenciador de serviços abstraído via adaptador plugável (`systemd` em produção real, `mock` em testes e sandboxes). |
+| **PRD-012** | Na raiz real, `systemd` é o padrão obrigatório e `SYSTEMD ACTIVE` é condição necessária para `PASS`; não existe fallback para processo direto ou estado interno. `mock` é restrito a testes e sandboxes explícitos. |
 | **PRD-013** | `production apply` é estritamente transacional, com rollback automático antes do commit point e comutação atômica de symlink. |
 | **PRD-014** | Toda mutação produz evidência de auditoria estruturada e sanitizada (isenta de chaves privadas e segredos). |
 | **PRD-015** | Execuções consecutivas sobre estado convergido produzem `NO_OP` com 0 ações. |
@@ -112,7 +114,9 @@ Exemplo de payload selado e digest emitido:
   "plan_digest": "sha256:4a8b79f0...",
   "candidate": {
     "candidate_id": "cand-datacenter-001",
-    "composition_id": "ecosystem_prod"
+    "composition_id": "ecosystem_prod",
+    "candidate_digest": "sha256:9d1d...",
+    "digest_algorithm": "sister.infra.candidate.tree/1+sha256"
   },
   "deployment": {
     "deployment_id": "prod-dc-01",
@@ -140,6 +144,8 @@ sister-infra production apply \
 O comando executa:
 1. **Verificação de Autoridade**: Valida variáveis e executa `PRODUCTION_GATE_CMD` (se configurado).
 2. **Conferência de Digest**: Compara o digest informado com o SHA-256 canônico do plano.
+   A identidade selada da candidata cobre a árvore materializada inteira e é
+   recalculada tanto na origem quanto após a cópia para staging.
 3. **Preflight Rigoroso**:
    - `check_clean_sources`: Control plane e componentes com árvores git 100% limpas.
    - `validate_external_tls`: Certificado institucional válido, data não-expirada, chave privada coincidente e cobertura de todas as SANs declaradas.
@@ -148,7 +154,8 @@ O comando executa:
 4. **Verificação de Divergência Factual**: Recalcula o plano contra o estado vivo instantâneo; se divergir do plano selado, aborta fail-closed imediatamente.
 5. **Transação Atômica**:
    - Materializa staging em `/opt/sister/releases/.creating-...`;
-   - Inicia ou atualiza serviços via `ServiceManagerAdapter`;
+   - Na raiz real, cria units e inicia serviços exclusivamente via `systemd`;
+   - Exige `systemctl is-active` para componentes e gateway, sem fallback direto;
    - Executa health probes de confirmação;
    - Se ocorrer falha: dispara rollback automático e restaura versão anterior;
    - Se sucesso: comuta atomicamente o symlink `/opt/sister/current` (commit point);
@@ -161,6 +168,10 @@ Inspeciona o estado atual dos serviços, links, certificados TLS e integridade F
 ```bash
 sister-infra production verify --json
 ```
+
+Um `PASS` real inclui `service_witness` com hostname, machine-id, boot-id e o
+estado `ACTIVE` de cada unit. Em `SISTER_PRODUCTION_ROOT` alternativo, a evidência
+declara `execution_mode: SANDBOX_TEST`; o perfil real declara `REAL_HOST`.
 
 ---
 

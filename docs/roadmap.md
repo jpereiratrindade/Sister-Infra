@@ -331,9 +331,11 @@ Propriedades comprovadas e invariantes (PRD-001 a PRD-019):
 - **Auditoria Sanitizada**: Geração de evidências auditáveis sem qualquer vazamento de segredos ou chaves privadas (PRD-014, PRD-007);
 - **Preservação Ontológica**: O modelo canônico (`component → composition → candidate → deployment → plan → reconcile`) e os ambientes LAB/Workstation permanecem intactos e intocados (PRD-017, PRD-018).
 
-> [!WARNING]
+> [!IMPORTANT]
 > **Fronteira Institucional de Autoridade (PRD-019)**:
-> A execução e implantação em servidores de produção reais permanece explicitamente **NÃO EXECUTADA E NÃO AUTORIZADA POR ESTA MISSÃO**. Toda a prova foi executada e validada em sandboxes herméticos nos 24 Gates de `tests/production_adapter_test.py`.
+> O executor de host real está disponível sob autorização explícita e `systemd`
+> fail-closed. Os 24 gates herméticos validam o adaptador sem alegar uma implantação
+> institucional específica; execuções reais produzem testemunho próprio do host.
 
 ### OPS-08 — End-to-End Lifecycle Automation
 
@@ -357,7 +359,7 @@ Propriedades comprovadas e invariantes (Gates L1 a L25):
 - **LAB Apply e Verify Mandatório**: Reconciliação automatizada com verify como gate obrigatório pós-apply (Gates L9, L10);
 - **Manutenção Reflexiva One-Shot (`REARIT-P001`)**: `lifecycle maintain` observa drift factual; se íntegro produz `NO_OP`; se divergente, planeja, executa `repair` mínimo e pós-verifica (Gates L11, L12);
 - **Promoção Formal (`WHAT WAS VERIFIED = WHAT IS PROMOTED`)**: A promoção avalia formalmente a identidade da candidata, pureza de fontes, evidências de qualificação e histórico de LAB, emitindo `promotion evidence` selada sem rebuilds silenciosos (Gates L14, L15);
-- **Produção Governada em Sandbox FHS**: Preflights de produção, plano com digest SHA-256 e aplicação transacional com rollback (Gates L16, L17, L18, L19);
+- **Produção Governada Fail-Closed**: Preflights, digest SHA-256 da árvore completa da candidata, plano selado, systemd real sem fallback e aplicação transacional com rollback (Gates L16, L17, L18, L19);
 - **Cadeia de Evidências Rastreável (`REARIT-P004`)**: Genealogia operacional completa acessível via `lifecycle evidence` (Gate L20);
 - **Idempotência Operacional**: Reexecução consecutiva de qualquer estágio é 100% idempotente (Gate L21);
 - **Genericidade Estática (`REARIT-P003`)**: Zero conhecimento embutido de participantes (`urt`, `nexo`, etc.) ou portas fixas (Gate L23);

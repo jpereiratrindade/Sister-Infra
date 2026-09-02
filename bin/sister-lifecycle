@@ -13,7 +13,6 @@ Genericidade estrita: zero conhecimento de participantes ou portas concretas.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -152,11 +151,13 @@ def get_lifecycle_state_roots() -> dict[str, Path]:
 
 
 def compute_candidate_digest(candidate_path: Path) -> str:
-    manifest_file = candidate_path / "manifest.json"
-    if manifest_file.is_file():
-        content = manifest_file.read_text(encoding="utf-8")
-        return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
-    return "unknown"
+    result = run_cmd([str(CANDIDATE_CLI), "digest", str(candidate_path), "--json"])
+    if result.returncode != 0:
+        return "unknown"
+    try:
+        return json.loads(result.stdout)["candidate_digest"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "unknown"
 
 
 def find_latest_lab_verified_candidate(roots: dict[str, Path]) -> dict[str, Any] | None:
@@ -170,7 +171,13 @@ def find_latest_lab_verified_candidate(roots: dict[str, Path]) -> dict[str, Any]
             doc = json.loads(f.read_text(encoding="utf-8"))
             if doc.get("status") == "PASS":
                 cand_path = doc.get("candidate_path")
-                if cand_path and Path(cand_path).is_dir():
+                candidate_digest = doc.get("candidate_digest")
+                if (
+                    cand_path
+                    and candidate_digest
+                    and Path(cand_path).is_dir()
+                    and compute_candidate_digest(Path(cand_path)) == candidate_digest
+                ):
                     verified_candidates.append(doc)
         except Exception:
             continue
@@ -415,7 +422,7 @@ def build_lifecycle_plan(
             stages.append({
                 "stage": "PRODUCTION_APPLY",
                 "status": "REQUIRES_AUTHORITY",
-                "description": "Aplicação produtiva governada e rollback transacional em sandbox",
+                "description": "Aplicação produtiva real via systemd, governada e com rollback transacional",
             })
 
     return {
@@ -501,15 +508,8 @@ def evaluate_promotion(
             try:
                 vdoc = json.loads(f.read_text(encoding="utf-8"))
                 if vdoc.get("status") == "PASS":
-                    match_id = vdoc.get("candidate_id") == candidate_id
                     match_digest = vdoc.get("candidate_digest") == cand_digest
-                    match_path = False
-                    if vdoc.get("candidate_path"):
-                        try:
-                            match_path = Path(vdoc["candidate_path"]).resolve() == candidate_path.resolve()
-                        except Exception:
-                            match_path = False
-                    if match_id or match_digest or match_path:
+                    if match_digest:
                         lab_verified = True
                         lab_ver_doc = vdoc
                         break
@@ -534,6 +534,7 @@ def evaluate_promotion(
         "candidate_id": candidate_id,
         "candidate_path": str(candidate_path.resolve()),
         "candidate_digest": cand_digest,
+        "candidate_digest_algorithm": "sister.infra.candidate.tree/1+sha256",
         "composition_id": candidate_manifest.get("composition", {}).get("composition_id"),
         "status": status,
         "reason": reason,
@@ -830,6 +831,7 @@ def execute_lifecycle_run(
                 "candidate_id": lab_cand_id,
                 "candidate_path": str(active_candidate.resolve()),
                 "candidate_digest": compute_candidate_digest(active_candidate),
+                "candidate_digest_algorithm": "sister.infra.candidate.tree/1+sha256",
                 "deployment_path": str(deployment_path.resolve()),
                 "deployment_id": json.loads(deployment_path.read_text(encoding="utf-8")).get("deployment_id", "lab"),
                 "status": "PASS",
@@ -880,7 +882,7 @@ def execute_lifecycle_run(
                 "plan_digest": digest,
             })
 
-            # 5.3 Production Apply (em sandbox)
+            # 5.3 Production Apply (executor real por padrão; mock só em sandbox/teste)
             stage_name = "PRODUCTION_APPLY"
             r_papply = run_cmd([
                 str(PRODUCTION_CLI),
@@ -967,7 +969,8 @@ def get_lifecycle_status() -> dict[str, Any]:
         promotion_status = "UNEVALUATED"
 
     # 5. Production Readiness
-    prod_status = "AVAILABLE_IN_SANDBOX"
+    prod_root = Path(os.environ.get("SISTER_PRODUCTION_ROOT", "/")).expanduser().resolve()
+    prod_status = "REAL_SYSTEMD_REQUIRED" if prod_root == Path("/") else "SANDBOX_TEST_READY"
 
     authorities = {
         target: resolve_authority_context(None, None, target, allow_missing=True)
@@ -997,7 +1000,7 @@ def get_lifecycle_status() -> dict[str, Any]:
             },
             "production": {
                 "status": prod_status,
-                "real_production": "NOT_EXECUTED_NOT_AUTHORIZED",
+                "executor": "systemd" if prod_root == Path("/") else "sandbox/mock eligible",
             },
         },
     }
@@ -1139,20 +1142,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "plan":
             authority = resolve_authority_context(args.composition, args.deployment, args.target, allow_missing=True)
-            requires_init = False
-            if args.target == "lab" and authority.get("status") == "MISSING" and not args.composition and not args.deployment:
-                requires_init = True
-                comp_p = INFRA_ROOT / "config" / "compositions" / "workstation.json"
-                dep_p = INFRA_ROOT / "config" / "deployments" / "workstation-lab.json"
-            else:
-                if authority.get("status") == "MISSING":
-                    raise LifecycleError(
-                        "INSTALLATION_AUTHORITY_MISSING",
-                        f"installation authority ausente para target '{args.target}'",
-                        "AUTHORITY",
-                    )
-                comp_p = Path(authority["composition"]["path"])
-                dep_p = Path(authority["deployment"]["path"])
+            if authority.get("status") == "MISSING":
+                raise LifecycleError(
+                    "INSTALLATION_AUTHORITY_MISSING",
+                    f"installation authority ausente para target '{args.target}'",
+                    "AUTHORITY",
+                )
+            comp_p = Path(authority["composition"]["path"])
+            dep_p = Path(authority["deployment"]["path"])
 
             cand_p = Path(args.candidate).expanduser().resolve() if args.candidate else None
             plan = build_lifecycle_plan(
@@ -1161,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
                 deployment_path=dep_p,
                 candidate_path=cand_p,
                 component_ref=args.component,
-                requires_initialization=requires_init,
+                requires_initialization=False,
             )
             plan["authority"] = authority
             out_str = json.dumps(plan, indent=2, ensure_ascii=False)

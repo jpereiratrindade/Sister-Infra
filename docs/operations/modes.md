@@ -160,7 +160,7 @@ efetivamente comprovadas:
 - atomic release switch (`release-switch`);
 - atomic ecosystem projection refresh (`tmp + rename(2)`);
 - graceful gateway reload (`-sf`) com rollback sobre processo ativo;
-- reconciliação controlada do leaf quando a publicação do gateway/SANs exigir, preservando a CA;
+- publicação HTTP por IP/portas na LAN, sem dependência de DNS ou CA;
 - probes de runtime e gateway independentes de proxy ambiental.
 
 Consultar `docs/roadmap.md` para o histórico e detalhes dos incrementos.
@@ -209,9 +209,10 @@ sister-infra production verify
 Suportado por FHS institucional, digest criptográfico selado, preflights rigorosos,
 rollback automático e travas de autoridade institucional.
 
-> [!WARNING]
-> A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
-> por esta missão (PRD-019). O adaptador e suas travas foram integralmente validados em sandbox.
+> [!IMPORTANT]
+> O executor real usa `systemd` por padrão e somente conclui com todas as units
+> factualmente `ACTIVE`. Uma raiz alternativa seleciona o perfil hermético; `mock`
+> é recusado na raiz real. A autorização de cada implantação permanece externa e explícita.
 
 ## 5. Lifecycle Automation (OPS-08)
 
@@ -234,8 +235,8 @@ Regido por `ORCHESTRATION ≠ DUPLICATION` (`REARIT-P001..P005`), encadeia os mo
 | DEV | testar componente isoladamente | não | disponível (OPS-05) |
 | LAB plan | observar diferença | não | disponível, UX canônica (OPS-06) |
 | LAB apply | convergir incrementalmente | somente o necessário | disponível, UX canônica (OPS-03/OPS-04/OPS-06) |
-| PROD reconciliado | implantação governada sob autoridade | não | disponível (OPS-07, sandbox) |
-| Lifecycle End-to-End | automação declarativa unificada de ciclo de vida | somente se alvo for LAB | disponível (OPS-08) |
+| PROD reconciliado | implantação real governada sob autoridade | não | disponível (OPS-07, systemd fail-closed) |
+| Lifecycle End-to-End | automação declarativa unificada de ciclo de vida | conforme o target explícito | disponível (OPS-08) |
 
 ## 7. Regra de autoridade
 

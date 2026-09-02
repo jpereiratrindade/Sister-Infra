@@ -7,19 +7,26 @@ física e como o gateway único reconcilia a exposição dos sistemas integrados
 A identidade pertence exclusivamente ao `.sister/component.json` de cada participante;
 por isso cada binding no deployment referencia apenas `system_id`.
 
-## 1. Exposição Declarativa por Domínio Único
+## 1. Exposição declarativa do gateway
 
-O contrato adota o princípio de **domínio-base único**:
-- O operador declara unicamente o domínio-base no bloco superior `gateway.domain`
-  (ex: `"domain": "lab.sister.local"` em LAB ou `"domain": "sister.institucional.gov.br"` em PRODUÇÃO).
-- Os sistemas integrados são descobertos automaticamente a partir da composição/candidata
-  e recebem subdomínios canônicos derivados diretamente de sua identidade:
+O contrato possui duas políticas explícitas, pertencentes ao deployment:
+
+- `gateway.exposure: "host"`: publicação por domínio, obrigatória em produção.
+  O operador declara `gateway.domain` e os sistemas recebem subdomínios
+  derivados da identidade:
+  - Os sistemas integrados são descobertos automaticamente a partir da composição/candidata
+  e recebem subdomínios canônicos:
   $$\text{host} = \text{component\_id} \cdot \text{domain}$$
-- O gateway único reconcilia automaticamente roteamento HAProxy, certificados TLS e DNS.
+- `gateway.exposure: "ip-ports"`: publicação LAB por HTTP no IP declarado em
+  `gateway.listen`; cada porta pública é derivada da porta física do binding.
+  Esse modo não usa DNS, SNI, certificado ou CA.
+
+Produção aceita somente `protocol=https` e `exposure=host`. O modo
+`ip-ports` é recusado fail-closed pela política produtiva.
 
 ### Invariante de Isolamento Estrito (FAIL-CLOSED)
 Nenhum sistema integrado deve conter configuração própria de domínio, proxy ou certificado.
-Quando `gateway.domain` está definido:
+Quando `gateway.domain` ou `gateway.exposure=ip-ports` está definido:
 - Qualquer tentativa de um binding declarar `gateway`, `host`, `domain`, `proxy`, `certificate` ou `tls`
   falha fechado imediatamente (`DeploymentError`).
 - Apenas bindings com parâmetros estritamente físicos de `runtime` e `probe` são aceitos.

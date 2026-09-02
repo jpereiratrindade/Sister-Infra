@@ -3,10 +3,9 @@
   "deployment_id": "workstation-lab",
   "composition_id": "workstation",
   "gateway": {
-    "protocol": "https",
-    "listen": "127.0.0.1",
-    "port": 8443,
-    "domain": "lab.sister.local"
+    "protocol": "http",
+    "listen": "10.163.80.176",
+    "exposure": "ip-ports"
   },
   "bindings": [
     {

@@ -81,7 +81,6 @@ load_profile() {
 runtime_preflight() {
   require_command curl
   require_command jq
-  require_command openssl
 
   if [[ -z "${SISTER_RESOLVED_DEPLOYMENT_FILE:-}" || ! -f "$SISTER_RESOLVED_DEPLOYMENT_FILE" ]]; then
     local current_link="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME/.local/share/sister}/current"
@@ -106,10 +105,17 @@ runtime_preflight() {
   local declared_addr declared_port
   declared_addr="$(jq -r '.gateway.listen // empty' "$resolved")"
   declared_port="$(jq -r '.gateway.port // empty' "$resolved")"
+  GATEWAY_PROTOCOL="$(jq -r '.gateway.protocol // "https"' "$resolved")"
+  GATEWAY_EXPOSURE="$(jq -r '.gateway.exposure // "host"' "$resolved")"
   GATEWAY_LISTEN_ADDRESS="${GATEWAY_LISTEN_ADDRESS:-$declared_addr}"
   GATEWAY_LISTEN_PORT="${GATEWAY_LISTEN_PORT:-$declared_port}"
   [[ -n "$GATEWAY_LISTEN_ADDRESS" ]] || die "gateway.listen ausente no deployment resolvido"
-  [[ -n "$GATEWAY_LISTEN_PORT" ]] || die "gateway.port ausente no deployment resolvido"
+  if [[ "$GATEWAY_EXPOSURE" != "ip-ports" ]]; then
+    [[ -n "$GATEWAY_LISTEN_PORT" ]] || die "gateway.port ausente no deployment resolvido"
+  fi
+  if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
+    require_command openssl
+  fi
 
   if [[ ! -x "$HAPROXY_BIN" ]]; then
     local detected
@@ -122,18 +128,22 @@ runtime_preflight() {
 }
 
 render_gateway() {
-  [[ -f "$TLS_PEM" ]] || die "TLS PEM ausente: $TLS_PEM"
+  if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
+    [[ -f "$TLS_PEM" ]] || die "TLS PEM ausente: $TLS_PEM"
+  fi
 
   local resolved="${SISTER_RESOLVED_DEPLOYMENT_FILE:-}"
   [[ -n "$resolved" && -f "$resolved" ]] || \
     die "deployment resolvido ausente; defina SISTER_RESOLVED_DEPLOYMENT_FILE"
 
-  "$INFRA_ROOT/bin/sister-gateway" render \
-    "$resolved" \
-    --listen-address "$GATEWAY_LISTEN_ADDRESS" \
-    --listen-port "$GATEWAY_LISTEN_PORT" \
-    --tls-pem "$TLS_PEM" \
-    > "$GATEWAY_CFG" || die "falha ao renderizar gateway declarativo"
+  local -a render_args=(
+    "$INFRA_ROOT/bin/sister-gateway" render
+    "$resolved"
+    --listen-address "$GATEWAY_LISTEN_ADDRESS"
+  )
+  [[ -n "$GATEWAY_LISTEN_PORT" ]] && render_args+=(--listen-port "$GATEWAY_LISTEN_PORT")
+  [[ "$GATEWAY_PROTOCOL" == "https" ]] && render_args+=(--tls-pem "$TLS_PEM")
+  "${render_args[@]}" > "$GATEWAY_CFG" || die "falha ao renderizar gateway declarativo"
 
   "$HAPROXY_BIN" -c -f "$GATEWAY_CFG" >/dev/null || \
     die "configuração HAProxy inválida"
@@ -228,32 +238,39 @@ verify_components() {
 verify_gateway_urls() {
   local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
   local -a cacert_args=()
-  if [[ -f "$CA_CERT" ]]; then
+  if [[ "$GATEWAY_PROTOCOL" == "https" && -f "$CA_CERT" ]]; then
     cacert_args=(--cacert "$CA_CERT")
   fi
 
-  local component_id host health_path
-  while IFS=$'\t' read -r component_id host health_path; do
+  local component_id host public_port health_path
+  while IFS=$'\t' read -r component_id host public_port health_path; do
     [[ -n "$component_id" ]] || continue
+    local port="$GATEWAY_LISTEN_PORT"
+    [[ "$GATEWAY_EXPOSURE" == "ip-ports" ]] && port="$public_port"
+    local -a resolve_args=()
+    if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
+      resolve_args=(--resolve "$host:$port:$GATEWAY_LISTEN_ADDRESS")
+    fi
     curl --noproxy '*' -fsS --max-time 5 \
-      "${cacert_args[@]}" \
-      --resolve "$host:$GATEWAY_LISTEN_PORT:$GATEWAY_LISTEN_ADDRESS" \
-      "https://$host:$GATEWAY_LISTEN_PORT$health_path" >/dev/null \
+      "${cacert_args[@]}" "${resolve_args[@]}" \
+      "$GATEWAY_PROTOCOL://$host:$port$health_path" >/dev/null \
       && pass "$component_id via gateway" \
       || die "$component_id não respondeu via gateway"
   done < <(
     jq -r '
       .components[]
       | select(.gateway != null and (.probe.health_path // "") != "")
-      | [.component_id, .gateway.host, .probe.health_path] | @tsv
+      | [.component_id, .gateway.host, (.gateway.port // ""), .probe.health_path] | @tsv
     ' "$resolved"
   )
 }
 
 cmd_up() {
   runtime_preflight
-  [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
-    die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
+    [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
+      die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  fi
   start_gateway
   if ! verify_components || ! verify_gateway_urls; then
     stop_gateway
@@ -277,8 +294,10 @@ cmd_status() {
 
 cmd_verify() {
   runtime_preflight
-  [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
-    die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
+    [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
+      die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
+  fi
   render_gateway
   verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"

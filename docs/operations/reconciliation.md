@@ -190,9 +190,9 @@ projection
 
 No plano, esses recursos possuem ações e `reason`s próprios.
 
-O certificado TLS leaf LAB não é uma ação independente do plano: sua
-reconciliação é transformação derivada durante `apply`, quando a publicação do
-gateway e o conjunto de hosts/SANs exigem reemissão.
+No deployment LAB institucional, o gateway usa HTTP/IP por portas e não
+materializa certificado. TLS continua pertencendo ao adapter produtivo e a
+fixtures explícitas que exercitam publicação por host.
 
 O LAB já comprova:
 
@@ -209,12 +209,11 @@ O LAB já comprova:
 - substituição atômica via arquivo temporário + `rename(2)`;
 - restauração atômica em rollback.
 
-### TLS leaf LAB
+### Isolamento LAB/PROD
 
-- reconciliação controlada quando SANs exigem;
-- preservação estrita de `CA_CERT` e `CA_KEY`;
-- rotação da CA fail-closed;
-- restauração do leaf anterior em rollback.
+- LAB `ip-ports`: HTTP por IP, sem DNS/CA, runtimes em loopback;
+- PROD `host`: HTTPS, DNS e TLS externo obrigatórios;
+- produção rejeita `protocol=http` e `exposure=ip-ports` fail-closed.
 
 ### Rollback integrado
 

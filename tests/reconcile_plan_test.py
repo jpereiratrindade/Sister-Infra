@@ -592,6 +592,34 @@ def main() -> None:
             print("[PASS] Hardening 1 — Projeção normalizada deriva REFRESH em alteração de runtime/gateway")
 
             # -------------------------------------------------------------
+            # Hardening 1b: gateway.listen global participa do diff
+            # -------------------------------------------------------------
+            dep_gateway_listener_file = tmp / "deployment_gateway_listener.json"
+            dep_gateway_listener = json.loads(dep_base_file.read_text(encoding="utf-8"))
+            dep_gateway_listener["gateway"]["listen"] = "192.0.2.44"
+            write_json(dep_gateway_listener_file, dep_gateway_listener)
+
+            res_gateway_listener = run_cmd([
+                sys.executable,
+                str(RECONCILE_CLI),
+                "plan",
+                "--current-release", str(release_current),
+                "--desired-candidate", str(cand_base),
+                "--desired-deployment", str(dep_gateway_listener_file),
+                "--no-probe-runtime",
+                "--json",
+            ])
+            assert res_gateway_listener.returncode == 0, res_gateway_listener.stderr
+            plan_gateway_listener = json.loads(res_gateway_listener.stdout)
+            assert all(
+                change["action"] == "KEEP"
+                for change in plan_gateway_listener["changes"]
+            )
+            assert plan_gateway_listener["gateway"]["action"] == "RECONFIGURE"
+            assert "listener" in plan_gateway_listener["gateway"]["reason"]
+            print("[PASS] Hardening 1b — alteração de gateway.listen exige RECONFIGURE")
+
+            # -------------------------------------------------------------
             # Hardening 2: Precedência de REPAIR (runtime down + binding novo -> RECONFIGURE, nunca REPAIR)
             # -------------------------------------------------------------
             port_beta_new = reserve_port()

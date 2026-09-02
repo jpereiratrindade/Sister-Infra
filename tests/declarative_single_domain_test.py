@@ -466,11 +466,15 @@ def main() -> None:
         print("[TEST] Gate 9 — Validação do deployment canônico workstation-lab.json...")
         repo_dep_file = ROOT / "config" / "deployments" / "workstation-lab.json"
         dep_content = json.loads(repo_dep_file.read_text(encoding="utf-8"))
-        assert dep_content.get("gateway", {}).get("domain") == "lab.sister.local"
+        repo_gateway = dep_content.get("gateway", {})
+        assert repo_gateway.get("protocol") == "http"
+        assert repo_gateway.get("exposure") == "ip-ports"
+        assert repo_gateway.get("listen") == "10.163.80.176"
+        assert "domain" not in repo_gateway
         assert "base_domain" not in dep_content.get("gateway", {}), "workstation-lab.json não deve conter o campo ambíguo 'base_domain'!"
         for b in dep_content.get("bindings", []):
             assert "gateway" not in b, f"Binding {b.get('system_id')} não deve conter gateway no deployment oficial!"
-        print("[PASS] Gate 9 — workstation-lab.json atende rigorosamente ao padrão canônico gateway.domain")
+        print("[PASS] Gate 9 — workstation-lab.json usa LAB HTTP/IP sem DNS ou CA")
 
     print("\n=====================================================================")
     print(" [SUCESSO] Todos os Gates de Exposição Declarativa Única passaram!")

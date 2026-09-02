@@ -159,6 +159,21 @@ def validate_bindings(
 
     gw_config = deployment.get("gateway") or {}
     domain = gw_config.get("domain")
+    exposure = gw_config.get("exposure", "host")
+
+    if exposure == "ip-ports":
+        if gw_config.get("protocol") != "http":
+            raise DeploymentError(
+                "gateway.exposure=ip-ports exige gateway.protocol=http"
+            )
+        if domain:
+            raise DeploymentError(
+                "gateway.exposure=ip-ports proíbe gateway.domain"
+            )
+        if not gw_config.get("listen"):
+            raise DeploymentError(
+                "gateway.exposure=ip-ports exige gateway.listen"
+            )
 
     for binding in deployment["bindings"]:
         system_id = binding["system_id"]
@@ -170,17 +185,21 @@ def validate_bindings(
             raise DeploymentError(f"binding desconhecido: {system_id}")
         by_system[system_id] = binding
 
-        if domain:
+        if domain or exposure == "ip-ports":
             if binding.get("gateway") is not None or any(
                 k in binding for k in ("domain", "proxy", "certificate", "tls")
             ):
                 raise DeploymentError(
                     f"configuração inválida no binding '{system_id}': nenhum "
                     "sistema integrado deve conter configuração própria de "
-                    "domínio, proxy ou certificado quando o gateway.domain é declarado"
+                    "domínio, proxy ou certificado quando a publicação é derivada pelo gateway"
                 )
 
         runtime = binding["runtime"]
+        if exposure == "ip-ports" and runtime["transport"] != "tcp":
+            raise DeploymentError(
+                "gateway.exposure=ip-ports exige runtime TCP para todos os participantes"
+            )
         if runtime["transport"] == "tcp":
             endpoint = (runtime["listen"], runtime["port"])
             if endpoint in tcp_endpoints:
@@ -190,7 +209,7 @@ def validate_bindings(
                 )
             tcp_endpoints.add(endpoint)
 
-        if not domain:
+        if not domain and exposure != "ip-ports":
             gateway = binding.get("gateway")
             if gateway is not None:
                 normalized_host = gateway["host"].lower()
@@ -271,6 +290,7 @@ def resolve(
     default_protocol = gateway_config.get("protocol", "https")
     default_port = gateway_config.get("port", 8443)
     domain = gateway_config.get("domain")
+    exposure = gateway_config.get("exposure", "host")
 
     bindings = validate_bindings(components, deployment)
     resolved_components = []
@@ -285,7 +305,15 @@ def resolve(
         if "probe" in binding:
             resolved["probe"] = binding["probe"]
 
-        if domain:
+        if exposure == "ip-ports":
+            public_port = binding["runtime"]["port"]
+            public_host = gateway_config["listen"]
+            resolved["gateway"] = {
+                "host": public_host,
+                "port": public_port,
+                "public_url": f"http://{public_host}:{public_port}",
+            }
+        elif domain:
             identity = component["component_id"].lower().replace("_", "-")
             host = f"{identity}.{domain}"
             if (default_protocol == "https" and default_port == 443) or (

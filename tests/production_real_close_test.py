@@ -17,10 +17,12 @@ Comprova as 5 condições obrigatórias do último quilômetro produtivo:
 =============================================================================
 """
 
+import atexit
 import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import socket
 import subprocess
@@ -80,6 +82,105 @@ def generate_self_signed_cert(cert_path: Path, key_path: Path, san_hosts: list[s
             os.unlink(cnf_path)
 
 
+def install_systemctl_witness(tmp: Path) -> Path:
+    """Install a hermetic systemctl witness; it never bypasses systemctl calls."""
+    bin_dir = tmp / "systemctl-witness-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(r'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+args = [arg for arg in sys.argv[1:] if arg != "--user"]
+command = args[0] if args else ""
+if os.environ.get("SISTER_SYSTEMD_WITNESS_FAIL") == "1":
+    print("injected systemd failure", file=sys.stderr)
+    raise SystemExit(1)
+if command == "daemon-reload":
+    raise SystemExit(0)
+
+unit = args[-1] if len(args) > 1 else ""
+unit_dir = Path(os.environ["SISTER_SYSTEMD_UNIT_DIR"])
+state_dir = Path(os.environ["SISTER_SYSTEMD_WITNESS_STATE"])
+state_dir.mkdir(parents=True, exist_ok=True)
+active = state_dir / unit
+
+def read_unit():
+    values = {}
+    environment = os.environ.copy()
+    for line in (unit_dir / unit).read_text(encoding="utf-8").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key == "Environment":
+            assignment = shlex.split(value)[0]
+            env_key, env_value = assignment.split("=", 1)
+            environment[env_key] = env_value
+        else:
+            values[key] = value
+    return values, environment
+
+if command == "start":
+    values, environment = read_unit()
+    result = subprocess.run(
+        shlex.split(values["ExecStart"]),
+        cwd=values.get("WorkingDirectory") or None,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stderr.buffer.write(result.stderr)
+        raise SystemExit(result.returncode)
+    active.touch()
+    raise SystemExit(0)
+
+if command == "stop":
+    values, environment = read_unit()
+    if values.get("ExecStop"):
+        subprocess.run(
+            shlex.split(values["ExecStop"]),
+            cwd=values.get("WorkingDirectory") or None,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    active.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+if command == "is-active":
+    raise SystemExit(0 if active.is_file() else 3)
+
+raise SystemExit(1)
+''', encoding="utf-8")
+    systemctl.chmod(0o755)
+    return bin_dir
+
+
+def terminate_fixture_processes(tmp: Path) -> None:
+    process_list = subprocess.run(
+        ["ps", "-eo", "pid=,args="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    marker = str(tmp)
+    for line in process_list.stdout.splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if len(fields) != 2 or marker not in fields[1]:
+            continue
+        try:
+            os.kill(int(fields[0]), 9)
+        except (OSError, ValueError):
+            pass
+
+
 def main() -> None:
     print("=====================================================================")
     print(" SUÍTE: Fechamento do Production Real (PRODUCTION-REAL-CLOSE)")
@@ -87,6 +188,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="sister-prc-") as tmp_dir:
         tmp = Path(tmp_dir)
+        atexit.register(terminate_fixture_processes, tmp)
 
         # Configurar ambiente hermético
         state_root = tmp / "state"
@@ -95,6 +197,7 @@ def main() -> None:
         fhs_root.mkdir(parents=True, exist_ok=True)
         unit_dir = fhs_root / "etc" / "systemd"
         unit_dir.mkdir(parents=True, exist_ok=True)
+        systemctl_bin = install_systemctl_witness(tmp)
 
         install_root = tmp / "workstation_install"
         install_root.mkdir(parents=True, exist_ok=True)
@@ -126,6 +229,8 @@ def main() -> None:
             "SISTER_WORKSTATION_CONFIG_ROOT": str(tmp / "workstation_config"),
             "SISTER_WORKSTATION_CONTRACTS_ROOT": str(contracts_dir),
             "SISTER_CONTRACT_ROOT": str(contracts_dir),
+            "SISTER_SYSTEMD_WITNESS_STATE": str(tmp / "systemctl-witness-state"),
+            "PATH": f"{systemctl_bin}:{os.environ.get('PATH', '')}",
         }
 
         # -------------------------------------------------------------------
@@ -463,12 +568,50 @@ esac
             "--json",
         ], env=env_base)
         assert res_prom.returncode == 0, f"falha ao gerar plano de produção com candidata de LAB: {res_prom.stderr}"
+        tamper_file = Path(cand_path_str) / "components" / "alpha" / "UNSEALED-TAMPER"
+        tamper_file.write_text("must change the candidate tree digest\n", encoding="utf-8")
+        res_tampered = run_cmd([
+            sys.executable, str(LIFECYCLE_CLI), "run",
+            "--target", "production",
+            "--composition", str(composition_file),
+            "--deployment", str(dep_prod_file),
+            "--candidate", cand_path_str,
+            "--json",
+        ], env=dict(env_base, PRODUCTION_APPROVED="YES", SISTER_INFRA_PRODUCTION_CONFIRM="YES"))
+        tamper_file.unlink()
+        assert res_tampered.returncode != 0, "mutação fora do manifesto deve invalidar a promoção"
+        assert "PROMOTION_BLOCKED" in (res_tampered.stdout + res_tampered.stderr)
         print("[PASS] Gate PRC-4 — Candidata verificada em LAB elegível para promoção institucional")
 
         # -------------------------------------------------------------------
         # GATE PRC-5: SystemdServiceManager determinístico
         # -------------------------------------------------------------------
         print("[TEST] Gate PRC-5 — SystemdServiceManager gera units determinísticas fiéis aos contratos...")
+        production_module = runpy.run_path(str(PRODUCTION_CLI))
+        resolve_manager = production_module["resolve_service_manager_type"]
+        production_error = production_module["ProductionError"]
+        manager_env = {
+            key: os.environ.get(key)
+            for key in ("SISTER_PRODUCTION_SERVICE_MANAGER", "SISTER_PRODUCTION_TEST_MODE")
+        }
+        try:
+            os.environ.pop("SISTER_PRODUCTION_SERVICE_MANAGER", None)
+            os.environ.pop("SISTER_PRODUCTION_TEST_MODE", None)
+            assert resolve_manager({"root": Path("/")}) == "systemd"
+            assert resolve_manager({"root": tmp / "explicit-sandbox"}) == "mock"
+            os.environ["SISTER_PRODUCTION_SERVICE_MANAGER"] = "mock"
+            try:
+                resolve_manager({"root": Path("/")})
+                raise AssertionError("mock não pode ser selecionado na raiz produtiva real")
+            except production_error as exc:
+                assert exc.code == "MOCK_FORBIDDEN_IN_REAL_PRODUCTION"
+        finally:
+            for key, value in manager_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
         # Executar produção com SystemdServiceManager em sandbox
         env_prod = dict(
             env_base,
@@ -481,6 +624,19 @@ esac
             PRODUCTION_TLS_CERT=str(cert_path),
             PRODUCTION_TLS_KEY=str(key_path),
         )
+
+        res_systemd_failure = run_cmd([
+            sys.executable, str(LIFECYCLE_CLI), "run",
+            "--target", "production",
+            "--composition", str(composition_file),
+            "--deployment", str(dep_prod_file),
+            "--json",
+        ], env=dict(env_prod, SISTER_SYSTEMD_WITNESS_FAIL="1"))
+        assert res_systemd_failure.returncode != 0, "falha de systemctl deve bloquear a implantação"
+        assert "systemd daemon-reload falhou" in (res_systemd_failure.stdout + res_systemd_failure.stderr)
+        for port in (port_prod_alpha, port_prod_beta):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                assert sock.connect_ex(("127.0.0.1", port)) != 0, "fallback direto iniciou processo produtivo"
 
         res_prod_apply = run_cmd([
             sys.executable, str(LIFECYCLE_CLI), "run",
@@ -588,6 +744,7 @@ esac
             SISTER_WORKSTATION_CONFIG_ROOT=str(e2e_config),
             SISTER_PRODUCTION_ROOT=str(e2e_fhs),
             SISTER_SYSTEMD_UNIT_DIR=str(e2e_unit_dir),
+            SISTER_SYSTEMD_WITNESS_STATE=str(e2e_dir / "systemctl-witness-state"),
         )
 
         # Inicializar CA no config do e2e
@@ -669,6 +826,14 @@ esac
 
         assert cand_prod_e2e == cand_e2e, f"Produção deve ter promovido exatamente a candidata do LAB ({cand_e2e} == {cand_prod_e2e})"
         print("[PASS] Gate PRC-9 — Ciclo fim a fim executado com sucesso: a MESMA candidata verificada em LAB foi promovida para Produção!")
+
+        # Encerrar daemons materializados pelas fixtures herméticas.
+        for pid_file in tmp.rglob("*.pid"):
+            try:
+                os.kill(int(pid_file.read_text(encoding="utf-8").strip()), 9)
+            except (OSError, ValueError):
+                pass
+        terminate_fixture_processes(tmp)
 
     print("\n=====================================================================")
     print(" [SUCESSO] Todos os 9 Gates de PRODUCTION-REAL-CLOSE passaram!")

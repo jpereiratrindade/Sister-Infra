@@ -64,6 +64,7 @@ def published_components(
 ) -> list[dict[str, str]]:
     published = []
     seen_hosts: set[str] = set()
+    exposure = (document.get("gateway") or {}).get("exposure", "host")
 
     for index, component in enumerate(document["components"]):
         if not isinstance(component, dict):
@@ -87,7 +88,7 @@ def published_components(
         if not isinstance(host, str) or not SAFE_HOST.fullmatch(host):
             raise GatewayError(f"gateway host inseguro para {component_id}")
         normalized_host = host.lower()
-        if normalized_host in seen_hosts:
+        if exposure != "ip-ports" and normalized_host in seen_hosts:
             raise GatewayError(f"gateway host duplicado: {host}")
         seen_hosts.add(normalized_host)
 
@@ -130,6 +131,7 @@ def published_components(
                 "acl": f"published_{index}",
                 "backend": f"component_{index}_{component_id}",
                 "host": normalized_host,
+                "port": gateway.get("port"),
                 "health_path": health_path,
                 "server": server,
             }
@@ -148,20 +150,19 @@ def safe_global(value: str, label: str) -> str:
 def render(
     document: dict[str, Any],
     listen_address: str,
-    listen_port: int,
-    tls_pem: str,
+    listen_port: int | None,
+    tls_pem: str | None,
 ) -> str:
     listen = validate_listen(listen_address)
-    if not 1 <= listen_port <= 65535:
-        raise GatewayError("porta global do gateway inválida")
-    certificate = safe_global(tls_pem, "path TLS")
+    gateway = document.get("gateway") or {}
+    protocol = gateway.get("protocol", "https")
+    exposure = gateway.get("exposure", "host")
     components = published_components(document)
 
     lines = [
         "global",
         "    log stdout format raw local0",
         "    maxconn 512",
-        "    ssl-default-bind-options ssl-min-ver TLSv1.2",
         "",
         "defaults",
         "    mode http",
@@ -173,9 +174,12 @@ def render(
         "    timeout client 30s",
         "    timeout server 30s",
         "    timeout http-request 10s",
-        "",
-        "frontend ecosystem_https",
-        f"    bind {listen}:{listen_port} ssl crt {certificate}",
+    ]
+
+    if protocol == "https":
+        lines.insert(3, "    ssl-default-bind-options ssl-min-ver TLSv1.2")
+
+    forwarded_headers = [
         "    http-request del-header Forwarded",
         "    http-request del-header X-Forwarded-For",
         "    http-request del-header X-Forwarded-Host",
@@ -184,29 +188,60 @@ def render(
         "    http-request del-header X-Sister-Email",
         "    http-request del-header X-Sister-Role",
         "    http-request del-header X-Sister-Capabilities",
-        "    http-request set-header X-Forwarded-Proto https",
+        f"    http-request set-header X-Forwarded-Proto {protocol}",
         "    http-request set-header X-Forwarded-Host %[req.hdr(host)]",
     ]
 
-    for component in components:
-        lines.append(
-            f"    acl {component['acl']} hdr(host),lower -i "
-            f"{component['host']} {component['host']}:{listen_port}"
-        )
-
-    allowed = " or ".join(component["acl"] for component in components)
-    if allowed:
-        lines.append(
-            f"    http-request deny deny_status 421 unless {allowed}"
-        )
+    if exposure == "ip-ports":
+        if protocol != "http":
+            raise GatewayError("gateway.exposure=ip-ports exige protocolo http")
+        seen_ports: set[int] = set()
+        for component in components:
+            port = component.get("port")
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                raise GatewayError(
+                    f"porta pública inválida para {component['backend']}: {port!r}"
+                )
+            if port in seen_ports:
+                raise GatewayError(f"porta pública duplicada no gateway: {port}")
+            seen_ports.add(port)
+            lines.extend([
+                "",
+                f"frontend {component['backend']}_http",
+                f"    bind {listen}:{port}",
+                *forwarded_headers,
+                f"    default_backend {component['backend']}",
+            ])
     else:
-        lines.append("    http-request deny deny_status 421")
+        if not isinstance(listen_port, int) or isinstance(listen_port, bool) or not 1 <= listen_port <= 65535:
+            raise GatewayError("porta global do gateway inválida")
+        bind = f"    bind {listen}:{listen_port}"
+        if protocol == "https":
+            certificate = safe_global(tls_pem, "path TLS")
+            bind += f" ssl crt {certificate}"
+        elif protocol != "http":
+            raise GatewayError(f"protocolo de gateway não suportado: {protocol!r}")
+        lines.extend(["", f"frontend ecosystem_{protocol}", bind, *forwarded_headers])
 
-    for component in components:
-        lines.append(
-            f"    use_backend {component['backend']} "
-            f"if {component['acl']}"
-        )
+        for component in components:
+            lines.append(
+                f"    acl {component['acl']} hdr(host),lower -i "
+                f"{component['host']} {component['host']}:{listen_port}"
+            )
+
+        allowed = " or ".join(component["acl"] for component in components)
+        if allowed:
+            lines.append(
+                f"    http-request deny deny_status 421 unless {allowed}"
+            )
+        else:
+            lines.append("    http-request deny deny_status 421")
+
+        for component in components:
+            lines.append(
+                f"    use_backend {component['backend']} "
+                f"if {component['acl']}"
+            )
 
     for component in components:
         lines.extend(
@@ -231,8 +266,8 @@ def parser() -> argparse.ArgumentParser:
     render_parser = subcommands.add_parser("render")
     render_parser.add_argument("resolved_deployment")
     render_parser.add_argument("--listen-address", required=True)
-    render_parser.add_argument("--listen-port", required=True, type=int)
-    render_parser.add_argument("--tls-pem", required=True)
+    render_parser.add_argument("--listen-port", type=int)
+    render_parser.add_argument("--tls-pem")
     return result
 
 

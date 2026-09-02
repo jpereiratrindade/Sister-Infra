@@ -129,58 +129,33 @@ LAN / cliente
 A publicação externa é responsabilidade do deployment/gateway e não dos
 componentes individualmente.
 
-## 7. DNS e TLS de laboratório
+Na instalação LAB institucional, o HAProxy publica frontends HTTP na interface
+`10.163.80.176`, usando uma porta por participante. Os endpoints reais
+permanecem restritos a `127.0.0.1` e não são expostos diretamente.
 
-Subdomínios derivados sob `gateway.domain` (como `<component_id>.lab.sister.local`), CA privada de laboratório e certificados leaf dedicados
-são ferramentas de desenvolvimento e validação do ambiente LAB.
+## 7. Acesso LAB por IP, sem DNS ou CA
 
-Eles são resolvidos e roteados no escopo do gateway LAB local (via SNI e
-cabeçalho `Host`). A resolução desses nomes nos clientes da LAN é provida
-pelo comando declarativo `sister-infra workstation hosts-line` (ou configuração de DNS
-local), mantendo a autoridade no gateway e desacoplada do runtime individual dos participantes.
+O deployment institucional usa `gateway.protocol=http` e
+`gateway.exposure=ip-ports`. O acesso do operador é direto:
 
-### 7.1 Modelo de Autoridade TLS Convergida (OPS-07A2)
+```text
+http://10.163.80.176:8000  Sister
+http://10.163.80.176:8015  Nexo
+http://10.163.80.176:8093  Praxis
+http://10.163.80.176:8094  URT
+http://10.163.80.176:8095  Atmos
+```
 
-O ciclo de vida TLS do LAB opera sob estrita separação de responsabilidades:
+Não há configuração de `/etc/hosts`, DNS, SNI, certificado leaf ou CA no
+caminho operacional do LAB. O gateway continua sendo a única fronteira LAN;
+os processos dos participantes não mudam seu binding de loopback.
 
-1. **Autoridade CA (Administração Explícita)**:
-   A autoridade CA do laboratório é inspecionada e inicializada explicitamente via CLI:
-   ```bash
-   sister-infra lab tls status [--json]
-   sister-infra lab tls init-ca [--json]
-   ```
-   - O comando `status` é estritamente observacional (read-only em qualquer estado).
-   - O comando `init-ca` cria a CA raiz (`ecosystem-lab-ca.crt` e `ecosystem-lab-ca.key`) sob lock de processo (`fcntl.flock`), com publicação atômica do diretório inteiro e permissões seguras (`0700/0600/0644`). É idempotente (`NO_OP`) sobre CA válida e falha fechado (`FAIL-CLOSED`) sobre divergências ou conteúdo preexistente em `tls/`.
+Os comandos históricos `lab tls status/init-ca` permanecem apenas para
+compatibilidade e testes específicos de TLS. Eles não são precondição de
+`lab plan`, `lab apply`, cold-start, repair ou verify no deployment ip-ports.
 
-2. **Localização Canônica da Autoridade**:
-   A única fonte autoritativa de TLS no LAB reside na configuração da workstation:
-   ```text
-   ~/.config/sister/workstation/tls/
-   ├── ecosystem-lab-ca.crt
-   ├── ecosystem-lab-ca.key
-   └── ecosystem-lab.pem
-   ```
-   O diretório `<repo>/secrets/` não é autoridade, fallback nem destino operacional.
-
-3. **Emissão e Reconciliação do Leaf**:
-   Apenas o reconciliador (`sister-reconcile` / `sister-infra lab apply`) emite ou renova o certificado folha (`ecosystem-lab.pem`), derivando automaticamente os SANs dos hosts publicados no deployment resolvido, preservando inalterada a autoridade CA.
-
-4. **Consumo no Boot de Runtime**:
-   O cold-start do gateway opera pelo adapter privado de runtime. O comando
-   histórico `sister-infra up --profile lan` apenas encaminha para esse mesmo
-   mecanismo durante a migração. O boot consome a autoridade existente: nunca
-   gera, renova ou rotaciona material TLS; caso o `TLS_PEM` necessário esteja
-   ausente ou ilegível, falha fechado imediatamente.
-
-Além disso, mecanismos LAB não constituem substitutos arquiteturais para:
-
-- DNS real;
-- certificados publicamente confiáveis;
-- domínio produtivo;
-- políticas produtivas de credenciais.
-
-Produção deve materializar a mesma intenção declarativa por mecanismos
-apropriados ao ambiente.
+Produção não herda essa política: seu adapter exige domínio, HTTPS, certificado
+externo, DNS pronto e verificação criptográfica fail-closed.
 
 ## 8. Gateway e projeção (Implementado)
 
@@ -191,15 +166,14 @@ A sequência operacional factual comprovada no OPS-04 executa:
 
 1. **Ativação e Health Local**: novos participantes (`ADD`) são iniciados em
    `TARGET_RELEASE` e validados localmente antes de qualquer publicação;
-2. **Preparação TLS**: reconciliação controlada do leaf quando a publicação
-   do gateway/SANs exigir, preservando estritamente `CA_CERT` e `CA_KEY`
-   (fail-closed se a validade residual da CA exigir renovação);
+2. **Preparação da Publicação**: derivação dos frontends HTTP/IP e portas a
+   partir do deployment, sem material TLS;
 3. **Validação Sintática do Gateway**: a nova configuração do HAProxy é
    validada previamente (`haproxy -c`) antes de qualquer recarga;
 4. **Graceful Gateway Reload**: recarga graciosa do HAProxy (`-sf <pid_old>`),
    assumindo o tráfego sem derrubar conexões existentes;
-5. **Verificação de Conectividade via Gateway**: probes HTTPS ponta a ponta
-   com verificação de SNI e certificado da CA;
+5. **Verificação de Conectividade via Gateway**: probes HTTP ponta a ponta em
+   cada endereço IP/porta publicado;
 6. **Atualização Atômica da Projeção**: a `ecosystem_projection.tsv` é
    atualizada via arquivo temporário e `rename(2)` atômico;
 7. **Observação do Ecossistema**: verificação factual de que os participantes

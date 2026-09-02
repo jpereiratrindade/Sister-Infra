@@ -195,15 +195,17 @@ EVIDENCE
    - Reinicialização seletiva via entrypoint (`start` seguido de `health`) de participante da release corrente parado, desde que sua porta esteja livre e seu estado persistente íntegro.
 5. **Gateway Gerenciado Parado**:
    - Inicialização do gateway HAProxy pelo adapter privado de runtime da release
-     quando parado, desde que sua porta esteja livre e sua autoridade TLS e
-     configuração sejam válidas e íntegras.
+     quando parado, desde que suas portas estejam livres e a configuração seja
+     válida. Autoridade TLS é exigida apenas em deployments HTTPS.
 
 ### 5.3 Salvaguardas Estritas de FAIL-CLOSED
 
 O repair recusa qualquer mutação e falha fechado (código 1) nos seguintes casos:
 - `RELEASE_CORRUPTED`: release instalada com arquivos modificados, evidência ausente, hash divergente ou git dirty;
 - `PORT_COLLISION_EXTERNAL`: porta de participante ou de gateway ocupada por processo externo não gerenciado;
-- `TLS_AUTHORITY_INVALID`: autoridade CA de laboratório ou certificado folha ausente, ilegível, expirado ou não validado (repair **nunca** emite ou rotaciona CA);
+- `TLS_AUTHORITY_INVALID`: em deployments HTTPS, autoridade CA ou certificado
+  folha ausente, ilegível, expirado ou não validado (repair nunca emite ou
+  rotaciona CA); não se aplica ao LAB HTTP/ip-ports;
 - `PERSISTENT_DATA_CORRUPTED`: caminho de dados persistentes inexistente como diretório;
 - `DEPLOYMENT_DIVERGENT`: deployment resolvido da release divergente ou corrompido;
 - `CURRENT_RELEASE_MISSING`: ausência de release instalada em `current` (repair nunca adivinha ou troca versões).

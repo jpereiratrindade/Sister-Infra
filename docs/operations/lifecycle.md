@@ -116,7 +116,7 @@ Executa de ponta a ponta a sequência de estágios autorizados para o alvo:
 # Executa ciclo LAB (qualifica -> candidata -> reconcilia -> verifica)
 ./bin/sister-infra lifecycle run --target lab
 
-# Executa ciclo PRODUCTION em sandbox sob autoridade
+# Promove a candidata exata comprovada no LAB e executa PRODUCTION real sob autoridade
 ./bin/sister-infra lifecycle run --target production
 ```
 
@@ -133,7 +133,7 @@ Inspeciona:
 - `lab`: release ativa e saúde dos serviços declarados.
 - `maintenance`: convergido (`CONVERGED`) ou com necessidade de reparo reflexivo (`REPAIR_REQUIRED`).
 - `promotion`: elegibilidade formal (`PROMOTABLE` ou `BLOCKED`).
-- `production`: prontidão em sandbox e confirmação de não-execução real.
+- `production`: prontidão do executor real (`systemd`) ou perfil hermético explicitamente identificado.
 
 ### 3.4. `lifecycle maintain` (Manutenção Reflexiva One-Shot)
 
@@ -145,7 +145,8 @@ Composição direta de verificação e reparo operacional reflexivo:
 
 - Se o ambiente estiver íntegro: retorna `NO_OP` com `CONVERGED`.
 - Se houver drift derivável (symlinks rompidos, permissões incorretas, processo parado com porta livre): delega para `sister-workstation repair`, comuta e pós-verifica.
-- Se houver drift fail-closed (release corrompida, colisão externa de portas, CA ausente): aborta sem mutações perigosas.
+- Se houver drift fail-closed (release corrompida, colisão externa de portas ou,
+  em deployments HTTPS, autoridade TLS ausente): aborta sem mutações perigosas.
 
 ### 3.5. `lifecycle evidence` (Cadeia de Evidências Rastreável)
 
@@ -169,7 +170,7 @@ Permite navegar entre:
 No SisTer, a promoção de um componente ou ecossistema para produção **não é a cópia manual de arquivos**, nem uma nova compilação silenciosa de fontes.
 
 A promoção avalia:
-1. **Identidade Imutável da Candidata**: O pacote de candidata possui identificador determinístico, manifest e hashes imutáveis.
+1. **Identidade Imutável da Candidata**: um digest SHA-256 canônico cobre toda a árvore materializada (paths, tipos, bits executáveis, symlinks e bytes), e deve coincidir exatamente com a evidência LAB.
 2. **Evidência de Qualificação**: Todos os componentes passaram formalmente por testes e inspeção de contrato (`PASS`).
 3. **Evidência Factual de LAB**: A candidata foi aplicada com sucesso em ambiente LAB e passou integralmente na verificação de saúde e gateway.
 4. **Pureza de Código-Fonte**: Tanto a árvore do control plane quanto todos os repositórios de componentes estão 100% limpos (`git status --porcelain` vazio).
@@ -195,6 +196,11 @@ Quando todos os critérios são satisfeitos, emite-se um documento de evidência
 
 ## 6. Fronteira de Produção Real
 
-> [!WARNING]
-> Em conformidade estrita com o princípio **PRD-019**, este controlador executa a automação produtiva **exclusivamente em sandboxes e ambientes de teste herméticos**.
-> A implantação real sobre servidores ou nós de produção institucionais continua **NÃO EXECUTADA E NÃO AUTORIZADA POR ESTA MISSÃO**, preservando integralmente a autoridade dos operadores humanos e as chaves institucionais.
+Na raiz padrão `/`, `lifecycle run --target production` seleciona `systemd`, exige
+autoridade institucional e promove somente o digest exato comprovado no LAB. Falhas
+de `daemon-reload`, `start` ou `is-active` encerram o ciclo sem fallback. Em raiz
+alternativa, a evidência é marcada `SANDBOX_TEST`; apenas nesse contexto `mock` é aceito.
+
+Cada execução real grava testemunho com hostname, machine-id, boot-id e estado das
+units. Esse testemunho comprova onde o `PASS` ocorreu sem transformar testes herméticos
+em alegação de implantação institucional.

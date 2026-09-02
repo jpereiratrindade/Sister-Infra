@@ -178,6 +178,64 @@ def main() -> None:
             validation.stdout + validation.stderr
         )
 
+        ip_ports = {
+            "schema": "sister.infra.deployment.resolved/1",
+            "status": "READY",
+            "deployment_id": "fixture-ip-ports",
+            "candidate_id": "wc-fixture",
+            "composition_id": "fixture",
+            "gateway": {
+                "protocol": "http",
+                "listen": "192.0.2.10",
+                "exposure": "ip-ports",
+            },
+            "components": [
+                {
+                    "component_id": "alpha",
+                    "system_id": "system_alpha",
+                    "component_path": "components/alpha",
+                    "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": 18001},
+                    "probe": {"health_path": "/health"},
+                    "gateway": {"host": "192.0.2.10", "port": 18001, "public_url": "http://192.0.2.10:18001"},
+                },
+                {
+                    "component_id": "beta",
+                    "system_id": "system_beta",
+                    "component_path": "components/beta",
+                    "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": 18002},
+                    "probe": {"health_path": "/ready"},
+                    "gateway": {"host": "192.0.2.10", "port": 18002, "public_url": "http://192.0.2.10:18002"},
+                },
+            ],
+        }
+        write_json(path, ip_ports)
+        rendered_ip_ports = subprocess.run(
+            [str(CLI), "render", str(path), "--listen-address", "192.0.2.10"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert rendered_ip_ports.returncode == 0, rendered_ip_ports.stderr
+        ip_config = rendered_ip_ports.stdout
+        assert "bind 192.0.2.10:18001" in ip_config
+        assert "bind 192.0.2.10:18002" in ip_config
+        assert " ssl crt " not in ip_config
+        assert "deny_status 421" not in ip_config
+        assert "default_backend component_0_alpha" in ip_config
+        assert "default_backend component_1_beta" in ip_config
+
+        ip_config_path = tmp / "haproxy-ip-ports.cfg"
+        ip_config_path.write_text(ip_config, encoding="utf-8")
+        validation_ip = subprocess.run(
+            [haproxy, "-c", "-f", str(ip_config_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert validation_ip.returncode == 0, validation_ip.stdout + validation_ip.stderr
+
         invalid = resolved()
         invalid["components"][0]["gateway"]["host"] = (
             "alpha.test\nbackend injected"

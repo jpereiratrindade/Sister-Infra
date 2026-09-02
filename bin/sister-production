@@ -29,6 +29,7 @@ import urllib.request
 
 INFRA_ROOT = Path(__file__).resolve().parent.parent
 AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
+CANDIDATE_CLI = INFRA_ROOT / "bin" / "sister-candidate"
 
 
 class ProductionError(RuntimeError):
@@ -48,6 +49,26 @@ class ProductionAuthorityError(ProductionError):
 
 class ProductionRollbackError(ProductionError):
     pass
+
+
+class CandidateIdentityError(RuntimeError):
+    pass
+
+
+def compute_candidate_tree_digest(candidate_dir: Path) -> str:
+    proc = subprocess.run(
+        [str(CANDIDATE_CLI), "digest", str(candidate_dir), "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise CandidateIdentityError(proc.stderr.strip() or proc.stdout.strip())
+    try:
+        return json.loads(proc.stdout)["candidate_digest"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise CandidateIdentityError("sister-candidate digest retornou contrato inválido") from exc
 
 
 def resolve_installation_lock_path(locks_dir: Path) -> Path:
@@ -539,20 +560,6 @@ class SystemdServiceManager(ServiceManagerAdapter):
             self.unit_dir = fhs.get("etc", Path("/etc/sister")) / "systemd"
 
         self.unit_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = fhs["state"] / "systemd-services.json"
-        self._procs: dict[str, subprocess.Popen[Any]] = {}
-
-    def _load_state(self) -> dict[str, Any]:
-        if self.state_file.is_file():
-            try:
-                return json.loads(self.state_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
-
-    def _save_state(self, state: dict[str, Any]) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     def render_unit(self, unit_name: str, comp_info: dict[str, Any]) -> Path:
         """Separa a materialização determinística da unit do gerenciamento systemd."""
@@ -560,9 +567,11 @@ class SystemdServiceManager(ServiceManagerAdapter):
         entrypoint = comp_info.get("entrypoint", "")
         env = comp_info.get("env", {})
         exec_cmd = comp_info.get("exec_cmd")
+        stop_cmd = None
 
         if not exec_cmd and c_path and entrypoint:
             exec_cmd = f"{c_path / entrypoint} start"
+            stop_cmd = f"{c_path / entrypoint} stop"
 
         env_lines = []
         for k, v in env.items():
@@ -574,11 +583,11 @@ Description=SisTer Service {unit_name}
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
 WorkingDirectory={c_path or self.fhs.get("opt", "/opt/sister")}
 ExecStart={exec_cmd}
-Restart=always
-RestartSec=3
+{f"ExecStop={stop_cmd}" if stop_cmd else ""}
+RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal
 {"\n".join(env_lines)}
@@ -593,69 +602,46 @@ WantedBy=multi-user.target
     def daemon_reload(self) -> None:
         cmd = ["systemctl", "--user", "daemon-reload"] if self.is_user else ["systemctl", "daemon-reload"]
         try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        except Exception:
-            pass
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except OSError as exc:
+            raise ProductionError("SERVICE_MANAGER_FAILURE", f"systemctl indisponível: {exc}") from exc
+        if result.returncode != 0:
+            raise ProductionError(
+                "SERVICE_MANAGER_FAILURE",
+                f"systemd daemon-reload falhou: {result.stderr.strip() or result.stdout.strip()}",
+            )
 
     def start(self, unit_name: str, comp_info: dict[str, Any]) -> None:
-        unit_file = self.render_unit(unit_name, comp_info)
+        self.render_unit(unit_name, comp_info)
         self.daemon_reload()
 
-        started_via_systemctl = False
         cmd = ["systemctl", "--user", "start", unit_name] if self.is_user else ["systemctl", "start", unit_name]
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            if res.returncode == 0:
-                started_via_systemctl = True
-        except Exception:
-            pass
-
-        if not started_via_systemctl:
-            # Fallback supervisionado caso o host/container não esteja com systemd ativo como init
-            c_path = comp_info.get("c_path")
-            entrypoint = comp_info.get("entrypoint")
-            env = comp_info.get("env", os.environ.copy())
-            exec_cmd = comp_info.get("exec_cmd")
-
-            if exec_cmd:
-                parts = shlex.split(exec_cmd)
-                proc = subprocess.Popen(parts, cwd=str(c_path) if c_path else None, env=env)
-                self._procs[unit_name] = proc
-            elif c_path and entrypoint:
-                cmd_run = [str(c_path / entrypoint), "start"]
-                proc = subprocess.run(cmd_run, cwd=str(c_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if proc.returncode != 0:
-                    raise ProductionError(
-                        "SERVICE_START_FAILURE",
-                        f"falha ao iniciar {unit_name}: {proc.stderr.decode('utf-8', errors='replace')}",
-                    )
-
-        state = self._load_state()
-        state[unit_name] = {
-            "active": True,
-            "unit_file": str(unit_file),
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save_state(state)
+        except OSError as exc:
+            raise ProductionError("SERVICE_START_FAILURE", f"systemctl indisponível ao iniciar {unit_name}: {exc}") from exc
+        if res.returncode != 0:
+            raise ProductionError(
+                "SERVICE_START_FAILURE",
+                f"systemd recusou start de {unit_name}: {res.stderr.strip() or res.stdout.strip()}",
+            )
+        if not self.is_active(unit_name):
+            raise ProductionError(
+                "SERVICE_NOT_ACTIVE",
+                f"systemd não confirmou ACTIVE para {unit_name} após start",
+            )
 
     def stop(self, unit_name: str) -> None:
         cmd = ["systemctl", "--user", "stop", unit_name] if self.is_user else ["systemctl", "stop", unit_name]
         try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        except Exception:
-            pass
-
-        proc = self._procs.pop(unit_name, None)
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-        state = self._load_state()
-        state[unit_name] = {"active": False}
-        self._save_state(state)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        except OSError as exc:
+            raise ProductionError("SERVICE_STOP_FAILURE", f"systemctl indisponível ao parar {unit_name}: {exc}") from exc
+        if result.returncode != 0:
+            raise ProductionError(
+                "SERVICE_STOP_FAILURE",
+                f"systemd recusou stop de {unit_name}: {result.stderr.strip() or result.stdout.strip()}",
+            )
 
     def restart(self, unit_name: str, comp_info: dict[str, Any]) -> None:
         self.stop(unit_name)
@@ -665,24 +651,30 @@ WantedBy=multi-user.target
         cmd = ["systemctl", "--user", "is-active", "--quiet", unit_name] if self.is_user else ["systemctl", "is-active", "--quiet", unit_name]
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if res.returncode == 0:
-                return True
-        except Exception:
-            pass
+        except OSError:
+            return False
+        return res.returncode == 0
 
-        proc = self._procs.get(unit_name)
-        if proc and proc.poll() is None:
-            return True
 
-        state = self._load_state()
-        return bool(state.get(unit_name, {}).get("active", False))
+def resolve_service_manager_type(fhs: dict[str, Path]) -> str:
+    configured = os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER", "").strip()
+    sandbox_or_test = fhs["root"] != Path("/") or os.environ.get("SISTER_PRODUCTION_TEST_MODE") == "1"
+    mgr_type = configured or ("mock" if sandbox_or_test else "systemd")
+    if mgr_type == "mock" and not sandbox_or_test:
+        raise ProductionError(
+            "MOCK_FORBIDDEN_IN_REAL_PRODUCTION",
+            "mock é permitido somente com SISTER_PRODUCTION_ROOT isolado ou SISTER_PRODUCTION_TEST_MODE=1",
+        )
+    if mgr_type not in ("mock", "systemd"):
+        raise ProductionError("INVALID_SERVICE_MANAGER", f"gerenciador de serviço desconhecido: {mgr_type}")
+    return mgr_type
 
 
 def get_service_manager(fhs: dict[str, Path]) -> ServiceManagerAdapter:
-    mgr_type = os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER", "mock").strip()
+    mgr_type = resolve_service_manager_type(fhs)
     if mgr_type == "mock":
         return MockServiceManager(fhs["state"])
-    elif mgr_type == "systemd":
+    if mgr_type == "systemd":
         # Validação mandatória de autoridade institucional (PRD-016)
         prod_approved = os.environ.get("PRODUCTION_APPROVED", "").strip()
         prod_confirm = os.environ.get("SISTER_INFRA_PRODUCTION_CONFIRM", "").strip()
@@ -693,8 +685,35 @@ def get_service_manager(fhs: dict[str, Path]) -> ServiceManagerAdapter:
             )
         is_user = os.geteuid() != 0
         return SystemdServiceManager(fhs, is_user=is_user)
-    else:
-        raise ProductionError("INVALID_SERVICE_MANAGER", f"gerenciador de serviço desconhecido: {mgr_type}")
+    raise AssertionError(f"tipo de gerenciador não tratado: {mgr_type}")
+
+
+def build_service_witness(
+    fhs: dict[str, Path],
+    service_mgr: ServiceManagerAdapter,
+    unit_names: list[str],
+) -> dict[str, Any]:
+    """Record the host and authoritative service-manager state behind a PASS."""
+    manager = "systemd" if isinstance(service_mgr, SystemdServiceManager) else "mock"
+    witness: dict[str, Any] = {
+        "service_manager": manager,
+        "execution_mode": (
+            "REAL_HOST"
+            if fhs["root"] == Path("/") and isinstance(service_mgr, SystemdServiceManager)
+            else "SANDBOX_TEST"
+        ),
+        "hostname": socket.gethostname(),
+        "units": {unit: ("ACTIVE" if service_mgr.is_active(unit) else "INACTIVE") for unit in unit_names},
+    }
+    for label, path in (
+        ("machine_id", Path("/etc/machine-id")),
+        ("boot_id", Path("/proc/sys/kernel/random/boot_id")),
+    ):
+        try:
+            witness[label] = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            witness[label] = None
+    return witness
 
 
 def reconcile_production_gateway(
@@ -841,6 +860,21 @@ def compute_plan_digest(canonical_payload: dict[str, Any]) -> str:
     return f"sha256:{digest}"
 
 
+def validate_production_gateway_policy(deployment: dict[str, Any]) -> dict[str, Any]:
+    gateway = deployment.get("gateway") or {}
+    if gateway.get("protocol", "https") != "https":
+        raise ProductionError(
+            "PRODUCTION_TLS_REQUIRED",
+            "deployment de produção exige gateway.protocol=https",
+        )
+    if gateway.get("exposure", "host") != "host":
+        raise ProductionError(
+            "PRODUCTION_HOST_ROUTING_REQUIRED",
+            "deployment de produção proíbe exposição LAB ip-ports",
+        )
+    return gateway
+
+
 def build_production_plan(
     candidate_dir: Path,
     deployment_file: Path,
@@ -855,14 +889,30 @@ def build_production_plan(
     candidate_manifest_file = candidate_dir / "manifest.json"
     if not candidate_manifest_file.is_file():
         raise ProductionError("CANDIDATE_INVALID", f"manifest.json ausente na candidata: {candidate_dir}")
+    candidate_verify = subprocess.run(
+        [str(CANDIDATE_CLI), "verify", str(candidate_dir), "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if candidate_verify.returncode != 0:
+        raise ProductionError(
+            "CANDIDATE_INVALID",
+            candidate_verify.stderr.strip() or candidate_verify.stdout.strip(),
+        )
     candidate_manifest = json.loads(candidate_manifest_file.read_text(encoding="utf-8"))
+    try:
+        candidate_digest = compute_candidate_tree_digest(candidate_dir)
+    except CandidateIdentityError as exc:
+        raise ProductionError("CANDIDATE_INVALID", str(exc)) from exc
 
     # 2. Carregar Deployment Desejado
     if not deployment_file.is_file():
         raise ProductionError("DEPLOYMENT_INVALID", f"arquivo de deployment ausente: {deployment_file}")
     deployment = json.loads(deployment_file.read_text(encoding="utf-8"))
     authority = resolve_authority_context(candidate_manifest_file, deployment_file)
-    gateway = deployment.get("gateway") or {}
+    gateway = validate_production_gateway_policy(deployment)
     gateway_listen = (
         os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS", "").strip()
         or os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip()
@@ -948,6 +998,7 @@ def build_production_plan(
     # 5. Montar Sealed Payload Criptográfico
     sealed_payload = {
         "candidate_id": candidate_manifest.get("candidate_id", ""),
+        "candidate_digest": candidate_digest,
         "composition_id": candidate_manifest.get("composition_id", ""),
         "deployment_id": deployment.get("deployment_id", ""),
         "policy": {
@@ -986,6 +1037,8 @@ def build_production_plan(
             "candidate_id": candidate_manifest.get("candidate_id"),
             "composition_id": candidate_manifest.get("composition_id"),
             "candidate_path": str(candidate_dir.resolve()),
+            "candidate_digest": candidate_digest,
+            "digest_algorithm": "sister.infra.candidate.tree/1+sha256",
         },
         "deployment": {
             "deployment_id": deployment.get("deployment_id"),
@@ -1092,6 +1145,16 @@ def _execute_production_apply_unlocked(
     # -------------------------------------------------------------------------
     candidate_path = Path(plan_doc["candidate"]["candidate_path"])
     candidate_manifest = json.loads((candidate_path / "manifest.json").read_text(encoding="utf-8"))
+    expected_candidate_digest = plan_doc["candidate"].get("candidate_digest")
+    try:
+        actual_candidate_digest = compute_candidate_tree_digest(candidate_path)
+    except CandidateIdentityError as exc:
+        raise ProductionAuthorityError("CANDIDATE_IDENTITY_INVALID", str(exc)) from exc
+    if not expected_candidate_digest or actual_candidate_digest != expected_candidate_digest:
+        raise ProductionAuthorityError(
+            "CANDIDATE_DIGEST_MISMATCH",
+            f"árvore da candidata divergiu do plano ({actual_candidate_digest} != {expected_candidate_digest})",
+        )
 
     control_plane_source = Path(
         os.environ.get("SISTER_PRODUCTION_CONTROL_PLANE_SOURCE", str(INFRA_ROOT))
@@ -1137,6 +1200,12 @@ def _execute_production_apply_unlocked(
 
     # Se todas as ações forem KEEP (NO_OP)
     if fresh_plan["summary"].get("add", 0) == 0 and fresh_plan["summary"].get("update", 0) == 0 and fresh_plan["summary"].get("remove", 0) == 0:
+        verification = execute_production_verify(fhs=fhs)
+        if verification.get("candidate_digest") != actual_candidate_digest:
+            raise ProductionError(
+                "NO_OP_CANDIDATE_DIVERGENCE",
+                "estado convergido executa outra candidata; uma promoção exata requer nova release",
+            )
         audit_evidence = {
             "schema": "sister.infra.production.evidence/1.0.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1147,7 +1216,9 @@ def _execute_production_apply_unlocked(
             "actions_applied": [],
             "tls": tls_info,
             "dns": dns_info,
-            "verification": {"status": "PASS", "details": "estado factual já convergido (NO_OP)"},
+            "candidate_digest": actual_candidate_digest,
+            "verification": verification,
+            "service_witness": verification["service_witness"],
         }
         evidence_dir = fhs["evidence"]
         evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -1177,11 +1248,19 @@ def _execute_production_apply_unlocked(
     actions_applied = []
 
     try:
-        # Copiar componentes da candidata para a staging release
-        shutil.copytree(candidate_path / "components", staging_dir / "components")
+        # Copiar a árvore completa e provar a identidade da cópia antes de
+        # transformá-la em release (fecha troca concorrente/TOCTOU da candidata).
+        shutil.copytree(candidate_path, staging_dir, dirs_exist_ok=True)
+        copied_candidate_digest = compute_candidate_tree_digest(staging_dir)
+        if copied_candidate_digest != actual_candidate_digest:
+            raise ProductionError(
+                "CANDIDATE_COPY_DIGEST_MISMATCH",
+                f"cópia staging divergiu da candidata aprovada ({copied_candidate_digest} != {actual_candidate_digest})",
+            )
 
-        # Copiar evidências da candidata
-        shutil.copytree(candidate_path / "evidence", staging_dir / "evidence")
+        candidate_evidence_dir = staging_dir / "evidence" / "candidate"
+        candidate_evidence_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(staging_dir / "manifest.json", candidate_evidence_dir / "manifest.json")
 
         # Materializar evidências de deployment (declaration.json e resolved.json)
         dep_evidence_dir = staging_dir / "evidence" / "deployment"
@@ -1210,6 +1289,7 @@ def _execute_production_apply_unlocked(
             "candidate": {
                 "candidate_id": candidate_id,
                 "composition_id": plan_doc["candidate"]["composition_id"],
+                "candidate_digest": actual_candidate_digest,
             },
             "deployment": {
                 "deployment_id": plan_doc["deployment"]["deployment_id"],
@@ -1265,7 +1345,7 @@ def _execute_production_apply_unlocked(
             probe = comp.get("probe") or {}
             health_path = probe.get("health_path")
             runtime = comp.get("runtime") or {}
-            if health_path and runtime and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+            if health_path and runtime and not isinstance(service_mgr, MockServiceManager):
                 healthy = False
                 for _ in range(10):
                     if probe_component_health(runtime, health_path):
@@ -1277,6 +1357,17 @@ def _execute_production_apply_unlocked(
 
         if os.environ.get("SISTER_MOCK_FAIL_HEALTH") == "1":
             raise ProductionError("HEALTH_PROBE_FAILED", "sondagem de health check falhou no participante")
+
+        unit_names = [
+            f"sister-{component.get('component_id')}.service"
+            for component in manifest_doc["components"]
+        ] + ["sister-gateway.service"]
+        inactive_units = [unit for unit in unit_names if not service_mgr.is_active(unit)]
+        if inactive_units:
+            raise ProductionError(
+                "SERVICE_NOT_ACTIVE",
+                f"gerenciador não confirmou ACTIVE para todas as units: {inactive_units}",
+            )
 
         # Commit Point atômico (PRD-020)
         current_symlink = fhs["current"]
@@ -1353,12 +1444,14 @@ def _execute_production_apply_unlocked(
         "status": "APPLIED",
         "plan_digest": expected_digest,
         "candidate_id": candidate_id,
+        "candidate_digest": actual_candidate_digest,
         "deployment_id": plan_doc["deployment"]["deployment_id"],
         "release_id": target_release_id,
         "actions_applied": actions_applied,
         "tls": tls_info,
         "dns": dns_info,
         "verification": {"status": "PASS", "details": "implantação transacional concluída com sucesso"},
+        "service_witness": build_service_witness(fhs, service_mgr, unit_names),
     }
     evidence_file = evidence_dir / f"audit-{ts}-{expected_digest.replace(':', '_')}.json"
     evidence_file.write_text(json.dumps(audit_evidence, indent=2), encoding="utf-8")
@@ -1407,9 +1500,7 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
     gateway_active = True
     if isinstance(service_mgr, SystemdServiceManager):
         if not service_mgr.is_active("sister-gateway.service"):
-            gw_pid_file = fhs["run"] / "gateway" / "haproxy.pid"
-            if not gw_pid_file.is_file():
-                raise ProductionError("VERIFY_FAILED", "serviço de gateway de produção (sister-gateway.service) inativo")
+            raise ProductionError("VERIFY_FAILED", "serviço de gateway de produção (sister-gateway.service) inativo")
 
     # 3. Validar health probes dos componentes diretamente
     component_probes = {}
@@ -1418,7 +1509,7 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
         probe = c.get("probe") or {}
         health_path = probe.get("health_path")
         runtime = c.get("runtime") or {}
-        if health_path and runtime and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+        if health_path and runtime and not isinstance(service_mgr, MockServiceManager):
             healthy = probe_component_health(runtime, health_path)
             if not healthy:
                 raise ProductionError("VERIFY_FAILED", f"componente {cid} falhou no health probe direto em {health_path}")
@@ -1460,7 +1551,7 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
         host = gw_entry.get("host")
         probe = c.get("probe") or {}
         health_path = probe.get("health_path", "/")
-        if host and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+        if host and not isinstance(service_mgr, MockServiceManager):
             accessible = probe_gateway_subdomain_https(gw_listen, gw_port, host, health_path, tls_cert_path=tls_cert)
             if not accessible:
                 raise ProductionError("VERIFY_FAILED", f"subdomínio {host} inacessível via HTTPS no gateway ({health_path})")
@@ -1471,11 +1562,17 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
     if not fhs["state"].is_dir():
         raise ProductionError("VERIFY_FAILED", f"diretório de estado persistente ausente: {fhs['state']}")
 
+    unit_names = [f"sister-{c.get('component_id')}.service" for c in manifest.get("components", [])]
+    if isinstance(service_mgr, SystemdServiceManager):
+        unit_names.append("sister-gateway.service")
+    service_witness = build_service_witness(fhs, service_mgr, unit_names)
+
     return {
         "schema": "sister.infra.production.verify/1.0.0",
         "status": "PASS",
         "release_id": manifest.get("release_id"),
         "candidate_id": manifest.get("candidate", {}).get("candidate_id"),
+        "candidate_digest": manifest.get("candidate", {}).get("candidate_digest"),
         "components_verified": len(manifest.get("components", [])),
         "components_status": components_status,
         "component_health_probes": component_probes,
@@ -1484,6 +1581,7 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
         "tls": tls_info,
         "dns": dns_info,
         "current_path": str(current_dir),
+        "service_witness": service_witness,
     }
 
 

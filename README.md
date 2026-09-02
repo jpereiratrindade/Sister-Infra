@@ -65,7 +65,7 @@ participantes concretos.
 | Composição | Seleção declarativa dos participantes por `source`. |
 | Qualificação | Build/teste isolado e evidência dos artefatos qualificados. |
 | Candidata | Materialização imutável dos commits e artefatos desejados. |
-| Deployment | Domínio único (`gateway.domain`), bindings físicos e probes. |
+| Deployment | Política de exposição (`host` ou `ip-ports`), bindings físicos e probes. |
 | Reconciliador | Comparação `CURRENT × DESIRED`, plano determinístico e apply transacional. |
 | Workstation | Releases, `current`, `previous`, runtime instalado e rollback. |
 
@@ -169,9 +169,12 @@ A interface reconciliada de produção opera sob travas institucionais de autori
 digest selado criptograficamente, preflights estritos (clean source, TLS externo institucional,
 DNS passivo e portas livres) e layout FHS (`/opt/sister`, `/etc/sister`, `/var/lib/sister`, `/run/sister`).
 
-> [!WARNING]
-> A implantação em servidores reais de produção NÃO foi executada e NÃO foi autorizada
-> por esta missão (PRD-019). O adaptador foi comprovado integralmente em sandbox hermético.
+> [!IMPORTANT]
+> Na raiz real (`SISTER_PRODUCTION_ROOT=/`, padrão), o executor é obrigatoriamente
+> `systemd` e falha fechado se qualquer unit não atingir `ACTIVE`. `mock` só é aceito
+> com raiz de sandbox explícita ou modo de teste. Executar o comando exige as
+> aprovações institucionais e efetivamente altera o host; as suítes herméticas não
+> alegam que uma implantação institucional específica tenha sido realizada.
 
 ### 2.4 Lifecycle End-to-End (OPS-08)
 
@@ -234,8 +237,9 @@ Exemplo não autoritativo em `config/deployments/workstation-lab.json`:
 }
 ```
 
-O subdomínio correspondente (`novo-sistema.<domain>`) é derivado automaticamente da
-identidade do componente pelo gateway único conforme o `gateway.domain` declarado no deployment.
+No LAB `ip-ports`, a URL é derivada automaticamente de `gateway.listen` e da
+porta física do binding. Em produção, o subdomínio continua derivado de
+`gateway.domain`.
 
 ### 3.4 Planejar e aplicar
 
@@ -362,8 +366,8 @@ Propriedades comprovadas nos incrementos OPS-01 a OPS-06:
 - `release-switch` atômico;
 - gateway HAProxy com graceful reload;
 - projection refresh atômico;
-- reconciliação controlada do TLS leaf LAB;
-- preservação da CA;
+- publicação LAB HTTP/IP sem DNS ou CA;
+- isolamento estrito dos runtimes em loopback;
 - zero resíduos após falha;
 - idempotência (`NO_OP`);
 - UX LAB sem paths manuais.
@@ -372,29 +376,24 @@ Detalhes: `docs/operations/reconciliation.md`.
 
 ---
 
-## 6. Gateway e TLS
+## 6. Gateway LAB e TLS produtivo
 
-Gateway, TLS e DNS são derivados automaticamente da declaração única `gateway.domain`
-e da composição descoberta, sem segunda fonte de verdade.
+O gateway é derivado da composição e da política explícita do deployment, sem
+segunda fonte de verdade.
 
 O HAProxy:
 
 - não contém tabela concreta hardcoded de participantes;
-- é renderizado dinamicamente a partir de `gateway.domain`, mapeando cada identidade descoberta para `<component_id>.<domain>`;
-- aplica fail-closed rigoroso: hosts desconhecidos ou não declarados recebem HTTP 421 Misdirected Request;
+- no LAB, publica HTTP em `gateway.listen`, com uma porta por participante e
+  sem DNS, SNI, certificado ou CA;
+- em produção, usa `gateway.domain`, HTTPS e roteamento por host;
+- no modo por host, aplica fail-closed: hosts desconhecidos recebem HTTP 421;
 - suporta graceful reload sem perda de conexões;
 - participa do rollback transacional.
 
-No LAB, o modelo de autoridade TLS (OPS-07A2):
-
-- estabelece administração explícita da CA via `sister-infra lab tls status/init-ca`;
-- localiza a autoridade exclusivamente em `~/.config/sister/workstation/tls/`;
-- elimina qualquer fallback ou autoridade em `<repo>/secrets/`;
-- preserva estritamente a CA existente e falha fechado diante de divergência;
-- delega ao reconciliador a emissão declarativa do certificado leaf (`ecosystem-lab.pem`)
-  com SANs derivadas dos hosts publicados;
-- desacopla o boot de runtime (`sister-infra up`) do ciclo de vida TLS (o boot consome
-  material existente sem jamais criar ou alterar certificados).
+Produção permanece fail-closed: `protocol=https`, `exposure=host`, certificado
+externo institucional e DNS pronto são obrigatórios. O adapter produtivo rejeita
+explicitamente a política LAB `ip-ports`.
 
 Material privado não deve ser versionado.
 
@@ -410,6 +409,7 @@ python3 tests/component_resolver_test.py
 python3 tests/composition_resolver_test.py
 python3 tests/composition_qualification_test.py
 python3 tests/deployment_resolver_test.py
+python3 tests/lab_ip_ports_gateway_test.py
 python3 tests/gateway_renderer_contract_test.py
 python3 tests/declarative_single_domain_test.py
 python3 tests/documentation_contract_alignment_test.py

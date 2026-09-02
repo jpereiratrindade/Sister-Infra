@@ -11,6 +11,12 @@ A candidata é o pacote imutável e verificável que resulta da qualificação d
 - lista os artefatos binários verificados por hash SHA-256;
 - define o status do deployment como `PENDING_BINDINGS`.
 
+Além da validação interna do manifesto, `sister-candidate digest <dir>` calcula
+`sister.infra.candidate.tree/1+sha256` sobre a árvore materializada inteira:
+paths, tipos de entrada, bits executáveis, destinos de symlinks e conteúdo de
+todos os arquivos. Evidências LAB, promoção e produção usam exclusivamente esse
+digest como identidade; `candidate_id` e path não estabelecem equivalência.
+
 A candidata é **neutra em relação a ambiente**: ela não contém bindings físicos, portas, hosts, certificados TLS ou service managers.
 
 ## Schema

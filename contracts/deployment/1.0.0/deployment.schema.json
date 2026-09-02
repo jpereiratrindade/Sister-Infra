@@ -41,6 +41,13 @@
             "https"
           ]
         },
+        "exposure": {
+          "type": "string",
+          "enum": [
+            "host",
+            "ip-ports"
+          ]
+        },
         "domain": {
           "type": "string",
           "minLength": 1,

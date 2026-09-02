@@ -1964,11 +1964,14 @@ for comp in resolved_deployment.get("components", []):
 
 # 3. Autoridade TLS
 has_gateway = any(c.get("gateway") for c in resolved_deployment.get("components", []))
+gateway_authority = resolved_deployment.get("gateway") or {}
+gateway_protocol = gateway_authority.get("protocol", "https")
+gateway_exposure = gateway_authority.get("exposure", "host")
 tls_dir = config_root / "tls"
 ca_cert = tls_dir / "ecosystem-lab-ca.crt"
 leaf_pem = tls_dir / "ecosystem-lab.pem"
 
-if has_gateway:
+if has_gateway and gateway_protocol == "https":
     if not ca_cert.is_file():
         fail_closed("TLS_AUTHORITY_INVALID", f"CA de laboratório ausente em {ca_cert} (repair não cria CA)")
     if not leaf_pem.is_file():
@@ -2048,19 +2051,28 @@ if gw_pid_file.is_file():
         except (ValueError, OSError):
             gw_running = False
 
-gateway = resolved_deployment.get("gateway") or {}
+gateway = gateway_authority
 gw_port_value = os.environ.get("GATEWAY_LISTEN_PORT", "").strip() or gateway.get("port")
 gw_addr = os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip() or gateway.get("listen")
-if not gw_port_value or not gw_addr:
+if not gw_addr or (gateway_exposure != "ip-ports" and not gw_port_value):
     fail_closed("GATEWAY_AUTHORITY_MISSING", "gateway.listen/port ausente no deployment resolvido")
-gw_port = int(gw_port_value)
+if gateway_exposure == "ip-ports":
+    gw_ports = sorted({
+        int(comp.get("gateway", {}).get("port"))
+        for comp in resolved_deployment.get("components", [])
+        if comp.get("gateway", {}).get("port") is not None
+    })
+    if not gw_ports:
+        fail_closed("GATEWAY_AUTHORITY_MISSING", "gateway ip-ports sem portas públicas derivadas")
+else:
+    gw_ports = [int(gw_port_value)]
 if test_mode:
     gw_port_used = (os.environ.get("SISTER_TEST_GATEWAY_PORT_COLLISION") == "1")
 else:
-    gw_port_used = check_port_in_use(gw_addr, gw_port)
+    gw_port_used = any(check_port_in_use(gw_addr, port) for port in gw_ports)
 
 if gw_port_used and not gw_running:
-    fail_closed("PORT_COLLISION_EXTERNAL", f"porta {gw_port} do gateway ocupada por processo externo não gerenciado")
+    fail_closed("PORT_COLLISION_EXTERNAL", f"porta(s) {gw_ports} do gateway ocupada(s) por processo externo não gerenciado")
 
 # 5. Detecção de Drift e Construção do Plano
 plan_items = []

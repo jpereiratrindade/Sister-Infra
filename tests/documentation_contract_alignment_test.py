@@ -61,13 +61,19 @@ def test_gate_d2_contract_unification_gateway_domain():
 
 
 def test_gate_d3_canonical_deployment_alignment():
-    """Gate D3: workstation-lab.json atende rigorosamente ao padrão gateway.domain e bindings puros."""
+    """Gate D3: workstation-lab.json publica HTTP por IP/portas e mantém bindings puros."""
     print("[TEST] Gate D3 — Validando conformidade factual de workstation-lab.json...")
     dep_file = ROOT / "config" / "deployments" / "workstation-lab.json"
     doc = json.loads(dep_file.read_text(encoding="utf-8"))
 
     gw = doc.get("gateway", {})
-    assert gw.get("domain") == "lab.sister.local", f"gateway.domain incorreto: {gw.get('domain')}"
+    assert gw.get("protocol") == "http", "LAB deve publicar HTTP sem autoridade TLS"
+    assert gw.get("exposure") == "ip-ports", "LAB deve usar exposição ip-ports"
+    assert "domain" not in gw, "LAB ip-ports não deve depender de DNS"
+    assert gw.get("listen") == "10.163.80.176", (
+        "gateway.listen do LAB deve publicar na interface LAN institucional"
+    )
+    assert "port" not in gw, "LAB ip-ports deriva a porta pública de cada binding"
     assert "base_domain" not in gw, "workstation-lab.json não deve conter base_domain"
 
     for binding in doc.get("bindings", []):
@@ -76,7 +82,8 @@ def test_gate_d3_canonical_deployment_alignment():
         for forbidden in ("domain", "proxy", "certificate", "tls"):
             assert forbidden not in binding, f"Binding '{sys_id}' contém chave proibida '{forbidden}'"
 
-    print("[PASS] Gate D3 — workstation-lab.json em conformidade estrita com gateway.domain")
+    assert [b["runtime"]["port"] for b in doc["bindings"]] == [8000, 8015, 8093, 8094, 8095]
+    print("[PASS] Gate D3 — workstation-lab.json publica HTTP/IP por portas institucionais")
 
 
 def test_gate_d4_readme_test_references_exist():

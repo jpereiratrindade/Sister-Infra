@@ -45,6 +45,39 @@ def sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def candidate_tree_digest(candidate_dir: Path) -> str:
+    """Identidade canônica de toda a árvore materializada, sem seguir symlinks."""
+    root = candidate_dir.expanduser().resolve()
+    if not root.is_dir() or not (root / "manifest.json").is_file():
+        raise CandidateError(f"candidata materializada inválida: {root}")
+
+    digest = hashlib.sha256()
+    digest.update(b"sister.infra.candidate.tree/1\0")
+    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    for path in entries:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        mode = path.lstat().st_mode & 0o111
+        if path.is_symlink():
+            entry_type = b"symlink"
+            payload = os.readlink(path).encode("utf-8")
+        elif path.is_dir():
+            entry_type = b"directory"
+            payload = b""
+        elif path.is_file():
+            entry_type = b"file"
+            payload = path.read_bytes()
+        else:
+            raise CandidateError(f"tipo de entrada não suportado na candidata: {path}")
+
+        digest.update(entry_type + b"\0")
+        digest.update(relative + b"\0")
+        digest.update(f"{mode:o}".encode("ascii") + b"\0")
+        digest.update(str(len(payload)).encode("ascii") + b"\0")
+        digest.update(payload)
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
 def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -310,6 +343,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_p.add_argument("candidate_dir", help="Diretório da candidata a verificar")
     verify_p.add_argument("--json", action="store_true", help="Emite resultado em JSON")
 
+    digest_p = sub.add_parser("digest", help="Calcula a identidade SHA-256 da árvore materializada completa")
+    digest_p.add_argument("candidate_dir", help="Diretório da candidata")
+    digest_p.add_argument("--json", action="store_true", help="Emite resultado em JSON")
+
     return parser
 
 
@@ -337,6 +374,15 @@ def main() -> int:
                 print(f"[PASS] integridade da candidata verificada: {manifest['candidate_id']}")
                 print(f"schema: {manifest['schema']}")
                 print(f"participantes: {len(manifest['components'])}")
+        elif args.command == "digest":
+            digest = candidate_tree_digest(Path(args.candidate_dir))
+            if args.json:
+                print(json.dumps({
+                    "candidate_digest": digest,
+                    "digest_algorithm": "sister.infra.candidate.tree/1+sha256",
+                }, indent=2, sort_keys=True))
+            else:
+                print(digest)
     except CandidateError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1

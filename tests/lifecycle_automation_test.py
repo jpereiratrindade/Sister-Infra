@@ -723,10 +723,17 @@ esac
         # Gate L25: Preservação do Runtime Real do Host
         # --------------------------------------------------------------------
         print("[TEST] Gate L25 — Preservação do runtime real do host...")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1.0)
-            res_host = s.connect_ex(("127.0.0.1", 8443))
-            assert res_host == 0, "Runtime real do gateway em 8443 foi perturbado pelos testes!"
+        lab_authority = json.loads(
+            (ROOT / "config" / "deployments" / "workstation-lab.json").read_text(encoding="utf-8")
+        )
+        lab_host = lab_authority["gateway"]["listen"]
+        for binding in lab_authority["bindings"]:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                port = binding["runtime"]["port"]
+                assert s.connect_ex((lab_host, port)) == 0, (
+                    f"Runtime real do gateway em {lab_host}:{port} foi perturbado pelos testes!"
+                )
         print("[PASS] Gate L25 — Runtime real do host permanece 100% íntegro e intocado")
 
     print("\n[PASS] Todos os 25 Gates de OPS-08 passaram com sucesso!")

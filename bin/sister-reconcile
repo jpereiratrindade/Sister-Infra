@@ -537,12 +537,19 @@ def compute_plan(
         if c.get("gateway"):
             des_gw_routes[c["component_id"]] = c["gateway"]
 
-    if curr_gw_routes == des_gw_routes:
+    curr_gw_config = (
+        current.get("resolved_deployment", {}).get("gateway", {})
+        if current
+        else {}
+    )
+    des_gw_config = desired["resolved_deployment"].get("gateway", {})
+
+    if curr_gw_routes == des_gw_routes and curr_gw_config == des_gw_config:
         gw_action = "KEEP"
-        gw_reason = "gateway routes and listeners unchanged"
+        gw_reason = "gateway authority, routes and listeners unchanged"
     else:
         gw_action = "RECONFIGURE"
-        gw_reason = "gateway routing or published hosts differ"
+        gw_reason = "gateway authority, routing, listener or published hosts differ"
 
     # Ecosystem projection diff (normalizado pelos campos efetivamente projetados)
     curr_proj = extract_normalized_projection(curr_components)
@@ -1037,7 +1044,7 @@ def get_gateway_paths(
     state_root: Path,
     config_root: Path,
     resolved_doc: dict[str, Any],
-) -> tuple[Path, Path, str, int]:
+) -> tuple[Path, Path, str, int | None]:
     cfg_p = Path(os.environ.get("GATEWAY_CFG", state_root / "control-plane" / "gateway" / "haproxy-lan.cfg")).expanduser().resolve()
     pid_p = Path(os.environ.get("GATEWAY_PID", state_root / "control-plane" / "gateway" / "haproxy-lan.pid")).expanduser().resolve()
     gateway = resolved_doc.get("gateway") or {}
@@ -1045,9 +1052,10 @@ def get_gateway_paths(
     port_value = os.environ.get("GATEWAY_LISTEN_PORT", "").strip() or gateway.get("port")
     if not listen_addr:
         raise ReconcileError("gateway.listen ausente no deployment resolvido")
-    if not port_value:
+    exposure = gateway.get("exposure", "host")
+    if not port_value and exposure != "ip-ports":
         raise ReconcileError("gateway.port ausente no deployment resolvido")
-    listen_port = int(port_value)
+    listen_port = int(port_value) if port_value else None
     return cfg_p, pid_p, listen_addr, listen_port
 
 
@@ -1065,18 +1073,23 @@ def find_haproxy_bin() -> str:
 def render_haproxy_config(
     resolved_deployment_file: Path,
     listen_address: str,
-    listen_port: int,
+    listen_port: int | None,
     tls_pem: Path,
 ) -> str:
-    res = subprocess.run([
+    command = [
         sys.executable,
         str(GATEWAY_CLI),
         "render",
         str(resolved_deployment_file),
         "--listen-address", listen_address,
-        "--listen-port", str(listen_port),
-        "--tls-pem", str(tls_pem),
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    ]
+    if listen_port is not None:
+        command.extend(["--listen-port", str(listen_port)])
+    if tls_pem:
+        command.extend(["--tls-pem", str(tls_pem)])
+    res = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
+    )
     if res.returncode != 0:
         raise ReconcileError(f"falha ao renderizar configuração HAProxy: {res.stderr.strip()}")
     return res.stdout
@@ -1151,7 +1164,7 @@ def reload_haproxy_gracefully(
 def verify_gateway_urls(
     resolved_doc: dict[str, Any],
     listen_address: str,
-    listen_port: int,
+    listen_port: int | None,
     ca_cert: Path,
     timeout: float = 5.0,
 ) -> tuple[bool, str]:
@@ -1167,7 +1180,14 @@ def verify_gateway_urls(
             super(http.client.HTTPSConnection, self).connect()
             self.sock = self._context.wrap_socket(self.sock, server_hostname=self._sni_server_hostname)
 
-    ssl_ctx = ssl.create_default_context(cafile=str(ca_cert))
+    gateway = resolved_doc.get("gateway") or {}
+    protocol = gateway.get("protocol", "https")
+    exposure = gateway.get("exposure", "host")
+    ssl_ctx = (
+        ssl.create_default_context(cafile=str(ca_cert))
+        if protocol == "https"
+        else None
+    )
 
     for comp in resolved_doc.get("components", []):
         cid = comp.get("component_id", "")
@@ -1180,22 +1200,34 @@ def verify_gateway_urls(
         if not host or not health_path:
             continue
 
+        port = gw.get("port") if exposure == "ip-ports" else listen_port
+        if not isinstance(port, int):
+            return False, f"componente '{cid}' sem porta pública válida"
+
         try:
-            conn = SNIHTTPSConnection(
-                listen_address,
-                port=listen_port,
-                server_hostname=host,
-                context=ssl_ctx,
-                timeout=timeout,
-            )
+            if protocol == "https":
+                assert ssl_ctx is not None
+                conn = SNIHTTPSConnection(
+                    listen_address,
+                    port=port,
+                    server_hostname=host,
+                    context=ssl_ctx,
+                    timeout=timeout,
+                )
+            elif protocol == "http":
+                conn = http.client.HTTPConnection(
+                    listen_address, port=port, timeout=timeout
+                )
+            else:
+                return False, f"protocolo de gateway não suportado: {protocol!r}"
             conn.request("GET", health_path, headers={"Host": host, "User-Agent": "sister-reconcile", "Connection": "close"})
             resp = conn.getresponse()
             status = resp.status
             conn.close()
             if status != 200:
-                return False, f"componente '{cid}' via gateway https://{host}:{listen_port}{health_path} retornou HTTP {status}"
+                return False, f"componente '{cid}' via gateway {protocol}://{host}:{port}{health_path} retornou HTTP {status}"
         except Exception as exc:
-            return False, f"componente '{cid}' via gateway https://{host}:{listen_port}{health_path} falhou: {exc}"
+            return False, f"componente '{cid}' via gateway {protocol}://{host}:{port}{health_path} falhou: {exc}"
 
     return True, "OK"
 
@@ -1609,7 +1641,11 @@ def execute_apply(
             # -------------------------------------------------------------
             # FASE 2: PREPARE TLS & VALIDATE
             # -------------------------------------------------------------
-            if target_resolved_doc and plan["gateway"]["action"] != "KEEP":
+            if (
+                target_resolved_doc
+                and plan["gateway"]["action"] != "KEEP"
+                and (target_resolved_doc.get("gateway") or {}).get("protocol", "https") == "https"
+            ):
                 desired_published_hosts = [
                     c["gateway"]["host"] for c in target_resolved_doc.get("components", [])
                     if c.get("gateway") and c["gateway"].get("host")
