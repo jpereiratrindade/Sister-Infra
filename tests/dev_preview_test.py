@@ -11,6 +11,7 @@ Valida:
 - Gate 5: Alocação de porta efêmera e retry em evidência factual de colisão
 - Gate 6: Lifecycle completo com health autoritativo ($entrypoint health, probe opcional, --duration, --json)
 - Gate 7: Cleanup seguro scoped e Zero Resíduos (processos, listeners, sandbox, lock reutilizável)
+- Gate 8: Identidade obrigatória para runtimes persistentes e configuração não sobrescrevível
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ def create_mock_component(
     system_id: str,
     probe_path: str | None = None,
     simulate_collision_first: bool = False,
+    state_policy: str = "stateless",
 ) -> Path:
     comp_dir = root / f"sister-{component_id}"
     comp_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +94,7 @@ def create_mock_component(
             "schema": "sister.runtime/1.0.0",
             "entrypoint": "scripts/runtime.sh",
             "actions": ["start", "stop", "restart", "status", "health"],
-            "state_policy": "stateless",
+            "state_policy": state_policy,
         },
     }
 
@@ -152,6 +154,10 @@ server.serve_forever()
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd -P)"
 ACTION="${{1:-status}}"
+MODE="${{SISTER_RUNTIME_MODE:-}}"
+INSTANCE_ID="${{SISTER_RUNTIME_INSTANCE_ID:-}}"
+STATE_DIR="${{SISTER_RUNTIME_STATE_DIR:-}}"
+DATA_DIR="${{SISTER_RUNTIME_DATA_DIR:-}}"
 
 load_deployment_binding() {{
   local resolved="${{SISTER_RESOLVED_DEPLOYMENT_FILE:-}}"
@@ -652,6 +658,51 @@ def test_gate_7_zero_residues() -> None:
     pass_test("Gate 7 — Cleanup seguro scoped e Zero Resíduos")
 
 
+# ==============================================================================
+# Gate 8: Identidade de Runtime Persistente
+# ==============================================================================
+def test_gate_8_persistent_runtime_identity() -> None:
+    print("[TEST] Validando Gate 8 — Identidade de Runtime Persistente...")
+    with tempfile.TemporaryDirectory(prefix="sister-test-identity-") as tmp:
+        tmp_path = Path(tmp)
+        comp = create_mock_component(
+            tmp_path,
+            "kilo",
+            "sister_kilo",
+            state_policy="persistent-external",
+        )
+        env = dict(os.environ)
+        env["SISTER_REPOSITORIES_ROOT"] = str(tmp_path)
+
+        accepted = subprocess.run(
+            [sys.executable, str(DEV_CLI), "preview", str(comp), "--duration", "0.2", "--json"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if accepted.returncode != 0:
+            fail_test("Gate 8", f"runtime persistente isolado foi recusado: {accepted.stderr}")
+
+        (comp / ".env").write_text(
+            "SISTER_RUNTIME_RUN_DIR=/tmp/identity-escape\n",
+            encoding="utf-8",
+        )
+        refused = subprocess.run(
+            [sys.executable, str(DEV_CLI), "preview", str(comp), "--duration", "0.1"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if refused.returncode == 0 or "variável reservada" not in refused.stderr:
+            fail_test("Gate 8", f"sobrescrita da identidade não foi recusada: {refused.stderr}")
+
+    pass_test("Gate 8 — identidade persistente isolada e não sobrescrevível")
+
+
 def main() -> None:
     print("[TEST] Iniciando suite de testes de DEV Preview (OPS-05)...")
     from component_resolver_test import make_contracts
@@ -666,12 +717,13 @@ def main() -> None:
             test_gate_5_port_retry()
             test_gate_6_lifecycle_health()
             test_gate_7_zero_residues()
+            test_gate_8_persistent_runtime_identity()
         finally:
             if previous is None:
                 os.environ.pop("SISTER_CONTRACT_ROOT", None)
             else:
                 os.environ["SISTER_CONTRACT_ROOT"] = previous
-    print("[PASS] Todos os Gates de OPS-05 (1 a 7) passaram com sucesso!")
+    print("[PASS] Todos os Gates de OPS-05 (1 a 8) passaram com sucesso!")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,16 @@ class DevError(RuntimeError):
     pass
 
 
+RESERVED_PREVIEW_ENV = {
+    "SISTER_RUNTIME_MODE",
+    "SISTER_RUNTIME_INSTANCE_ID",
+    "SISTER_RUNTIME_STATE_DIR",
+    "SISTER_RUNTIME_RUN_DIR",
+    "SISTER_RUNTIME_DATA_DIR",
+    "SISTER_RUNTIME_CLEANUP_SCOPE",
+}
+
+
 def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -164,6 +174,76 @@ def allocate_ephemeral_port() -> int:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def validate_preview_config(repo_env: Path) -> None:
+    """Component config may provide secrets, never preview identity."""
+    if not repo_env.is_file():
+        return
+    for number, raw_line in enumerate(repo_env.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.removeprefix("export ").split("=", 1)[0].strip()
+        if key in RESERVED_PREVIEW_ENV:
+            raise DevError(
+                f"configuração do componente tenta definir variável reservada de preview "
+                f"{key} ({repo_env}:{number})"
+            )
+
+
+def validate_persistent_preview_entrypoint(
+    component_root: Path,
+    entrypoint_rel: str,
+    state_policy: str,
+) -> None:
+    if state_policy != "persistent-external":
+        return
+    entrypoint = component_root / entrypoint_rel
+    try:
+        source = entrypoint.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DevError(
+            "runtime persistent-external precisa declarar isolamento de preview "
+            f"em entrypoint textual verificável: {exc}"
+        ) from exc
+    required = (
+        "SISTER_RUNTIME_MODE",
+        "SISTER_RUNTIME_INSTANCE_ID",
+        "SISTER_RUNTIME_STATE_DIR",
+        "SISTER_RUNTIME_RUN_DIR",
+        "SISTER_RUNTIME_DATA_DIR",
+    )
+    missing = [name for name in required if name not in source]
+    if missing:
+        raise DevError(
+            "runtime persistent-external não comprova isolamento integral de DEV Preview; "
+            "marcadores ausentes: " + ", ".join(missing)
+        )
+
+
+def verify_scoped_runtime_identity(
+    pids: list[int],
+    expected: dict[str, str],
+) -> None:
+    if not pids:
+        raise DevError("runtime iniciado sem processo atribuível à sandbox de preview")
+    for pid in pids:
+        try:
+            entries = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\x00")
+            actual = {}
+            for entry in entries:
+                if b"=" in entry:
+                    key, value = entry.split(b"=", 1)
+                    actual[key.decode(errors="ignore")] = value.decode(errors="ignore")
+        except OSError as exc:
+            raise DevError(f"não foi possível verificar identidade do processo preview {pid}: {exc}") from exc
+        for key, value in expected.items():
+            if actual.get(key) != value:
+                raise DevError(
+                    f"processo preview {pid} não preservou {key}; "
+                    "runtime recusado antes da exposição"
+                )
 
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -317,6 +397,13 @@ def safe_cleanup_processes(
     env_overrides: dict[str, str],
     sandbox_run: Path,
 ) -> None:
+    expected_run = Path(env_overrides.get("SISTER_RUNTIME_RUN_DIR", ""))
+    cleanup_scope = env_overrides.get("SISTER_RUNTIME_CLEANUP_SCOPE")
+    if cleanup_scope != "preview-only" or not expected_run.is_absolute():
+        raise DevError("cleanup recusado: identidade de DEV Preview ausente")
+    if expected_run.resolve() != sandbox_run.resolve():
+        raise DevError("cleanup recusado: run dir fora da sandbox atribuída")
+
     # 1. Executa primeiro o entrypoint stop
     try:
         invoke_entrypoint_action(
@@ -382,6 +469,12 @@ def run_dev_preview(
     entrypoint_rel = descriptor.get("runtime", {}).get(
         "entrypoint", "scripts/runtime.sh"
     )
+    state_policy = descriptor.get("runtime", {}).get("state_policy", "stateless")
+    validate_persistent_preview_entrypoint(
+        component_root, entrypoint_rel, state_policy
+    )
+    repo_env = component_root / ".env"
+    validate_preview_config(repo_env)
 
     # 1. Adquire lock DEV fora do repositório
     lock_fd, lock_path = acquire_dev_lock(component_root)
@@ -397,7 +490,6 @@ def run_dev_preview(
     sandbox_env.mkdir(parents=True, exist_ok=True)
 
     config_file = sandbox_env / f"{cid}.env"
-    repo_env = component_root / ".env"
     if repo_env.is_file():
         shutil.copy2(repo_env, config_file)
     else:
@@ -436,11 +528,16 @@ def run_dev_preview(
             probe_path=probe_path,
         )
 
+        instance_id = f"{cid}-{sandbox_dir.name.removeprefix(f'sister-dev-preview-{cid}-')}"
         env_overrides = {
             "SISTER_RESOLVED_DEPLOYMENT_FILE": str(binding_file),
             "SISTER_COMPONENT_CONFIG_FILE": str(config_file),
+            "SISTER_RUNTIME_MODE": "dev-preview",
+            "SISTER_RUNTIME_INSTANCE_ID": instance_id,
             "SISTER_RUNTIME_STATE_DIR": str(sandbox_state),
             "SISTER_RUNTIME_RUN_DIR": str(sandbox_run),
+            "SISTER_RUNTIME_DATA_DIR": str(sandbox_state / "data"),
+            "SISTER_RUNTIME_CLEANUP_SCOPE": "preview-only",
         }
 
         # Invoca start
@@ -465,6 +562,16 @@ def run_dev_preview(
                 time.sleep(0.2)
 
             if healthy:
+                verify_scoped_runtime_identity(
+                    find_scoped_processes(sandbox_run, component_root),
+                    {
+                        "SISTER_RUNTIME_MODE": "dev-preview",
+                        "SISTER_RUNTIME_INSTANCE_ID": instance_id,
+                        "SISTER_RUNTIME_STATE_DIR": str(sandbox_state),
+                        "SISTER_RUNTIME_RUN_DIR": str(sandbox_run),
+                        "SISTER_RUNTIME_DATA_DIR": str(sandbox_state / "data"),
+                    },
+                )
                 started = True
                 break
             else:

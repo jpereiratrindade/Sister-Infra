@@ -32,3 +32,21 @@ scripts `runtime.sh`:
 
 Isso permite interoperabilidade imediata com todos os participantes do ecossistema
 sem necessidade de modificar seus entrypoints.
+
+Além do documento JSON, o executor fornece a identidade não sobrescrevível da
+sessão por ambiente:
+
+```text
+SISTER_RUNTIME_MODE=dev-preview
+SISTER_RUNTIME_INSTANCE_ID=<identidade efêmera>
+SISTER_RUNTIME_STATE_DIR=<sandbox>/state
+SISTER_RUNTIME_RUN_DIR=<sandbox>/run
+SISTER_RUNTIME_DATA_DIR=<sandbox>/state/data
+SISTER_RUNTIME_CLEANUP_SCOPE=preview-only
+```
+
+Um componente `persistent-external` deve derivar desses valores todos os seus
+PIDs, logs, bancos, containers, volumes e demais recursos auxiliares. Reutilizar
+qualquer recurso do LAB/installed/production viola este contrato. O executor
+recusa entrypoints que não comprovem o consumo desses marcadores e verifica a
+identidade do processo antes de expor o endpoint do preview.
