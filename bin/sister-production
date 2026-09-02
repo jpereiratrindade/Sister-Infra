@@ -872,6 +872,20 @@ def validate_production_gateway_policy(deployment: dict[str, Any]) -> dict[str, 
             "PRODUCTION_HOST_ROUTING_REQUIRED",
             "deployment de produção proíbe exposição LAB ip-ports",
         )
+    domain = gateway.get("domain")
+    if not domain or not isinstance(domain, str) or not domain.strip():
+        raise ProductionError(
+            "PRODUCTION_DOMAIN_REQUIRED",
+            "deployment de produção exige gateway.domain declarado",
+        )
+    for b in deployment.get("bindings", []):
+        if b.get("gateway") is not None or any(
+            k in b for k in ("domain", "proxy", "certificate", "tls", "host")
+        ):
+            raise ProductionError(
+                "GATEWAY_CONFLICTING_AUTHORITY",
+                f"binding '{b.get('system_id', 'unknown')}' não pode declarar gateway/host concorrente em produção; gateway.domain é a autoridade única",
+            )
     return gateway
 
 
@@ -963,36 +977,32 @@ def build_production_plan(
     except Exception as exc:
         raise ProductionError("PLAN_PARSE_FAILED", f"saída inválida do reconciliador: {exc}")
 
-    # 4. Extrair bindings e hosts declarados
+    # 4. Extrair bindings e hosts declarados exclusivamente via gateway.domain
     declared_hosts = []
-    gw_config = deployment.get("gateway") or {}
-    domain = gw_config.get("domain")
-    if domain:
-        for c in candidate_manifest.get("components", []):
-            cid = c.get("component_id", "")
-            if cid:
-                identity = cid.lower().replace("_", "-")
-                declared_hosts.append(f"{identity}.{domain}")
-    else:
-        for b in deployment.get("bindings", []):
-            gw = b.get("gateway", {})
-            host = gw.get("host")
-            if host:
-                declared_hosts.append(host)
+    domain = gateway["domain"]
+    for c in candidate_manifest.get("components", []):
+        cid = c.get("component_id", "")
+        if cid:
+            identity = cid.lower().replace("_", "-")
+            declared_hosts.append(f"{identity}.{domain}")
+    declared_hosts = sorted(set(declared_hosts))
 
+    comp_by_sys = {c.get("system_id"): c for c in candidate_manifest.get("components", [])}
     normalized_bindings = []
     for b in deployment.get("bindings", []):
         sys_id = b.get("system_id", "")
-        gw = b.get("gateway", {})
-        host = gw.get("host")
         rt = b.get("runtime", {})
+        matching_c = comp_by_sys.get(sys_id)
+        comp_host = None
+        if matching_c and matching_c.get("component_id"):
+            comp_host = f"{matching_c['component_id'].lower().replace('_', '-')}.{domain}"
         normalized_bindings.append({
             "system_id": sys_id,
             "transport": rt.get("transport", "tcp"),
             "listen": rt.get("listen", "127.0.0.1"),
             "port": rt.get("port"),
             "socket": rt.get("socket"),
-            "host": host,
+            "host": comp_host,
         })
 
     # 5. Montar Sealed Payload Criptográfico

@@ -282,13 +282,12 @@ esac
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "production-datacenter-01",
             "composition_id": "lifecycle_ecosystem",
-            "gateway": {"protocol": "https", "listen": prod_gw, "port": 443},
+            "gateway": {"protocol": "https", "listen": prod_gw, "port": 443, "domain": "institutional.gov.br"},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
                     "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": alpha_port_prod},
                     "probe": {"health_path": "/health"},
-                    "gateway": {"host": prod_host},
                 },
             ],
         })

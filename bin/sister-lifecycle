@@ -603,7 +603,7 @@ def execute_lifecycle_run(
             r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
             if r_v.returncode != 0:
                 raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida para produção: {r_v.stderr.strip()}", "CANDIDATE")
-            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED_LAB_VERIFIED", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
+            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED_LAB_VERIFIED", "candidate_id": cand_id, "candidate_path": str(active_candidate), "candidate_digest": compute_candidate_digest(active_candidate)})
 
         else:
             stage_name = "QUALIFY"
@@ -656,7 +656,7 @@ def execute_lifecycle_run(
                         stage_name,
                     )
                 active_candidate = created_candidate
-                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
+                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id, "candidate_path": str(active_candidate), "candidate_digest": compute_candidate_digest(active_candidate)})
             else:
                 active_candidate = candidate_path
                 cand_id = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", active_candidate.name)
@@ -664,7 +664,7 @@ def execute_lifecycle_run(
                 r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
                 if r_v.returncode != 0:
                     raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida: {r_v.stderr.strip()}", "CANDIDATE")
-                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
+                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED", "candidate_id": cand_id, "candidate_path": str(active_candidate), "candidate_digest": compute_candidate_digest(active_candidate)})
 
         # ---------------------------------------------------------------------
         # 3. TARGET: DEV
@@ -809,11 +809,33 @@ def execute_lifecycle_run(
                     stage_name,
                 )
 
+            apply_status = apply_doc.get("status")
             execution_evidence["stages_executed"].append({
                 "stage": "LAB_APPLY",
                 "status": "PASS",
-                "apply_status": apply_doc.get("status"),
+                "apply_status": apply_status,
             })
+
+            # Frente B / HC-02 / HC-G07:
+            # Se apply produziu NO_OP, checar se a candidata ativa é comprovadamente
+            # a mesma candidata que originou a release materializada no runtime.
+            active_cand_digest = compute_candidate_digest(active_candidate)
+            if apply_status == "NO_OP":
+                source_cand_digest = apply_doc.get("source_candidate_digest")
+                if not source_cand_digest:
+                    raise LifecycleError(
+                        "LAB_PROVENANCE_MISSING",
+                        "release corrente não possui candidate_digest de proveniência; não é possível validar NO_OP",
+                        stage_name,
+                    )
+                if active_cand_digest != source_cand_digest:
+                    # Caso C: Candidata nova em NO_OP NÃO recebe evidência de verificação
+                    raise LifecycleError(
+                        "NO_OP_CANDIDATE_DIVERGENCE",
+                        f"LAB apply resultou em NO_OP com candidata nova ({active_cand_digest} != {source_cand_digest}); "
+                        "a candidata ativa não foi materializada no runtime e não recebe evidência LAB VERIFIED",
+                        stage_name,
+                    )
 
             # Mandatory Verify Gate
             stage_name = "VERIFY"
@@ -821,7 +843,7 @@ def execute_lifecycle_run(
             if r_ver.returncode != 0:
                 raise LifecycleError("LAB_VERIFY_FAILED", f"pós-verificação de workstation falhou: {r_ver.stderr.strip()}", stage_name)
 
-            # Emitir evidência persistente de verificação de LAB (vinculada à candidata)
+            # Emitir evidência persistente de verificação de LAB (vinculada à candidata comprovadamente verificada)
             lab_cand_id = cand_id if "cand_id" in locals() else (
                 json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", "unknown")
             )
@@ -830,10 +852,11 @@ def execute_lifecycle_run(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "candidate_id": lab_cand_id,
                 "candidate_path": str(active_candidate.resolve()),
-                "candidate_digest": compute_candidate_digest(active_candidate),
+                "candidate_digest": active_cand_digest,
                 "candidate_digest_algorithm": "sister.infra.candidate.tree/1+sha256",
                 "deployment_path": str(deployment_path.resolve()),
                 "deployment_id": json.loads(deployment_path.read_text(encoding="utf-8")).get("deployment_id", "lab"),
+                "release_id": apply_doc.get("release_id"),
                 "status": "PASS",
                 "verifier": "sister-workstation verify",
             }
@@ -844,6 +867,8 @@ def execute_lifecycle_run(
             execution_evidence["stages_executed"].append({
                 "stage": "VERIFY",
                 "status": "PASS",
+                "candidate_id": lab_cand_id,
+                "candidate_digest": active_cand_digest,
                 "lab_verification_file": str(lab_ver_file),
             })
             execution_evidence["status"] = "COMPLETED"
@@ -858,6 +883,8 @@ def execute_lifecycle_run(
             execution_evidence["stages_executed"].append({
                 "stage": "PROMOTION_EVIDENCE",
                 "status": "PASS",
+                "candidate_id": prom_doc.get("candidate_id"),
+                "candidate_digest": prom_doc.get("candidate_digest"),
                 "evidence_file": prom_doc.get("evidence_file"),
             })
 

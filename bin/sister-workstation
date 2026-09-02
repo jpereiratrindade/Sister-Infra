@@ -1275,9 +1275,15 @@ release_create() {
     composition_candidate_integrity "$candidate_path"
   fi
 
-  local candidate_id
+  local candidate_id candidate_digest
   candidate_id="$(jq -r '.candidate_id // empty' "$candidate_manifest")"
   [[ -n "$candidate_id" ]] || die "manifesto de candidata sem candidate_id"
+
+  if [[ -x "$INFRA_ROOT/bin/sister-candidate" ]]; then
+    candidate_digest="$("${PYTHON:-python3}" "$INFRA_ROOT/bin/sister-candidate" digest "$candidate_path" --json | jq -r '.candidate_digest // empty')"
+  else
+    candidate_digest=""
+  fi
 
   local id release tmp
   id="wr-${candidate_id#wc-}"
@@ -1335,12 +1341,15 @@ PY_INFRA
     "$tmp/manifest.json" \
     "$id" \
     "$declaration_hash" \
-    "$resolved_hash" <<'PY_RELEASE_V3'
+    "$resolved_hash" \
+    "$candidate_id" \
+    "${candidate_digest:-}" \
+    "$candidate_path" <<'PY_RELEASE_V3'
 import json
 import sys
 from pathlib import Path
 
-manifest_path, release_id, declaration_hash, resolved_hash = sys.argv[1:]
+manifest_path, release_id, declaration_hash, resolved_hash, cand_id, cand_digest, cand_path = sys.argv[1:]
 path = Path(manifest_path)
 manifest = json.loads(path.read_text(encoding="utf-8"))
 resolved = json.loads(
@@ -1351,6 +1360,15 @@ resolved = json.loads(
 
 manifest["schema"] = "sister.infra.workstation.release/3"
 manifest["release_id"] = release_id
+manifest["candidate_id"] = cand_id
+if cand_digest:
+    manifest["candidate_digest"] = cand_digest
+manifest["candidate"] = {
+    "candidate_id": cand_id,
+    "candidate_path": cand_path,
+    "candidate_digest": cand_digest,
+    "digest_algorithm": "sister.infra.candidate.tree/1+sha256",
+}
 manifest["deployment"] = {
     "status": "READY",
     "deployment_id": resolved["deployment_id"],

@@ -219,6 +219,7 @@ def main() -> None:
             "gateway": {
                 "protocol": "https",
                 "port": 443,
+                "domain": "institutional.gov.br",
             },
             "bindings": [
                 {
@@ -229,7 +230,6 @@ def main() -> None:
                         "port": alpha_port,
                     },
                     "probe": {"health_path": "/health"},
-                    "gateway": {"host": expected_host},
                 },
             ],
         })
@@ -668,19 +668,17 @@ def main() -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "production-datacenter-02",
             "composition_id": "production_ecosystem",
-            "gateway": {"protocol": "https", "port": 443},
+            "gateway": {"protocol": "https", "port": 443, "domain": "institutional.gov.br"},
             "bindings": [
                 {
                     "system_id": "sister_alpha",
                     "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": alpha_port},
                     "probe": {"health_path": "/health"},
-                    "gateway": {"host": expected_host},
                 },
                 {
                     "system_id": "sister_beta",
                     "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": beta_port},
                     "probe": {"health_path": "/health"},
-                    "gateway": {"host": "beta.institutional.gov.br"},
                 },
             ],
         })

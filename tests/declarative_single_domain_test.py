@@ -142,11 +142,11 @@ def main() -> None:
         assert manifest_file.is_file()
 
         # -------------------------------------------------------------------
-        # GATE 1: Exposição Declarativa via Domínio Único
+        # GATE 1: Contrato genérico de host routing: Exposição Declarativa via Domínio Único
         # O operador informa apenas gateway.domain; sistemas integrados
         # recebem subdomínios derivados de sua identidade (<cid>.<domain>).
         # -------------------------------------------------------------------
-        print("[TEST] Gate 1 — Exposição declarativa via domínio único no gateway...")
+        print("[TEST] Gate 1 — Contrato genérico de host routing: exposição declarativa via domínio único...")
         dep_lab_file = tmp / "deployment_lab.json"
         write_json(dep_lab_file, {
             "schema": "sister.infra.deployment/1.0.0",
@@ -228,11 +228,11 @@ def main() -> None:
         print("[PASS] Gate 2 — Bloqueio fail-closed de configuração individual de domínio em bindings")
 
         # -------------------------------------------------------------------
-        # GATE 3: Reconciliação Automática de Roteamento no Gateway Único
+        # GATE 3: Contrato genérico de host routing: Reconciliação Automática de Roteamento
         # HAProxy renderiza ACLs e backends exclusivamente da composição
         # descoberta e do domínio-base.
         # -------------------------------------------------------------------
-        print("[TEST] Gate 3 — Reconciliação automática de roteamento no gateway...")
+        print("[TEST] Gate 3 — Contrato genérico de host routing: reconciliação automática de roteamento...")
         resolved_file = tmp / "resolved.json"
         write_json(resolved_file, resolved_doc)
 
@@ -290,11 +290,11 @@ def main() -> None:
         print("[PASS] Gate 3 — Roteamento HAProxy derivado e validado com sucesso")
 
         # -------------------------------------------------------------------
-        # GATE 4: Reconciliação Automática de TLS no LAB
+        # GATE 4: Contrato genérico de host routing: Reconciliação Automática de TLS
         # O certificado folha do gateway cobre exatamente todos os subdomínios
         # derivados dos componentes descobertos.
         # -------------------------------------------------------------------
-        print("[TEST] Gate 4 — Reconciliação automática de TLS no LAB (SANs derivadas)...")
+        print("[TEST] Gate 4 — Contrato genérico de host routing: reconciliação automática de TLS (SANs derivadas)...")
         from importlib.machinery import SourceFileLoader
         reconcile_mod = SourceFileLoader("sister_reconcile", str(ROOT / "bin" / "sister-reconcile")).load_module()
         generate_leaf_certificate = reconcile_mod.generate_leaf_certificate
@@ -314,10 +314,10 @@ def main() -> None:
         print("[PASS] Gate 4 — TLS de laboratório derivado com todas as SANs descobertas")
 
         # -------------------------------------------------------------------
-        # GATE 5: Reconciliação e Validação de TLS em Produção
+        # GATE 5: Contrato genérico de host routing: Validação de TLS em Produção
         # Certificado institucional externo cobre subdomínios (wildcard ou lista)
         # -------------------------------------------------------------------
-        print("[TEST] Gate 5 — Validação de TLS em Produção (cobertura dos subdomínios)...")
+        print("[TEST] Gate 5 — Contrato genérico de host routing: Validação de TLS em Produção (cobertura dos subdomínios)...")
         prod_mod = SourceFileLoader("sister_production", str(ROOT / "bin" / "sister-production")).load_module()
         validate_external_tls = prod_mod.validate_external_tls
         check_dns_readiness = prod_mod.check_dns_readiness
@@ -386,10 +386,10 @@ def main() -> None:
         print("[PASS] Gate 6 — Reconciliação de DNS e detecção de drift validados")
 
         # -------------------------------------------------------------------
-        # GATE 7: Paridade Arquitetural LAB vs PRODUÇÃO
+        # GATE 7: Contrato genérico de host routing: Paridade Arquitetural
         # A mesma candidata atende LAB e PRODUÇÃO variando unicamente bindings
         # -------------------------------------------------------------------
-        print("[TEST] Gate 7 — Paridade LAB vs PRODUÇÃO a partir da mesma candidata...")
+        print("[TEST] Gate 7 — Contrato genérico de host routing: Paridade arquitetural a partir da mesma candidata...")
         dep_prod_file = tmp / "deployment_production.json"
         write_json(dep_prod_file, {
             "schema": "sister.infra.deployment/1.0.0",
@@ -475,6 +475,43 @@ def main() -> None:
         for b in dep_content.get("bindings", []):
             assert "gateway" not in b, f"Binding {b.get('system_id')} não deve conter gateway no deployment oficial!"
         print("[PASS] Gate 9 — workstation-lab.json usa LAB HTTP/IP sem DNS ou CA")
+
+        # -------------------------------------------------------------------
+        # GATE 10: HC-G01 - PRODUCTION sem gateway.domain falha fechado
+        # -------------------------------------------------------------------
+        print("[TEST] Gate 10 — Produção sem gateway.domain falha fechado (HC-G01)...")
+        from sister_production import build_production_plan, ProductionError
+        dep_prod_no_domain = json.loads(dep_prod_file.read_text(encoding="utf-8"))
+        if "domain" in dep_prod_no_domain.get("gateway", {}):
+            del dep_prod_no_domain["gateway"]["domain"]
+
+        dep_prod_no_domain_file = tmp / "deployment_prod_no_domain.json"
+        write_json(dep_prod_no_domain_file, dep_prod_no_domain)
+
+        try:
+            build_production_plan(cand_dir, dep_prod_no_domain_file, tmp / "prod_out")
+            assert False, "Deveria ter falhado fechado por falta de gateway.domain"
+        except ProductionError as exc:
+            assert exc.code == "PRODUCTION_DOMAIN_REQUIRED"
+        print("[PASS] Gate 10 — Produção sem gateway.domain falhou fechado com PRODUCTION_DOMAIN_REQUIRED")
+
+        # -------------------------------------------------------------------
+        # GATE 11: HC-G02 - PRODUCTION com binding.gateway falha fechado
+        # -------------------------------------------------------------------
+        print("[TEST] Gate 11 — Produção com binding.gateway concorrente falha fechado (HC-G02)...")
+        dep_prod_conflict = json.loads(dep_prod_file.read_text(encoding="utf-8"))
+        if "bindings" in dep_prod_conflict and len(dep_prod_conflict["bindings"]) > 0:
+            dep_prod_conflict["bindings"][0]["gateway"] = {"host": "conflict.org"}
+
+        dep_prod_conflict_file = tmp / "deployment_prod_conflict.json"
+        write_json(dep_prod_conflict_file, dep_prod_conflict)
+
+        try:
+            build_production_plan(cand_dir, dep_prod_conflict_file, tmp / "prod_out")
+            assert False, "Deveria ter falhado fechado por gateway em binding"
+        except ProductionError as exc:
+            assert exc.code == "GATEWAY_CONFLICTING_AUTHORITY"
+        print("[PASS] Gate 11 — Produção com autoridade concorrente falhou fechado com GATEWAY_CONFLICTING_AUTHORITY")
 
     print("\n=====================================================================")
     print(" [SUCESSO] Todos os Gates de Exposição Declarativa Única passaram!")

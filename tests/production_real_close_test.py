@@ -436,17 +436,16 @@ esac
         port_prod_alpha = allocate_free_port()
         port_prod_beta = allocate_free_port()
 
-        # Deployments (LAB e Produção com domínio único)
+        # Deployments (LAB canônico ip-ports e Produção com domínio único)
         dep_lab_file = tmp / "deployment_lab.json"
         dep_lab_file.write_text(json.dumps({
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "lab-prc",
             "composition_id": "ecosystem-prc",
             "gateway": {
-                "protocol": "https",
-                "listen": "127.0.0.1",
-                "port": port_lab_gw,
-                "domain": "lab.sister.local",
+                "protocol": "http",
+                "exposure": "ip-ports",
+                "listen": "127.0.0.2",
             },
             "bindings": [
                 {
@@ -633,7 +632,7 @@ esac
             "--json",
         ], env=dict(env_prod, SISTER_SYSTEMD_WITNESS_FAIL="1"))
         assert res_systemd_failure.returncode != 0, "falha de systemctl deve bloquear a implantação"
-        assert "systemd daemon-reload falhou" in (res_systemd_failure.stdout + res_systemd_failure.stderr)
+        assert "systemd daemon-reload falhou" in (res_systemd_failure.stdout + res_systemd_failure.stderr), f"stdout={res_systemd_failure.stdout} stderr={res_systemd_failure.stderr}"
         for port in (port_prod_alpha, port_prod_beta):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 assert sock.connect_ex(("127.0.0.1", port)) != 0, "fallback direto iniciou processo produtivo"
@@ -764,7 +763,7 @@ esac
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "lab-e2e",
             "composition_id": "ecosystem-prc",
-            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": port_e2e_lab_gw, "domain": "lab.sister.local"},
+            "gateway": {"protocol": "http", "exposure": "ip-ports", "listen": "127.0.0.2"},
             "bindings": [
                 {"system_id": "system_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_lab_alpha}, "probe": {"health_path": "/health"}},
                 {"system_id": "system_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_lab_beta}, "probe": {"health_path": "/health"}},
@@ -825,7 +824,97 @@ esac
         cand_prod_e2e = doc_prod_e2e["stages_executed"][0]["candidate_id"]
 
         assert cand_prod_e2e == cand_e2e, f"Produção deve ter promovido exatamente a candidata do LAB ({cand_e2e} == {cand_prod_e2e})"
-        print("[PASS] Gate PRC-9 — Ciclo fim a fim executado com sucesso: a MESMA candidata verificada em LAB foi promovida para Produção!")
+        cand_digest_e2e = json.loads(r_lab_e2e.stdout)["stages_executed"][1]["candidate_digest"]
+        cand_digest_prod = doc_prod_e2e["stages_executed"][0]["candidate_digest"]
+        assert cand_digest_prod == cand_digest_e2e, f"Digest da candidata promovida deve ser exatamente igual ({cand_digest_e2e} == {cand_digest_prod})"
+        print("[PASS] Gate PRC-9 — Ciclo fim a fim executado com sucesso: a MESMA candidata (mesmo digest) verificada em LAB foi promovida para Produção!")
+
+        # -------------------------------------------------------------------
+        # GATE PRC-10 (HC-G07): LAB NO_OP com candidata nova NÃO recebe LAB VERIFIED
+        # -------------------------------------------------------------------
+        print("[TEST] Gate PRC-10 — LAB NO_OP com candidata nova NÃO recebe LAB VERIFIED (HC-G07)...")
+        cand_b_dir = e2e_dir / "candidate_b"
+        r_create_b = run_cmd([
+            sys.executable, str(CANDIDATE_CLI), "create",
+            str(composition_file),
+            "--out", str(cand_b_dir),
+            "--candidate-id", "cand-prc-divergence-b",
+            "--json",
+        ], env=e2e_env_base)
+        assert r_create_b.returncode == 0, f"falha ao criar candidata B: stderr={r_create_b.stderr} stdout={r_create_b.stdout}"
+        cand_b_id = "cand-prc-divergence-b"
+        cand_b_path = str(cand_b_dir)
+        assert cand_b_id != cand_e2e, f"Candidata B ({cand_b_id}) deve ser diferente da A ({cand_e2e})"
+
+        # Reconcile produz NO_OP mas a release ativa é A. O lifecycle DEVE falhar fechado.
+        r_lab_b = run_cmd([
+            str(INFRA_CLI), "lifecycle", "run",
+            "--target", "lab",
+            "--candidate", str(cand_b_path),
+            "--composition", str(composition_file),
+            "--deployment", str(dep_lab_e2e),
+            "--json",
+        ], env=e2e_env_base)
+        assert r_lab_b.returncode != 0, "LAB com candidata nova sob NO_OP deve falhar fechado!"
+        err_lab_b = json.loads(r_lab_b.stdout)
+        assert err_lab_b.get("code") == "NO_OP_CANDIDATE_DIVERGENCE", f"esperado NO_OP_CANDIDATE_DIVERGENCE, obtido {err_lab_b}"
+
+        # Assegurar que nenhuma evidência LAB VERIFIED foi gerada para Candidata B
+        ev_files_b = list((state_root / "evidence" / "lab").glob(f"verification-{cand_b_id}-*.json"))
+        assert len(ev_files_b) == 0, f"Candidata nova jamais pode ganhar LAB VERIFIED sob NO_OP! {ev_files_b}"
+        print("[PASS] Gate PRC-10 — Candidata nova sob LAB NO_OP falhou fechado e NÃO recebeu evidência de verificação")
+
+        # -------------------------------------------------------------------
+        # GATE PRC-11 (HC-G01): Produção sem gateway.domain falha fechado
+        # -------------------------------------------------------------------
+        print("[TEST] Gate PRC-11 — Produção sem gateway.domain falha fechado (HC-G01)...")
+        dep_prod_no_domain = e2e_dir / "dep_prod_no_domain.json"
+        dep_prod_no_domain.write_text(json.dumps({
+            "schema": "sister.infra.deployment/1.0.0",
+            "deployment_id": "prod-no-domain",
+            "composition_id": "ecosystem-prc",
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": port_e2e_prod_gw},
+            "bindings": [
+                {"system_id": "system_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_prod_alpha}, "probe": {"health_path": "/health"}},
+                {"system_id": "system_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_prod_beta}, "probe": {"health_path": "/health"}},
+            ],
+        }, indent=2), encoding="utf-8")
+        r_pnd = run_cmd([
+            sys.executable, str(PRODUCTION_CLI), "plan",
+            "--desired-candidate", str(cand_path_str),
+            "--desired-deployment", str(dep_prod_no_domain),
+            "--json",
+        ], env=e2e_env_base)
+        assert r_pnd.returncode != 0
+        err_pnd = json.loads(r_pnd.stdout)
+        assert err_pnd.get("code") == "PRODUCTION_DOMAIN_REQUIRED", f"esperado PRODUCTION_DOMAIN_REQUIRED, obtido {err_pnd}"
+        print("[PASS] Gate PRC-11 — Produção sem gateway.domain falhou fechado com PRODUCTION_DOMAIN_REQUIRED")
+
+        # -------------------------------------------------------------------
+        # GATE PRC-12 (HC-G02): Produção com binding.gateway concorrente falha fechado
+        # -------------------------------------------------------------------
+        print("[TEST] Gate PRC-12 — Produção com binding.gateway concorrente falha fechado (HC-G02)...")
+        dep_prod_conflict = e2e_dir / "dep_prod_conflict.json"
+        dep_prod_conflict.write_text(json.dumps({
+            "schema": "sister.infra.deployment/1.0.0",
+            "deployment_id": "prod-conflict",
+            "composition_id": "ecosystem-prc",
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": port_e2e_prod_gw, "domain": "sister.gov.br"},
+            "bindings": [
+                {"system_id": "system_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_prod_alpha}, "probe": {"health_path": "/health"}, "gateway": {"host": "alpha-concorrente.org"}},
+                {"system_id": "system_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_e2e_prod_beta}, "probe": {"health_path": "/health"}},
+            ],
+        }, indent=2), encoding="utf-8")
+        r_pc = run_cmd([
+            sys.executable, str(PRODUCTION_CLI), "plan",
+            "--desired-candidate", str(cand_path_str),
+            "--desired-deployment", str(dep_prod_conflict),
+            "--json",
+        ], env=e2e_env_base)
+        assert r_pc.returncode != 0
+        err_pc = json.loads(r_pc.stdout)
+        assert err_pc.get("code") == "GATEWAY_CONFLICTING_AUTHORITY", f"esperado GATEWAY_CONFLICTING_AUTHORITY, obtido {err_pc}"
+        print("[PASS] Gate PRC-12 — Produção com autoridade concorrente falhou fechado com GATEWAY_CONFLICTING_AUTHORITY")
 
         # Encerrar daemons materializados pelas fixtures herméticas.
         for pid_file in tmp.rglob("*.pid"):
@@ -836,7 +925,7 @@ esac
         terminate_fixture_processes(tmp)
 
     print("\n=====================================================================")
-    print(" [SUCESSO] Todos os 9 Gates de PRODUCTION-REAL-CLOSE passaram!")
+    print(" [SUCESSO] Todos os 12 Gates de PRODUCTION-REAL-CLOSE passaram!")
     print("=====================================================================")
 
 

@@ -127,6 +127,7 @@ def probe_runtime_endpoint(
 
 def load_current_state(
     current_release_arg: str | None,
+    mode: str = "workstation",
     probe_runtime: bool = True,
     probe_override: dict[str, tuple[bool, str]] | None = None,
 ) -> dict[str, Any] | None:
@@ -144,7 +145,7 @@ def load_current_state(
         env_release = os.environ.get("SISTER_CURRENT_RELEASE")
         if env_release:
             current_dir = Path(env_release).expanduser().resolve()
-        else:
+        elif mode == "production":
             prod_install_root = os.environ.get("SISTER_PRODUCTION_INSTALL_ROOT")
             if not prod_install_root and os.environ.get("SISTER_PRODUCTION_ROOT"):
                 prod_install_root = str(Path(os.environ["SISTER_PRODUCTION_ROOT"]) / "opt" / "sister")
@@ -153,16 +154,16 @@ def load_current_state(
                 cand = Path(prod_install_root).expanduser() / "current"
                 if cand.is_symlink() or cand.is_dir():
                     current_dir = cand.resolve()
+        else:
+            install_root = os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT")
+            if install_root:
+                cand = Path(install_root).expanduser() / "current"
+                if cand.is_symlink() or cand.is_dir():
+                    current_dir = cand.resolve()
             else:
-                install_root = os.environ.get("SISTER_WORKSTATION_INSTALL_ROOT")
-                if install_root:
-                    cand = Path(install_root).expanduser() / "current"
-                    if cand.is_symlink() or cand.is_dir():
-                        current_dir = cand.resolve()
-                else:
-                    default_cand = Path.home() / ".local" / "share" / "sister" / "current"
-                    if default_cand.is_symlink() or default_cand.is_dir():
-                        current_dir = default_cand.resolve()
+                default_cand = Path.home() / ".local" / "share" / "sister" / "current"
+                if default_cand.is_symlink() or default_cand.is_dir():
+                    current_dir = default_cand.resolve()
 
     if not current_dir or not current_dir.exists():
         return None
@@ -393,9 +394,25 @@ def load_desired_state(
             "gateway": resolved_comp.get("gateway"),
         }
 
+    cand_digest = candidate_manifest.get("candidate_digest")
+    if not cand_digest and CANDIDATE_CLI.is_file():
+        res_digest = subprocess.run(
+            [sys.executable, str(CANDIDATE_CLI), "digest", str(candidate_dir), "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if res_digest.returncode == 0:
+            try:
+                cand_digest = json.loads(res_digest.stdout).get("candidate_digest")
+            except Exception:
+                cand_digest = None
+
     return {
         "candidate_id": candidate_manifest.get("candidate_id", candidate_dir.name),
         "candidate_dir": str(candidate_dir),
+        "candidate_digest": cand_digest,
         "candidate_manifest": candidate_manifest,
         "resolved_deployment": resolved_deployment,
         "resolved_file": str(resolved_file_path),
@@ -1364,7 +1381,7 @@ def execute_apply(
 
     with ReconcileLock(state_root):
         # 1. OBSERVE & PLAN sob lock operacional
-        current = load_current_state(current_release_arg, probe_runtime=True)
+        current = load_current_state(current_release_arg, mode=mode, probe_runtime=True)
         desired = load_desired_state(desired_candidate_arg, desired_deployment_arg)
         plan = compute_plan(current, desired, mode=mode, probe_runtime=True)
 
@@ -1398,10 +1415,30 @@ def execute_apply(
         untouched = [c["component_id"] for c in plan["changes"] if c["action"] == "KEEP"]
 
         if not active_changes and plan["gateway"]["action"] == "KEEP" and plan["projection"]["action"] == "KEEP":
+            release_id = None
+            release_path = None
+            source_candidate_id = None
+            source_candidate_digest = None
+            if current:
+                release_id = current.get("release_id")
+                release_path = current.get("current_dir")
+                curr_manifest = current.get("manifest", {})
+                source_candidate_id = (
+                    curr_manifest.get("candidate", {}).get("candidate_id")
+                    or curr_manifest.get("candidate_id")
+                )
+                source_candidate_digest = (
+                    curr_manifest.get("candidate", {}).get("candidate_digest")
+                    or curr_manifest.get("candidate_digest")
+                )
             return {
                 "schema": APPLY_SCHEMA,
                 "status": "NO_OP",
                 "mode": mode,
+                "release_id": release_id,
+                "release_path": release_path,
+                "source_candidate_id": source_candidate_id,
+                "source_candidate_digest": source_candidate_digest,
                 "executed_changes": [],
                 "untouched_components": untouched,
                 "summary": plan["summary"],
@@ -1766,7 +1803,11 @@ def execute_apply(
                 "schema": APPLY_SCHEMA,
                 "status": "SUCCESS",
                 "mode": mode,
+                "release_id": target_release_dir.name if target_release_dir else (current["release_id"] if current else None),
+                "release_path": str(target_release_dir) if target_release_dir else (str(current_dir) if current_dir else None),
                 "target_release": str(target_release_dir) if target_release_dir else str(current_dir),
+                "source_candidate_id": desired.get("candidate_id"),
+                "source_candidate_digest": desired.get("candidate_digest"),
                 "executed_changes": executed_changes,
                 "untouched_components": untouched,
                 "summary": plan["summary"],
@@ -1931,6 +1972,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             current = load_current_state(
                 args.current_release,
+                mode=args.mode,
                 probe_runtime=args.probe_runtime,
             )
             desired = load_desired_state(
