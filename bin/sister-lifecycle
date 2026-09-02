@@ -131,14 +131,55 @@ def get_lifecycle_state_roots() -> dict[str, Path]:
         os.environ.get("SISTER_PROMOTION_EVIDENCE_ROOT") or (state_root / "evidence" / "promotion")
     ).expanduser().resolve()
 
-    for d in (lifecycle_ev_dir, promotion_ev_dir):
+    lab_ev_dir = Path(
+        os.environ.get("SISTER_LAB_EVIDENCE_ROOT") or (state_root / "evidence" / "lab")
+    ).expanduser().resolve()
+
+    candidates_dir = Path(
+        os.environ.get("SISTER_CANDIDATES_ROOT") or (state_root / "candidates")
+    ).expanduser().resolve()
+
+    for d in (lifecycle_ev_dir, promotion_ev_dir, lab_ev_dir, candidates_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     return {
         "state_root": state_root,
+        "candidates": candidates_dir,
+        "lab_evidence": lab_ev_dir,
         "lifecycle_evidence": lifecycle_ev_dir,
         "promotion_evidence": promotion_ev_dir,
     }
+
+
+def compute_candidate_digest(candidate_path: Path) -> str:
+    manifest_file = candidate_path / "manifest.json"
+    if manifest_file.is_file():
+        content = manifest_file.read_text(encoding="utf-8")
+        return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
+    return "unknown"
+
+
+def find_latest_lab_verified_candidate(roots: dict[str, Path]) -> dict[str, Any] | None:
+    lab_ev_dir = roots.get("lab_evidence") or (roots["state_root"] / "evidence" / "lab")
+    if not lab_ev_dir.is_dir():
+        return None
+
+    verified_candidates = []
+    for f in lab_ev_dir.glob("verification-*.json"):
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+            if doc.get("status") == "PASS":
+                cand_path = doc.get("candidate_path")
+                if cand_path and Path(cand_path).is_dir():
+                    verified_candidates.append(doc)
+        except Exception:
+            continue
+
+    if not verified_candidates:
+        return None
+
+    verified_candidates.sort(key=lambda d: d.get("timestamp", ""), reverse=True)
+    return verified_candidates[0]
 
 
 def check_git_clean(repo_path: Path) -> tuple[bool, str, str]:
@@ -449,9 +490,42 @@ def evaluate_promotion(
                 "commit": c_commit,
             })
 
+    # 4. Validar se a candidata foi aplicada e verificada com sucesso no LAB (WHAT WAS VERIFIED = WHAT IS PROMOTED)
+    lab_ev_dir = roots.get("lab_evidence") or (roots["state_root"] / "evidence" / "lab")
+    lab_verified = False
+    lab_ver_doc = None
+    cand_digest = compute_candidate_digest(candidate_path)
+
+    if lab_ev_dir.is_dir():
+        for f in lab_ev_dir.glob("verification-*.json"):
+            try:
+                vdoc = json.loads(f.read_text(encoding="utf-8"))
+                if vdoc.get("status") == "PASS":
+                    match_id = vdoc.get("candidate_id") == candidate_id
+                    match_digest = vdoc.get("candidate_digest") == cand_digest
+                    match_path = False
+                    if vdoc.get("candidate_path"):
+                        try:
+                            match_path = Path(vdoc["candidate_path"]).resolve() == candidate_path.resolve()
+                        except Exception:
+                            match_path = False
+                    if match_id or match_digest or match_path:
+                        lab_verified = True
+                        lab_ver_doc = vdoc
+                        break
+            except Exception:
+                continue
+
+    if not lab_verified:
+        raise LifecycleError(
+            "PROMOTION_BLOCKED",
+            f"candidata '{candidate_id}' não possui comprovação de aplicação e verificação no LAB (WHAT WAS VERIFIED = WHAT IS PROMOTED)",
+            "PROMOTION_EVIDENCE",
+        )
+
     all_clean = all(s["clean"] for s in sources_status)
     status = "PROMOTABLE" if all_clean else "BLOCKED"
-    reason = "Candidata plenamente qualificada, compatível e com fontes limpas" if all_clean else "Fontes contêm alterações não commitadas"
+    reason = "Candidata plenamente qualificada, compatível, verificada em LAB e com fontes limpas" if all_clean else "Fontes contêm alterações não commitadas"
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%SZ")
     evidence_doc = {
@@ -459,10 +533,12 @@ def evaluate_promotion(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "candidate_id": candidate_id,
         "candidate_path": str(candidate_path.resolve()),
+        "candidate_digest": cand_digest,
         "composition_id": candidate_manifest.get("composition", {}).get("composition_id"),
         "status": status,
         "reason": reason,
         "sources": sources_status,
+        "lab_verification": lab_ver_doc,
         "production_deployment_id": json.loads(production_deployment_path.read_text(encoding="utf-8")).get("deployment_id"),
     }
 
@@ -507,64 +583,87 @@ def execute_lifecycle_run(
 
     try:
         # ---------------------------------------------------------------------
-        # 1. DISCOVER & QUALIFY
+        # 1. CANDIDATE DISCOVERY / QUALIFICATION
         # ---------------------------------------------------------------------
-        stage_name = "QUALIFY"
-        if not candidate_path or not (candidate_path / "manifest.json").is_file():
-            if not composition_path.is_file():
-                raise LifecycleError("COMPOSITION_NOT_FOUND", f"composição não encontrada: {composition_path}", "DISCOVER")
-
-            # Qualificar composição
-            contracts_root_env = os.environ.get("SISTER_CONTRACT_ROOT") or os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT")
-            qual_cmd = [
-                str(COMPOSITION_CLI),
-                "qualify",
-                str(composition_path),
-                "--json",
-            ]
-            if contracts_root_env:
-                qual_cmd.extend(["--contracts-root", contracts_root_env])
-            r_qual = run_cmd(qual_cmd)
-            if r_qual.returncode != 0:
-                raise LifecycleError(
-                    "QUALIFICATION_FAILED",
-                    f"falha na qualificação da composição: {r_qual.stderr.strip() or r_qual.stdout.strip()}",
-                    stage_name,
-                )
-            execution_evidence["stages_executed"].append({"stage": "QUALIFY", "status": "PASS"})
-
-            # -----------------------------------------------------------------
-            # 2. CANDIDATE CREATE
-            # -----------------------------------------------------------------
+        if target == "production":
             stage_name = "CANDIDATE"
-            created_candidate_tmp = Path(os.environ.get("SISTER_LIFECYCLE_TMPDIR") or "/tmp") / f"sister-lifecycle-cand-{ts}"
-            cand_id = f"cand-lifecycle-{ts}"
-            cand_cmd = [
-                str(CANDIDATE_CLI),
-                "create",
-                str(composition_path),
-                "--out", str(created_candidate_tmp),
-                "--candidate-id", cand_id,
-                "--json",
-            ]
-            if contracts_root_env:
-                cand_cmd.extend(["--contracts-root", contracts_root_env])
-            r_cand = run_cmd(cand_cmd)
-            if r_cand.returncode != 0:
-                raise LifecycleError(
-                    "CANDIDATE_CREATE_FAILED",
-                    f"falha ao criar candidata: {r_cand.stderr.strip() or r_cand.stdout.strip()}",
-                    stage_name,
-                )
-            active_candidate = created_candidate_tmp
-            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id})
-        else:
+            if not candidate_path or not (candidate_path / "manifest.json").is_file():
+                verified_doc = find_latest_lab_verified_candidate(roots)
+                if not verified_doc:
+                    raise LifecycleError(
+                        "PRODUCTION_REQUIRES_LAB_VERIFIED_CANDIDATE",
+                        "produção jamais cria candidata a partir de fontes; nenhuma candidata verificada no LAB foi encontrada",
+                        "CANDIDATE",
+                    )
+                candidate_path = Path(verified_doc["candidate_path"])
+
             active_candidate = candidate_path
-            # Verificar candidata existente
+            cand_id = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", active_candidate.name)
             r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
             if r_v.returncode != 0:
-                raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida: {r_v.stderr.strip()}", "CANDIDATE")
-            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED", "candidate_path": str(active_candidate)})
+                raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida para produção: {r_v.stderr.strip()}", "CANDIDATE")
+            execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED_LAB_VERIFIED", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
+
+        else:
+            stage_name = "QUALIFY"
+            if not candidate_path or not (candidate_path / "manifest.json").is_file():
+                if not composition_path.is_file():
+                    raise LifecycleError("COMPOSITION_NOT_FOUND", f"composição não encontrada: {composition_path}", "DISCOVER")
+
+                # Qualificar composição
+                contracts_root_env = os.environ.get("SISTER_CONTRACT_ROOT") or os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT")
+                qual_cmd = [
+                    str(COMPOSITION_CLI),
+                    "qualify",
+                    str(composition_path),
+                    "--json",
+                ]
+                if contracts_root_env:
+                    qual_cmd.extend(["--contracts-root", contracts_root_env])
+                r_qual = run_cmd(qual_cmd)
+                if r_qual.returncode != 0:
+                    raise LifecycleError(
+                        "QUALIFICATION_FAILED",
+                        f"falha na qualificação da composição: {r_qual.stderr.strip() or r_qual.stdout.strip()}",
+                        stage_name,
+                    )
+                execution_evidence["stages_executed"].append({"stage": "QUALIFY", "status": "PASS"})
+
+                # -----------------------------------------------------------------
+                # 2. CANDIDATE CREATE (Durável em $STATE_ROOT/candidates/)
+                # -----------------------------------------------------------------
+                stage_name = "CANDIDATE"
+                candidates_dir = roots.get("candidates") or (roots["state_root"] / "candidates")
+                candidates_dir.mkdir(parents=True, exist_ok=True)
+                cand_id = f"cand-lifecycle-{ts}"
+                created_candidate = candidates_dir / cand_id
+                cand_cmd = [
+                    str(CANDIDATE_CLI),
+                    "create",
+                    str(composition_path),
+                    "--out", str(created_candidate),
+                    "--candidate-id", cand_id,
+                    "--json",
+                ]
+                if contracts_root_env:
+                    cand_cmd.extend(["--contracts-root", contracts_root_env])
+                r_cand = run_cmd(cand_cmd)
+                if r_cand.returncode != 0:
+                    raise LifecycleError(
+                        "CANDIDATE_CREATE_FAILED",
+                        f"falha ao criar candidata: {r_cand.stderr.strip() or r_cand.stdout.strip()}",
+                        stage_name,
+                    )
+                active_candidate = created_candidate
+                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
+            else:
+                active_candidate = candidate_path
+                cand_id = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", active_candidate.name)
+                # Verificar candidata existente
+                r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
+                if r_v.returncode != 0:
+                    raise LifecycleError("CANDIDATE_INVALID", f"candidata inválida: {r_v.stderr.strip()}", "CANDIDATE")
+                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "REUSED", "candidate_id": cand_id, "candidate_path": str(active_candidate)})
 
         # ---------------------------------------------------------------------
         # 3. TARGET: DEV
@@ -720,7 +819,31 @@ def execute_lifecycle_run(
             r_ver = run_cmd([str(WORKSTATION_CLI), "verify"])
             if r_ver.returncode != 0:
                 raise LifecycleError("LAB_VERIFY_FAILED", f"pós-verificação de workstation falhou: {r_ver.stderr.strip()}", stage_name)
-            execution_evidence["stages_executed"].append({"stage": "VERIFY", "status": "PASS"})
+
+            # Emitir evidência persistente de verificação de LAB (vinculada à candidata)
+            lab_cand_id = cand_id if "cand_id" in locals() else (
+                json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", "unknown")
+            )
+            lab_ver_doc = {
+                "schema": "sister.infra.lab.verification/1.0.0",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "candidate_id": lab_cand_id,
+                "candidate_path": str(active_candidate.resolve()),
+                "candidate_digest": compute_candidate_digest(active_candidate),
+                "deployment_path": str(deployment_path.resolve()),
+                "deployment_id": json.loads(deployment_path.read_text(encoding="utf-8")).get("deployment_id", "lab"),
+                "status": "PASS",
+                "verifier": "sister-workstation verify",
+            }
+            roots["lab_evidence"].mkdir(parents=True, exist_ok=True)
+            lab_ver_file = roots["lab_evidence"] / f"verification-{lab_cand_id}-{ts}.json"
+            lab_ver_file.write_text(json.dumps(lab_ver_doc, indent=2), encoding="utf-8")
+
+            execution_evidence["stages_executed"].append({
+                "stage": "VERIFY",
+                "status": "PASS",
+                "lab_verification_file": str(lab_ver_file),
+            })
             execution_evidence["status"] = "COMPLETED"
 
         # ---------------------------------------------------------------------

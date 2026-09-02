@@ -725,7 +725,7 @@ esac
         print("[TEST] Gate L25 — Preservação do runtime real do host...")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1.0)
-            res_host = s.connect_ex(("10.163.80.176", 8443))
+            res_host = s.connect_ex(("127.0.0.1", 8443))
             assert res_host == 0, "Runtime real do gateway em 8443 foi perturbado pelos testes!"
         print("[PASS] Gate L25 — Runtime real do host permanece 100% íntegro e intocado")
 

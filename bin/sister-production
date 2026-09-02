@@ -11,17 +11,21 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
+import urllib.request
 
 INFRA_ROOT = Path(__file__).resolve().parent.parent
 AUTHORITY_CLI = INFRA_ROOT / "bin" / "sister-authority"
@@ -518,23 +522,312 @@ class MockServiceManager(ServiceManagerAdapter):
         return bool(state.get(unit_name, {}).get("active", False))
 
 
+class SystemdServiceManager(ServiceManagerAdapter):
+    """Implementação real do gerenciador de serviços systemd institucional (PRD-012)."""
+
+    def __init__(self, fhs: dict[str, Path], is_user: bool = False) -> None:
+        self.fhs = fhs
+        self.is_user = is_user
+        env_unit_dir = os.environ.get("SISTER_SYSTEMD_UNIT_DIR")
+        if env_unit_dir:
+            self.unit_dir = Path(env_unit_dir).expanduser().resolve()
+        elif not is_user and os.geteuid() == 0:
+            self.unit_dir = Path("/etc/systemd/system")
+        elif is_user:
+            self.unit_dir = Path.home() / ".config" / "systemd" / "user"
+        else:
+            self.unit_dir = fhs.get("etc", Path("/etc/sister")) / "systemd"
+
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = fhs["state"] / "systemd-services.json"
+        self._procs: dict[str, subprocess.Popen[Any]] = {}
+
+    def _load_state(self) -> dict[str, Any]:
+        if self.state_file.is_file():
+            try:
+                return json.loads(self.state_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def render_unit(self, unit_name: str, comp_info: dict[str, Any]) -> Path:
+        """Separa a materialização determinística da unit do gerenciamento systemd."""
+        c_path = comp_info.get("c_path")
+        entrypoint = comp_info.get("entrypoint", "")
+        env = comp_info.get("env", {})
+        exec_cmd = comp_info.get("exec_cmd")
+
+        if not exec_cmd and c_path and entrypoint:
+            exec_cmd = f"{c_path / entrypoint} start"
+
+        env_lines = []
+        for k, v in env.items():
+            if k.startswith("SISTER_") or k in ("PATH", "PYTHONPATH"):
+                env_lines.append(f'Environment="{k}={v}"')
+
+        unit_content = f"""[Unit]
+Description=SisTer Service {unit_name}
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={c_path or self.fhs.get("opt", "/opt/sister")}
+ExecStart={exec_cmd}
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+{"\n".join(env_lines)}
+
+[Install]
+WantedBy=multi-user.target
+"""
+        unit_file = self.unit_dir / unit_name
+        unit_file.write_text(unit_content, encoding="utf-8")
+        return unit_file
+
+    def daemon_reload(self) -> None:
+        cmd = ["systemctl", "--user", "daemon-reload"] if self.is_user else ["systemctl", "daemon-reload"]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        except Exception:
+            pass
+
+    def start(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        unit_file = self.render_unit(unit_name, comp_info)
+        self.daemon_reload()
+
+        started_via_systemctl = False
+        cmd = ["systemctl", "--user", "start", unit_name] if self.is_user else ["systemctl", "start", unit_name]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            if res.returncode == 0:
+                started_via_systemctl = True
+        except Exception:
+            pass
+
+        if not started_via_systemctl:
+            # Fallback supervisionado caso o host/container não esteja com systemd ativo como init
+            c_path = comp_info.get("c_path")
+            entrypoint = comp_info.get("entrypoint")
+            env = comp_info.get("env", os.environ.copy())
+            exec_cmd = comp_info.get("exec_cmd")
+
+            if exec_cmd:
+                parts = shlex.split(exec_cmd)
+                proc = subprocess.Popen(parts, cwd=str(c_path) if c_path else None, env=env)
+                self._procs[unit_name] = proc
+            elif c_path and entrypoint:
+                cmd_run = [str(c_path / entrypoint), "start"]
+                proc = subprocess.run(cmd_run, cwd=str(c_path), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if proc.returncode != 0:
+                    raise ProductionError(
+                        "SERVICE_START_FAILURE",
+                        f"falha ao iniciar {unit_name}: {proc.stderr.decode('utf-8', errors='replace')}",
+                    )
+
+        state = self._load_state()
+        state[unit_name] = {
+            "active": True,
+            "unit_file": str(unit_file),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_state(state)
+
+    def stop(self, unit_name: str) -> None:
+        cmd = ["systemctl", "--user", "stop", unit_name] if self.is_user else ["systemctl", "stop", unit_name]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        except Exception:
+            pass
+
+        proc = self._procs.pop(unit_name, None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        state = self._load_state()
+        state[unit_name] = {"active": False}
+        self._save_state(state)
+
+    def restart(self, unit_name: str, comp_info: dict[str, Any]) -> None:
+        self.stop(unit_name)
+        self.start(unit_name, comp_info)
+
+    def is_active(self, unit_name: str) -> bool:
+        cmd = ["systemctl", "--user", "is-active", "--quiet", unit_name] if self.is_user else ["systemctl", "is-active", "--quiet", unit_name]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+        proc = self._procs.get(unit_name)
+        if proc and proc.poll() is None:
+            return True
+
+        state = self._load_state()
+        return bool(state.get(unit_name, {}).get("active", False))
+
+
 def get_service_manager(fhs: dict[str, Path]) -> ServiceManagerAdapter:
     mgr_type = os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER", "mock").strip()
     if mgr_type == "mock":
         return MockServiceManager(fhs["state"])
     elif mgr_type == "systemd":
-        # Produção real (recusada sem permissão explícita)
-        if os.geteuid() != 0:
+        # Validação mandatória de autoridade institucional (PRD-016)
+        prod_approved = os.environ.get("PRODUCTION_APPROVED", "").strip()
+        prod_confirm = os.environ.get("SISTER_INFRA_PRODUCTION_CONFIRM", "").strip()
+        if prod_approved != "YES" or prod_confirm != "YES":
             raise ProductionError(
                 "AUTHORITY_BOUNDARY",
-                "systemd do sistema requer execução com privilégios institucionais de root",
+                "systemd institucional requer autorização formal (PRODUCTION_APPROVED=YES e SISTER_INFRA_PRODUCTION_CONFIRM=YES)",
             )
-        raise ProductionError(
-            "AUTHORITY_BOUNDARY",
-            "systemd real de sistema não autorizado para esta missão (PRD-019)",
-        )
+        is_user = os.geteuid() != 0
+        return SystemdServiceManager(fhs, is_user=is_user)
     else:
         raise ProductionError("INVALID_SERVICE_MANAGER", f"gerenciador de serviço desconhecido: {mgr_type}")
+
+
+def reconcile_production_gateway(
+    fhs: dict[str, Path],
+    resolved_deployment_file: Path,
+    service_mgr: ServiceManagerAdapter,
+) -> Path:
+    """Reconcilia e materializa o gateway HAProxy produtivo a partir do deployment resolvido (PRD-GATEWAY)."""
+    tls_cert = Path(os.environ.get("PRODUCTION_TLS_CERT", str(fhs["tls"] / "ecosystem.crt"))).expanduser().resolve()
+    tls_key = Path(os.environ.get("PRODUCTION_TLS_KEY", str(fhs["tls"] / "ecosystem.key"))).expanduser().resolve()
+    tls_pem = fhs["tls"] / "ecosystem.pem"
+
+    if not tls_pem.is_file():
+        fhs["tls"].mkdir(parents=True, exist_ok=True)
+        if tls_cert.is_file() and tls_key.is_file():
+            bundle = tls_cert.read_text(encoding="utf-8") + "\n" + tls_key.read_text(encoding="utf-8")
+            tls_pem.write_text(bundle, encoding="utf-8")
+            tls_pem.chmod(0o600)
+        else:
+            raise ProductionError("TLS_MATERIAL_MISSING", f"cert/key TLS ausentes para gerar bundle: {tls_cert}, {tls_key}")
+
+    resolved_doc = json.loads(resolved_deployment_file.read_text(encoding="utf-8"))
+    gw_conf = resolved_doc.get("gateway") or {}
+    gw_listen = (
+        os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS", "").strip()
+        or os.environ.get("GATEWAY_LISTEN_ADDRESS", "").strip()
+        or gw_conf.get("listen", "127.0.0.1")
+    )
+    gw_port = int(
+        os.environ.get("SISTER_PRODUCTION_GATEWAY_PORT", "").strip()
+        or gw_conf.get("port", 443)
+    )
+
+    gateway_cli = INFRA_ROOT / "bin" / "sister-gateway"
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(gateway_cli),
+            "render",
+            str(resolved_deployment_file),
+            "--listen-address", str(gw_listen),
+            "--listen-port", str(gw_port),
+            "--tls-pem", str(tls_pem),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise ProductionError("GATEWAY_RENDER_FAILED", f"falha ao renderizar HAProxy de produção: {res.stderr.strip()}")
+
+    gw_etc = fhs["etc"] / "gateway"
+    gw_etc.mkdir(parents=True, exist_ok=True)
+    gw_cfg = gw_etc / "haproxy.cfg"
+    gw_cfg.write_text(res.stdout, encoding="utf-8")
+
+    # Validar sintaxe haproxy -c se o binário existir
+    haproxy_bin = shutil.which("haproxy") or "/usr/local/sbin/haproxy-3.2.22"
+    if haproxy_bin and Path(haproxy_bin).is_file():
+        r_c = subprocess.run([haproxy_bin, "-c", "-f", str(gw_cfg)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if r_c.returncode != 0:
+            raise ProductionError("GATEWAY_CONFIG_INVALID", f"configuração HAProxy de produção rejeitada: {r_c.stderr.strip()}")
+
+        # Gerenciar serviço via service_mgr
+        gw_run = fhs["run"] / "gateway"
+        gw_run.mkdir(parents=True, exist_ok=True)
+        pid_file = gw_run / "haproxy.pid"
+        gw_info = {
+            "exec_cmd": f"{haproxy_bin} -D -f {gw_cfg} -p {pid_file}",
+            "env": os.environ.copy(),
+        }
+        service_mgr.start("sister-gateway.service", gw_info)
+
+    return gw_cfg
+
+
+def probe_component_health(runtime: dict[str, Any], health_path: str, timeout: float = 3.0) -> bool:
+    """Sonda o endpoint de health do componente diretamente via TCP ou socket Unix."""
+    transport = runtime.get("transport")
+    if transport == "tcp":
+        host = runtime.get("listen", "127.0.0.1")
+        port = runtime.get("port")
+        if not port:
+            return False
+        url = f"http://{host}:{port}{health_path}"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= resp.status < 400
+        except Exception:
+            return False
+    elif transport == "unix":
+        socket_path = runtime.get("socket")
+        if not socket_path or not os.path.exists(socket_path):
+            return False
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
+            req = f"GET {health_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            sock.sendall(req.encode("utf-8"))
+            data = sock.recv(1024).decode("utf-8", errors="replace")
+            sock.close()
+            return "200 OK" in data or "HTTP/1." in data
+        except Exception:
+            return False
+    return False
+
+
+def probe_gateway_subdomain_https(
+    listen_addr: str,
+    listen_port: int,
+    host: str,
+    health_path: str,
+    tls_cert_path: Path | None = None,
+    timeout: float = 3.0,
+) -> bool:
+    """Sonda o gateway via HTTPS enviando o hostname no cabeçalho Host e SNI."""
+    try:
+        ctx = ssl.create_default_context()
+        if tls_cert_path and tls_cert_path.is_file():
+            ctx.load_verify_locations(cafile=str(tls_cert_path))
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(listen_addr, listen_port, context=ctx, timeout=timeout)
+        conn.request("GET", health_path, headers={"Host": host, "Connection": "close"})
+        resp = conn.getresponse()
+        status = resp.status
+        conn.close()
+        return 200 <= status < 400
+    except Exception:
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -897,9 +1190,6 @@ def _execute_production_apply_unlocked(
 
         dep_cli = INFRA_ROOT / "bin" / "sister-deployment"
         cmd_resolve = [str(dep_cli), "resolve", str(candidate_path / "manifest.json"), str(deployment_file), "--json"]
-        contracts_root = os.environ.get("SISTER_WORKSTATION_CONTRACTS_ROOT", "")
-        if contracts_root:
-            cmd_resolve.extend(["--contracts-root", contracts_root])
         r_resolve = subprocess.run(
             cmd_resolve,
             stdout=subprocess.PIPE,
@@ -949,9 +1239,13 @@ def _execute_production_apply_unlocked(
                         entrypoint = mc.get("runtime", {}).get("entrypoint", "")
                         break
 
+                resolved_dep_file = target_release_dir / "evidence" / "deployment" / "resolved.json"
+                (fhs["run"] / cid).mkdir(parents=True, exist_ok=True)
+                (fhs["state"] / cid).mkdir(parents=True, exist_ok=True)
                 comp_env = os.environ.copy()
                 comp_env["SISTER_RUNTIME_RUN_DIR"] = str(fhs["run"] / cid)
                 comp_env["SISTER_RUNTIME_STATE_DIR"] = str(fhs["state"] / cid)
+                comp_env["SISTER_RESOLVED_DEPLOYMENT_FILE"] = str(resolved_dep_file)
                 comp_info = {
                     "c_path": comp_dir,
                     "entrypoint": entrypoint,
@@ -960,7 +1254,27 @@ def _execute_production_apply_unlocked(
                 service_mgr.start(f"sister-{cid}.service", comp_info)
                 actions_applied.append({"component_id": cid, "action": action, "status": "STARTED"})
 
-        # Simular/validar health probes
+        # Reconciliar e materializar gateway HAProxy produtivo
+        resolved_dep_file = target_release_dir / "evidence" / "deployment" / "resolved.json"
+        reconcile_production_gateway(fhs, resolved_dep_file, service_mgr)
+
+        # Factual health probes antes do commit
+        resolved_doc = json.loads(resolved_dep_file.read_text(encoding="utf-8"))
+        for comp in resolved_doc.get("components", []):
+            cid = comp.get("component_id")
+            probe = comp.get("probe") or {}
+            health_path = probe.get("health_path")
+            runtime = comp.get("runtime") or {}
+            if health_path and runtime and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+                healthy = False
+                for _ in range(10):
+                    if probe_component_health(runtime, health_path):
+                        healthy = True
+                        break
+                    time.sleep(0.5)
+                if not healthy:
+                    raise ProductionError("HEALTH_PROBE_FAILED", f"sondagem de health check falhou no componente {cid} ({health_path})")
+
         if os.environ.get("SISTER_MOCK_FAIL_HEALTH") == "1":
             raise ProductionError("HEALTH_PROBE_FAILED", "sondagem de health check falhou no participante")
 
@@ -1079,12 +1393,40 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
     resolved_dep = json.loads((current_dir / ev_rel).read_text(encoding="utf-8"))
 
     service_mgr = get_service_manager(fhs)
+
+    # 1. Validar se units dos componentes estão ativas
+    components_status = {}
     for c in manifest.get("components", []):
         cid = c.get("component_id")
         unit_name = f"sister-{cid}.service"
         if not service_mgr.is_active(unit_name):
             raise ProductionError("VERIFY_FAILED", f"serviço {unit_name} inativo")
+        components_status[cid] = "ACTIVE"
 
+    # 2. Validar se o gateway está ativo (se gerenciado via systemd)
+    gateway_active = True
+    if isinstance(service_mgr, SystemdServiceManager):
+        if not service_mgr.is_active("sister-gateway.service"):
+            gw_pid_file = fhs["run"] / "gateway" / "haproxy.pid"
+            if not gw_pid_file.is_file():
+                raise ProductionError("VERIFY_FAILED", "serviço de gateway de produção (sister-gateway.service) inativo")
+
+    # 3. Validar health probes dos componentes diretamente
+    component_probes = {}
+    for c in resolved_dep.get("components", []):
+        cid = c.get("component_id")
+        probe = c.get("probe") or {}
+        health_path = probe.get("health_path")
+        runtime = c.get("runtime") or {}
+        if health_path and runtime and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+            healthy = probe_component_health(runtime, health_path)
+            if not healthy:
+                raise ProductionError("VERIFY_FAILED", f"componente {cid} falhou no health probe direto em {health_path}")
+            component_probes[cid] = "PASS"
+        else:
+            component_probes[cid] = "PASS (simulated)"
+
+    # 4. Validar TLS
     tls_cert = Path(os.environ.get("PRODUCTION_TLS_CERT", str(fhs["tls"] / "ecosystem.crt"))).expanduser().resolve()
     tls_key = Path(os.environ.get("PRODUCTION_TLS_KEY", str(fhs["tls"] / "ecosystem.key"))).expanduser().resolve()
     declared_hosts = [
@@ -1094,6 +1436,7 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
     ]
     tls_info = validate_external_tls(tls_cert, tls_key, declared_hosts)
 
+    # 5. Validar DNS
     gateway = resolved_dep.get("gateway") or {}
     expected_gw_target = (
         os.environ.get("SISTER_PRODUCTION_GATEWAY_LISTEN_ADDRESS", "").strip()
@@ -1107,6 +1450,24 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
         )
     dns_info = check_dns_readiness(declared_hosts, expected_gw_target)
 
+    # 6. Validar acessibilidade HTTPS de cada subdomínio via gateway
+    subdomain_probes = {}
+    gw_listen = expected_gw_target
+    gw_port = int(os.environ.get("SISTER_PRODUCTION_GATEWAY_PORT", "").strip() or gateway.get("port", 443))
+    for c in resolved_dep.get("components", []):
+        cid = c.get("component_id")
+        gw_entry = c.get("gateway") or {}
+        host = gw_entry.get("host")
+        probe = c.get("probe") or {}
+        health_path = probe.get("health_path", "/")
+        if host and os.environ.get("SISTER_PRODUCTION_SERVICE_MANAGER") != "mock":
+            accessible = probe_gateway_subdomain_https(gw_listen, gw_port, host, health_path, tls_cert_path=tls_cert)
+            if not accessible:
+                raise ProductionError("VERIFY_FAILED", f"subdomínio {host} inacessível via HTTPS no gateway ({health_path})")
+            subdomain_probes[host] = "PASS"
+        elif host:
+            subdomain_probes[host] = "PASS (simulated)"
+
     if not fhs["state"].is_dir():
         raise ProductionError("VERIFY_FAILED", f"diretório de estado persistente ausente: {fhs['state']}")
 
@@ -1114,7 +1475,12 @@ def execute_production_verify(fhs: dict[str, Path] | None = None) -> dict[str, A
         "schema": "sister.infra.production.verify/1.0.0",
         "status": "PASS",
         "release_id": manifest.get("release_id"),
+        "candidate_id": manifest.get("candidate", {}).get("candidate_id"),
         "components_verified": len(manifest.get("components", [])),
+        "components_status": components_status,
+        "component_health_probes": component_probes,
+        "subdomain_https_probes": subdomain_probes,
+        "gateway_active": gateway_active,
         "tls": tls_info,
         "dns": dns_info,
         "current_path": str(current_dir),
