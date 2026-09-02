@@ -443,15 +443,34 @@ def main() -> None:
         print("[PASS] Gate 7 — Paridade comprovada: mesma candidata em LAB e PROD sem reconfiguração")
 
         # -------------------------------------------------------------------
-        # GATE 8: Verificação do workstation-lab.json oficial do repositório
+        # GATE 8: Eliminação de ambiguidade (rejeição de 'base_domain' no gateway)
         # -------------------------------------------------------------------
-        print("[TEST] Gate 8 — Validação do deployment canônico workstation-lab.json...")
+        print("[TEST] Gate 8 — Invariante de campo canônico: gateway.base_domain é rejeitado fail-closed...")
+        dep_ambiguous = json.loads(dep_lab_file.read_text(encoding="utf-8"))
+        del dep_ambiguous["gateway"]["domain"]
+        dep_ambiguous["gateway"]["base_domain"] = "lab.sister.local"
+        ambig_file = tmp / "deployment_ambiguous.json"
+        write_json(ambig_file, dep_ambiguous)
+
+        res_ambig = run_cmd([
+            sys.executable, str(DEPLOYMENT_CLI),
+            "resolve", str(manifest_file), str(ambig_file), "--json",
+        ])
+        assert res_ambig.returncode != 0, "Deveria ter rejeitado campo ambíguo 'base_domain'"
+        assert "Additional properties are not allowed ('base_domain' was unexpected)" in res_ambig.stderr or "deployment rejeitado" in res_ambig.stderr
+        print("[PASS] Gate 8 — Contrato rejeita 'base_domain' e exige exclusivamente 'domain'")
+
+        # -------------------------------------------------------------------
+        # GATE 9: Verificação do workstation-lab.json oficial do repositório
+        # -------------------------------------------------------------------
+        print("[TEST] Gate 9 — Validação do deployment canônico workstation-lab.json...")
         repo_dep_file = ROOT / "config" / "deployments" / "workstation-lab.json"
         dep_content = json.loads(repo_dep_file.read_text(encoding="utf-8"))
         assert dep_content.get("gateway", {}).get("domain") == "lab.sister.local"
+        assert "base_domain" not in dep_content.get("gateway", {}), "workstation-lab.json não deve conter o campo ambíguo 'base_domain'!"
         for b in dep_content.get("bindings", []):
             assert "gateway" not in b, f"Binding {b.get('system_id')} não deve conter gateway no deployment oficial!"
-        print("[PASS] Gate 8 — workstation-lab.json atende rigorosamente a exposição declarativa por domínio único")
+        print("[PASS] Gate 9 — workstation-lab.json atende rigorosamente ao padrão canônico gateway.domain")
 
     print("\n=====================================================================")
     print(" [SUCESSO] Todos os Gates de Exposição Declarativa Única passaram!")

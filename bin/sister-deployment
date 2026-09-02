@@ -158,7 +158,7 @@ def validate_bindings(
     gateway_hosts: set[str] = set()
 
     gw_config = deployment.get("gateway") or {}
-    base_domain = gw_config.get("domain") or gw_config.get("base_domain")
+    domain = gw_config.get("domain")
 
     for binding in deployment["bindings"]:
         system_id = binding["system_id"]
@@ -170,14 +170,14 @@ def validate_bindings(
             raise DeploymentError(f"binding desconhecido: {system_id}")
         by_system[system_id] = binding
 
-        if base_domain:
+        if domain:
             if binding.get("gateway") is not None or any(
                 k in binding for k in ("domain", "proxy", "certificate", "tls")
             ):
                 raise DeploymentError(
                     f"configuração inválida no binding '{system_id}': nenhum "
                     "sistema integrado deve conter configuração própria de "
-                    "domínio, proxy ou certificado quando o domínio-base é declarado no gateway"
+                    "domínio, proxy ou certificado quando o gateway.domain é declarado"
                 )
 
         runtime = binding["runtime"]
@@ -190,7 +190,7 @@ def validate_bindings(
                 )
             tcp_endpoints.add(endpoint)
 
-        if not base_domain:
+        if not domain:
             gateway = binding.get("gateway")
             if gateway is not None:
                 normalized_host = gateway["host"].lower()
@@ -270,7 +270,7 @@ def resolve(
     gateway_config = deployment.get("gateway") or {}
     default_protocol = gateway_config.get("protocol", "https")
     default_port = gateway_config.get("port", 8443)
-    base_domain = gateway_config.get("domain") or gateway_config.get("base_domain")
+    domain = gateway_config.get("domain")
 
     bindings = validate_bindings(components, deployment)
     resolved_components = []
@@ -285,9 +285,9 @@ def resolve(
         if "probe" in binding:
             resolved["probe"] = binding["probe"]
 
-        if base_domain:
+        if domain:
             identity = component["component_id"].lower().replace("_", "-")
-            host = f"{identity}.{base_domain}"
+            host = f"{identity}.{domain}"
             if (default_protocol == "https" and default_port == 443) or (
                 default_protocol == "http" and default_port == 80
             ):

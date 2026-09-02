@@ -131,13 +131,13 @@ componentes individualmente.
 
 ## 7. DNS e TLS de laboratório
 
-Nomes `*.gateway.test`, CA privada de laboratório e certificados leaf dedicados
+Subdomínios derivados sob `gateway.domain` (como `<component_id>.lab.sister.local`), CA privada de laboratório e certificados leaf dedicados
 são ferramentas de desenvolvimento e validação do ambiente LAB.
 
 Eles são resolvidos e roteados no escopo do gateway LAB local (via SNI e
-cabeçalho `Host`). A resolução desses nomes nos clientes da LAN continua sendo
-uma preocupação de publicação e deployment (por exemplo, configuração de DNS
-local ou `/etc/hosts` na LAN), e não do runtime individual dos participantes.
+cabeçalho `Host`). A resolução desses nomes nos clientes da LAN é provida
+pelo comando declarativo `sister-infra workstation hosts-line` (ou configuração de DNS
+local), mantendo a autoridade no gateway e desacoplada do runtime individual dos participantes.
 
 ### 7.1 Modelo de Autoridade TLS Convergida (OPS-07A2)
 
@@ -227,18 +227,11 @@ qual arquivo do gateway reescrever
 Essas decisões pertencem ao control plane quando puderem ser derivadas de
 contratos e estado factual.
 
-## 10. Interface ainda não disponível
+## 10. Interfaces e Modos Disponíveis
 
-Não confundir visão desejada com estado factual.
-
-O DEV Preview já está disponível desde o OPS-05:
-
-```bash
-sister-infra dev preview <component>
-```
-
-A interface reconciliada de produção ainda permanece no roadmap:
-
-```bash
-sister-infra production apply
-```
+Não confundir visão desejada com estado factual:
+- **DEV Preview**: disponível desde OPS-05 (`sister-infra dev preview <component>`).
+- **LAB Reconciliado**: disponível desde OPS-06 (`sister-infra lab plan/apply`).
+- **PROD (Operações Governadas)**: disponível desde OPS-07 (`sister-infra production plan/apply/verify`), operando sob travas institucionais de autoridade, digest selado e verificação rigorosa de DNS/TLS.
+- **Lifecycle End-to-End**: orquestrador unificado disponível desde OPS-08 (`sister-infra lifecycle plan/run`).
+- **Workstation Repair**: manutenção reflexiva convergente disponível desde OPS-10 (`sister-infra workstation repair`).

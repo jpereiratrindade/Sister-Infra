@@ -2,23 +2,38 @@
 
 O contrato `sister.infra.deployment/1.0.0` descreve como uma implantação
 concreta liga os participantes de uma candidata qualificada à infraestrutura
-física. A identidade continua pertencendo exclusivamente ao
-`.sister/component.json`; por isso cada binding referencia apenas `system_id`.
+física e como o gateway único reconcilia a exposição dos sistemas integrados.
 
-Cada participante deve receber exatamente um binding. O resolvedor rejeita
-participantes ausentes ou desconhecidos, identidades duplicadas, colisões de
-endpoint TCP e hosts de gateway repetidos.
+A identidade pertence exclusivamente ao `.sister/component.json` de cada participante;
+por isso cada binding no deployment referencia apenas `system_id`.
 
-## Runtime
+## 1. Exposição Declarativa por Domínio Único
 
+O contrato adota o princípio de **domínio-base único**:
+- O operador declara unicamente o domínio-base no bloco superior `gateway.domain`
+  (ex: `"domain": "lab.sister.local"` em LAB ou `"domain": "sister.institucional.gov.br"` em PRODUÇÃO).
+- Os sistemas integrados são descobertos automaticamente a partir da composição/candidata
+  e recebem subdomínios canônicos derivados diretamente de sua identidade:
+  $$\text{host} = \text{component\_id} \cdot \text{domain}$$
+- O gateway único reconcilia automaticamente roteamento HAProxy, certificados TLS e DNS.
+
+### Invariante de Isolamento Estrito (FAIL-CLOSED)
+Nenhum sistema integrado deve conter configuração própria de domínio, proxy ou certificado.
+Quando `gateway.domain` está definido:
+- Qualquer tentativa de um binding declarar `gateway`, `host`, `domain`, `proxy`, `certificate` ou `tls`
+  falha fechado imediatamente (`DeploymentError`).
+- Apenas bindings com parâmetros estritamente físicos de `runtime` e `probe` são aceitos.
+
+## 2. Runtime e Probes
+
+Cada participante da candidata deve receber exatamente um binding:
 - `tcp` exige `listen` e `port` (1 a 65535) e proíbe `socket`;
 - `unix` exige um `socket` absoluto e proíbe `listen` e `port`.
+- `probe.health_path` é dado operacional do binding (ex: `/api/health`).
 
-`probe` e `gateway` são opcionais. A ausência de `gateway` significa que o
-participante não é publicado externamente. Nesta versão, `probe.health_path`
-é dado operacional do binding.
+O resolvedor rejeita participantes ausentes ou desconhecidos, identidades duplicadas e colisões de endpoint TCP.
 
-## Resolução
+## 3. Resolução
 
 ```bash
 ./bin/sister-deployment resolve \
@@ -26,7 +41,6 @@ participante não é publicado externamente. Nesta versão, `probe.health_path`
   config/deployments/workstation-lab.json --json
 ```
 
-Somente candidatas com qualificação `PASS`, deployment
-`PENDING_BINDINGS` e `composition_id` compatível podem ser resolvidas. O
-resultado usa o contrato `sister.infra.deployment.resolved/1` e o status
-`READY`.
+Somente candidatas com qualificação `PASS`, deployment `PENDING_BINDINGS` e `composition_id`
+compatível podem ser resolvidas. O resultado usa o contrato `sister.infra.deployment.resolved/1`
+com o status `READY` e cada participante associado à sua URL pública resolvida no gateway.

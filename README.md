@@ -65,7 +65,7 @@ participantes concretos.
 | Composição | Seleção declarativa dos participantes por `source`. |
 | Qualificação | Build/teste isolado e evidência dos artefatos qualificados. |
 | Candidata | Materialização imutável dos commits e artefatos desejados. |
-| Deployment | Bindings físicos, probes e publicação de gateway. |
+| Deployment | Domínio único (`gateway.domain`), bindings físicos e probes. |
 | Reconciliador | Comparação `CURRENT × DESIRED`, plano determinístico e apply transacional. |
 | Workstation | Releases, `current`, `previous`, runtime instalado e rollback. |
 
@@ -215,6 +215,9 @@ Exemplo não autoritativo em `config/compositions/workstation.json`:
 
 ### 3.3 Declarar o binding
 
+O operador declara apenas a ligação física (`runtime` e `probe`). Nenhum participante
+contém configuração própria de domínio, gateway, proxy ou certificado:
+
 Exemplo não autoritativo em `config/deployments/workstation-lab.json`:
 
 ```json
@@ -227,12 +230,12 @@ Exemplo não autoritativo em `config/deployments/workstation-lab.json`:
   },
   "probe": {
     "health_path": "/health"
-  },
-  "gateway": {
-    "host": "novo-gateway.test"
   }
 }
 ```
+
+O subdomínio correspondente (`novo-sistema.<domain>`) é derivado automaticamente da
+identidade do componente pelo gateway único conforme o `gateway.domain` declarado no deployment.
 
 ### 3.4 Planejar e aplicar
 
@@ -371,13 +374,15 @@ Detalhes: `docs/operations/reconciliation.md`.
 
 ## 6. Gateway e TLS
 
-Gateway e TLS são derivados do deployment resolvido.
+Gateway, TLS e DNS são derivados automaticamente da declaração única `gateway.domain`
+e da composição descoberta, sem segunda fonte de verdade.
 
 O HAProxy:
 
 - não contém tabela concreta hardcoded de participantes;
-- é renderizado a partir de `gateway.host`;
-- suporta graceful reload;
+- é renderizado dinamicamente a partir de `gateway.domain`, mapeando cada identidade descoberta para `<component_id>.<domain>`;
+- aplica fail-closed rigoroso: hosts desconhecidos ou não declarados recebem HTTP 421 Misdirected Request;
+- suporta graceful reload sem perda de conexões;
 - participa do rollback transacional.
 
 No LAB, o modelo de autoridade TLS (OPS-07A2):
@@ -406,6 +411,8 @@ python3 tests/composition_resolver_test.py
 python3 tests/composition_qualification_test.py
 python3 tests/deployment_resolver_test.py
 python3 tests/gateway_renderer_contract_test.py
+python3 tests/declarative_single_domain_test.py
+python3 tests/documentation_contract_alignment_test.py
 
 # Workstation e lifecycle declarativo
 python3 tests/workstation_composition_candidate_test.py
@@ -477,10 +484,14 @@ produção e sua autoridade pertencem ao ambiente institucional, não ao Git.
 - `docs/roadmap.md` — incrementos operacionais e estado factual;
 - `docs/operations/modes.md` — DEV, LAB e PROD;
 - `docs/operations/lab.md` — operação cotidiana do LAB;
+- `docs/operations/production.md` — operação institucional e adaptor de PRODUÇÃO (OPS-07);
+- `docs/operations/lifecycle.md` — orquestração declarativa end-to-end do ciclo de vida (OPS-08);
 - `docs/operations/reconciliation.md` — semântica de plan/apply/rollback;
 - `docs/operations/maintenance.md` — check/bootstrap/doctor/repair e aplicação de REARIT-P001;
-- `docs/operations/installation-authority.md` — separação entre engine e autoridade da instalação;
+- `docs/operations/installation-authority.md` — separação entre engine e autoridade da instalação (OPS-09);
 - `docs/operations/agent-missions.md` — missões autônomas de agentes e aplicação de REARIT-P005;
+- `docs/architecture/operator-automation-contract.md` — contrato de automação e UX do operador (OPS-10B);
+- `docs/architecture/control-plane-contract-audit.md` — auditoria factual do control plane (OPS-10A);
 - `docs/architecture/operational-model.md` — modelo operacional;
 - `docs/architecture/DATA_PLANE.md` — fronteira do plano de dados.
 
@@ -498,5 +509,8 @@ OPS-07A0  DONE
 OPS-07A1  DONE
 OPS-07A2  DONE
 OPS-07A3  DONE
-OPS-07    NEXT (PLANNED)
+OPS-07    DONE (Adaptador de Produção)
+OPS-08    DONE (Lifecycle Unificado)
+OPS-09    DONE (Fronteira de Autoridade da Instalação)
+OPS-10    IN PROGRESS (Simplificação do Control Plane)
 ```

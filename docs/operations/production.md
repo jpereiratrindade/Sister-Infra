@@ -117,11 +117,12 @@ Exemplo de payload selado e digest emitido:
   "deployment": {
     "deployment_id": "prod-dc-01",
     "gateway_port": 443,
-    "declared_hosts": ["app.gov.br", "api.gov.br"]
+    "declared_hosts": ["sister.gov.br", "nexo.gov.br", "praxis.gov.br"]
   },
   "actions": [ ... ]
 }
 ```
+*(Os `declared_hosts` são derivados automaticamente a partir dos componentes descobertos e do `gateway.domain` institucional, sem configuração manual em bindings)*
 
 ### 4.2. Aplicação com Autoridade (`production apply`)
 

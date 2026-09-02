@@ -1338,10 +1338,18 @@ def execute_apply(
 
         # 2. PREFLIGHT & AUTHORIZATION
         if plan["summary"]["reconfigure"] > 0:
-            reconfig_cids = [c["component_id"] for c in plan["changes"] if c["action"] == "RECONFIGURE"]
-            raise ReconcileError(
-                f"apply recusado: RECONFIGURE de componentes não é suportado ({reconfig_cids})"
-            )
+            runtime_reconfigs = []
+            for c in plan["changes"]:
+                if c["action"] == "RECONFIGURE":
+                    cid = c["component_id"]
+                    curr_c = current["components"].get(cid, {})
+                    des_c = desired["components"].get(cid, {})
+                    if curr_c.get("runtime") != des_c.get("runtime") or curr_c.get("probe") != des_c.get("probe"):
+                        runtime_reconfigs.append(cid)
+            if runtime_reconfigs:
+                raise ReconcileError(
+                    f"apply recusado: RECONFIGURE de runtime físico de componentes não é suportado ({runtime_reconfigs})"
+                )
 
         has_add = any(c["action"] == "ADD" for c in plan["changes"])
         has_remove = any(c["action"] == "REMOVE" for c in plan["changes"])
@@ -1579,6 +1587,15 @@ def execute_apply(
                         "action": "REPAIR",
                         "status": "SUCCESS",
                         "detail": "restored drifted runtime and verified healthy",
+                        "reason": item["reason"],
+                    })
+
+                elif action == "RECONFIGURE":
+                    executed_changes.append({
+                        "component_id": cid,
+                        "action": "RECONFIGURE",
+                        "status": "SUCCESS",
+                        "detail": "gateway publication reconfigured (runtime preserved and healthy)",
                         "reason": item["reason"],
                     })
 
