@@ -238,7 +238,19 @@ def run_test_suite() -> None:
         # -------------------------------------------------------------
         ca_cert_before = (ws_config / "tls" / "ecosystem-lab-ca.crt").read_bytes()
         p_run2 = subprocess.run(cmd_run, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert p_run2.returncode == 0, f"Segunda execução falhou: {p_run2.stderr}"
+        assert p_run2.returncode == 0, f"Segunda execução falhou: {p_run2.stderr}\n{p_run2.stdout}"
+        run2_doc = json.loads(p_run2.stdout)
+        first_candidate = next(stage for stage in run_doc["stages_executed"] if stage["stage"] == "CANDIDATE")
+        second_candidate = next(stage for stage in run2_doc["stages_executed"] if stage["stage"] == "CANDIDATE")
+        assert second_candidate["status"] == "REUSED_LAB_VERIFIED", (
+            f"segunda execução LAB idêntica deve reutilizar candidata verificada: {second_candidate}"
+        )
+        assert second_candidate["candidate_path"] == first_candidate["candidate_path"], (
+            "segunda execução idêntica não deve materializar nova candidata"
+        )
+        assert second_candidate["candidate_digest"] == first_candidate["candidate_digest"], (
+            "segunda execução idêntica deve preservar exatamente o digest verificado no LAB"
+        )
         ca_cert_after = (ws_config / "tls" / "ecosystem-lab-ca.crt").read_bytes()
         assert ca_cert_before == ca_cert_after, "CA não deve ser alterada ou recriada na segunda execução"
         print("[PASS] Gate 3 — Segunda execução é idempotente e preserva a autoridade CA intacta")

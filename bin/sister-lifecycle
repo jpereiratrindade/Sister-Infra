@@ -189,6 +189,199 @@ def find_latest_lab_verified_candidate(roots: dict[str, Path]) -> dict[str, Any]
     return verified_candidates[0]
 
 
+def qualification_material_identity(qualification_doc: dict[str, Any]) -> dict[str, Any] | None:
+    """Projeta a identidade material que uma qualificação produziria na candidata.
+
+    Metadados efêmeros da execução da qualificação são excluídos. A reutilização
+    exige componentes versionados, limpos e com artefatos integralmente
+    identificados por SHA-256.
+    """
+    if not isinstance(qualification_doc, dict) or qualification_doc.get("status") != "PASS":
+        return None
+
+    components = qualification_doc.get("components")
+    if not isinstance(components, list) or not components:
+        return None
+
+    projected_components: list[dict[str, Any]] = []
+    for component in components:
+        if not isinstance(component, dict):
+            return None
+
+        qualification = component.get("qualification")
+        source = qualification.get("source") if isinstance(qualification, dict) else None
+        artifacts = qualification.get("artifacts") if isinstance(qualification, dict) else None
+        if (
+            not isinstance(qualification, dict)
+            or qualification.get("status") != "PASS"
+            or not isinstance(source, dict)
+            or source.get("clean") is not True
+            or not isinstance(artifacts, list)
+        ):
+            return None
+
+        commit = source.get("commit")
+        if not isinstance(commit, str) or not commit or commit in {"unknown", "unversioned"}:
+            return None
+
+        projected_artifacts: list[dict[str, Any]] = []
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return None
+            artifact_id = artifact.get("id")
+            artifact_path = artifact.get("path")
+            artifact_sha256 = artifact.get("sha256")
+            if not all(
+                isinstance(value, str) and value
+                for value in (artifact_id, artifact_path, artifact_sha256)
+            ):
+                return None
+            projected_artifacts.append(
+                {
+                    "id": artifact_id,
+                    "path": artifact_path,
+                    "sha256": artifact_sha256,
+                    "executable": bool(artifact.get("executable", False)),
+                }
+            )
+
+        projected_artifacts.sort(key=lambda item: (item["id"], item["path"]))
+        projected_components.append(
+            {
+                "component_id": component.get("component_id"),
+                "system_id": component.get("system_id"),
+                "role": component.get("role", "system"),
+                "component_contract": component.get("component_contract", ""),
+                "runtime": component.get("runtime"),
+                "commit": commit,
+                "artifacts": projected_artifacts,
+            }
+        )
+
+    projected_components.sort(key=lambda item: str(item["component_id"]))
+    return {
+        "composition": {
+            "composition_id": qualification_doc.get("composition_id"),
+            "schema": qualification_doc.get("schema"),
+        },
+        "deployment_class": qualification_doc.get("deployment_class"),
+        "components": projected_components,
+    }
+
+
+def candidate_material_identity(candidate_path: Path) -> dict[str, Any] | None:
+    """Projeta da candidata os mesmos campos materiais produzidos pela qualificação."""
+    manifest_path = candidate_path / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    components = manifest.get("components")
+    if not isinstance(components, list) or not components:
+        return None
+
+    projected_components: list[dict[str, Any]] = []
+    for component in components:
+        if not isinstance(component, dict):
+            return None
+        artifacts = component.get("artifacts")
+        commit = component.get("commit")
+        if (
+            not isinstance(artifacts, list)
+            or not isinstance(commit, str)
+            or not commit
+            or commit in {"unknown", "unversioned"}
+        ):
+            return None
+
+        projected_artifacts: list[dict[str, Any]] = []
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return None
+            artifact_id = artifact.get("id")
+            artifact_path = artifact.get("path")
+            artifact_sha256 = artifact.get("sha256")
+            if not all(
+                isinstance(value, str) and value
+                for value in (artifact_id, artifact_path, artifact_sha256)
+            ):
+                return None
+            projected_artifacts.append(
+                {
+                    "id": artifact_id,
+                    "path": artifact_path,
+                    "sha256": artifact_sha256,
+                    "executable": bool(artifact.get("executable", False)),
+                }
+            )
+
+        projected_artifacts.sort(key=lambda item: (item["id"], item["path"]))
+        projected_components.append(
+            {
+                "component_id": component.get("component_id"),
+                "system_id": component.get("system_id"),
+                "role": component.get("role", "system"),
+                "component_contract": component.get("component_contract", ""),
+                "runtime": component.get("runtime"),
+                "commit": commit,
+                "artifacts": projected_artifacts,
+            }
+        )
+
+    projected_components.sort(key=lambda item: str(item["component_id"]))
+    return {
+        "composition": manifest.get("composition"),
+        "deployment_class": manifest.get("deployment_class"),
+        "components": projected_components,
+    }
+
+
+def find_matching_lab_verified_candidate(
+    roots: dict[str, Path],
+    current_qualification: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Retorna a candidata LAB-verificada mais recente materialmente equivalente."""
+    expected_identity = qualification_material_identity(current_qualification)
+    if expected_identity is None:
+        return None
+
+    lab_ev_dir = roots.get("lab_evidence") or (roots["state_root"] / "evidence" / "lab")
+    if not lab_ev_dir.is_dir():
+        return None
+
+    verified_docs: list[dict[str, Any]] = []
+    for evidence_file in lab_ev_dir.glob("verification-*.json"):
+        try:
+            doc = json.loads(evidence_file.read_text(encoding="utf-8"))
+            if doc.get("status") == "PASS":
+                verified_docs.append(doc)
+        except Exception:
+            continue
+
+    verified_docs.sort(key=lambda doc: doc.get("timestamp", ""), reverse=True)
+    for doc in verified_docs:
+        candidate_path_raw = doc.get("candidate_path")
+        candidate_digest = doc.get("candidate_digest")
+        if not candidate_path_raw or not candidate_digest:
+            continue
+
+        candidate_path = Path(candidate_path_raw)
+        if (
+            not candidate_path.is_dir()
+            or compute_candidate_digest(candidate_path) != candidate_digest
+        ):
+            continue
+
+        if candidate_material_identity(candidate_path) == expected_identity:
+            return doc
+
+    return None
+
+
 def check_git_clean(repo_path: Path) -> tuple[bool, str, str]:
     """Verifica se o repositório está limpo e retorna (is_clean, commit_hash, status_output)."""
     if not (repo_path / ".git").exists():
@@ -628,35 +821,90 @@ def execute_lifecycle_run(
                         f"falha na qualificação da composição: {r_qual.stderr.strip() or r_qual.stdout.strip()}",
                         stage_name,
                     )
+                try:
+                    qual_doc = json.loads(r_qual.stdout)
+                except json.JSONDecodeError as exc:
+                    raise LifecycleError(
+                        "QUALIFICATION_RESULT_INVALID",
+                        f"qualificação retornou JSON malformado: {exc}",
+                        stage_name,
+                    ) from exc
+                if not isinstance(qual_doc, dict) or qual_doc.get("status") != "PASS":
+                    raise LifecycleError(
+                        "QUALIFICATION_RESULT_INVALID",
+                        "qualificação retornou documento sem status PASS",
+                        stage_name,
+                    )
                 execution_evidence["stages_executed"].append({"stage": "QUALIFY", "status": "PASS"})
 
                 # -----------------------------------------------------------------
-                # 2. CANDIDATE CREATE (Durável em $STATE_ROOT/candidates/)
+                # 2. CANDIDATE REUSE/CREATE
+                #
+                # LAB idempotente reutiliza exatamente a candidata já verificada
+                # quando a qualificação material corrente é idêntica. O gate
+                # NO_OP_CANDIDATE_DIVERGENCE permanece intacto para candidatas
+                # realmente novas ou explicitamente fornecidas.
                 # -----------------------------------------------------------------
                 stage_name = "CANDIDATE"
-                candidates_dir = roots.get("candidates") or (roots["state_root"] / "candidates")
-                candidates_dir.mkdir(parents=True, exist_ok=True)
-                cand_id = f"cand-lifecycle-{ts}"
-                created_candidate = candidates_dir / cand_id
-                cand_cmd = [
-                    str(CANDIDATE_CLI),
-                    "create",
-                    str(composition_path),
-                    "--out", str(created_candidate),
-                    "--candidate-id", cand_id,
-                    "--json",
-                ]
-                if contracts_root_env:
-                    cand_cmd.extend(["--contracts-root", contracts_root_env])
-                r_cand = run_cmd(cand_cmd)
-                if r_cand.returncode != 0:
-                    raise LifecycleError(
-                        "CANDIDATE_CREATE_FAILED",
-                        f"falha ao criar candidata: {r_cand.stderr.strip() or r_cand.stdout.strip()}",
-                        stage_name,
+                matching_verified = (
+                    find_matching_lab_verified_candidate(roots, qual_doc)
+                    if target == "lab"
+                    else None
+                )
+
+                if matching_verified:
+                    active_candidate = Path(matching_verified["candidate_path"])
+                    cand_manifest = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8"))
+                    cand_id = cand_manifest.get("candidate_id", active_candidate.name)
+                    r_v = run_cmd([str(CANDIDATE_CLI), "verify", str(active_candidate), "--json"])
+                    if r_v.returncode != 0:
+                        raise LifecycleError(
+                            "CANDIDATE_INVALID",
+                            f"candidata LAB-verificada equivalente tornou-se inválida: {r_v.stderr.strip()}",
+                            stage_name,
+                        )
+                    execution_evidence["stages_executed"].append(
+                        {
+                            "stage": "CANDIDATE",
+                            "status": "REUSED_LAB_VERIFIED",
+                            "candidate_id": cand_id,
+                            "candidate_path": str(active_candidate),
+                            "candidate_digest": compute_candidate_digest(active_candidate),
+                            "reuse_reason": "material_qualification_identity",
+                        }
                     )
-                active_candidate = created_candidate
-                execution_evidence["stages_executed"].append({"stage": "CANDIDATE", "status": "PASS", "candidate_id": cand_id, "candidate_path": str(active_candidate), "candidate_digest": compute_candidate_digest(active_candidate)})
+                else:
+                    candidates_dir = roots.get("candidates") or (roots["state_root"] / "candidates")
+                    candidates_dir.mkdir(parents=True, exist_ok=True)
+                    cand_id = f"cand-lifecycle-{ts}"
+                    created_candidate = candidates_dir / cand_id
+                    cand_cmd = [
+                        str(CANDIDATE_CLI),
+                        "create",
+                        str(composition_path),
+                        "--out", str(created_candidate),
+                        "--candidate-id", cand_id,
+                        "--json",
+                    ]
+                    if contracts_root_env:
+                        cand_cmd.extend(["--contracts-root", contracts_root_env])
+                    r_cand = run_cmd(cand_cmd)
+                    if r_cand.returncode != 0:
+                        raise LifecycleError(
+                            "CANDIDATE_CREATE_FAILED",
+                            f"falha ao criar candidata: {r_cand.stderr.strip() or r_cand.stdout.strip()}",
+                            stage_name,
+                        )
+                    active_candidate = created_candidate
+                    execution_evidence["stages_executed"].append(
+                        {
+                            "stage": "CANDIDATE",
+                            "status": "PASS",
+                            "candidate_id": cand_id,
+                            "candidate_path": str(active_candidate),
+                            "candidate_digest": compute_candidate_digest(active_candidate),
+                        }
+                    )
             else:
                 active_candidate = candidate_path
                 cand_id = json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", active_candidate.name)
