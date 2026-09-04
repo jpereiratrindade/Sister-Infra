@@ -286,6 +286,7 @@ def create_candidate(
                     "path": f"components/{cid}",
                     "commit": comp["qualification"]["source"]["commit"],
                     "runtime": comp.get("runtime"),
+                    "interaction_surfaces": comp.get("interaction_surfaces", []),
                     "artifacts": artifacts,
                 }
             )

@@ -189,6 +189,7 @@ def resolved_component(
         "role": descriptor["deployment_role"],
         "component_contract": descriptor["schema"],
         "runtime": descriptor.get("runtime"),
+        "interaction_surfaces": descriptor.get("interaction_surfaces", []),
         "root": str(root),
     }
 

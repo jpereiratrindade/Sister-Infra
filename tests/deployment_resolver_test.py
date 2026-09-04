@@ -42,6 +42,13 @@ def candidate() -> dict[str, Any]:
                 "component_id": "alpha",
                 "system_id": "system_alpha",
                 "path": "components/alpha",
+                "interaction_surfaces": [{
+                    "surface_id": "alpha-work",
+                    "label": "Alpha",
+                    "purpose": "Executar trabalho Alpha",
+                    "path": "/work",
+                    "access_class": "authenticated",
+                }],
             },
             {
                 "component_id": "beta",
@@ -276,6 +283,13 @@ def main() -> None:
             resolved["components"][0]["gateway"]["public_url"]
             == "https://alpha-gateway.test:8443"
         )
+        assert resolved["components"][0]["interaction_surfaces"] == [{
+            "surface_id": "alpha-work",
+            "label": "Alpha",
+            "purpose": "Executar trabalho Alpha",
+            "access_class": "authenticated",
+            "public_url": "https://alpha-gateway.test:8443/work",
+        }]
         assert resolved["components"][1]["runtime"]["transport"] == "unix"
         assert "gateway" not in resolved["components"][1]
 

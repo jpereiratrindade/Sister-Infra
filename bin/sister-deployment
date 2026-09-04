@@ -337,6 +337,20 @@ def resolve(
                 else:
                     gw["public_url"] = f"{default_protocol}://{host}:{default_port}"
             resolved["gateway"] = gw
+        surfaces = []
+        gateway_public_url = resolved.get("gateway", {}).get("public_url")
+        for declaration in component.get("interaction_surfaces", []):
+            surface = dict(declaration)
+            path = surface.pop("path", "")
+            if gateway_public_url and path.startswith("/"):
+                surface["public_url"] = (
+                    gateway_public_url.rstrip("/")
+                    if path == "/"
+                    else gateway_public_url.rstrip("/") + path
+                )
+            surfaces.append(surface)
+        if surfaces:
+            resolved["interaction_surfaces"] = surfaces
         resolved_components.append(resolved)
 
     return {
