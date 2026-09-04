@@ -1305,6 +1305,13 @@ def render_ecosystem_projection(resolved_doc: dict[str, Any]) -> str:
         host = gw.get("host", "")
         pub_url = gw.get("public_url", "")
         lines.append(f"PARTICIPANT\t{cid}\t{sid}\t{transport}\t{listen}\t{port}\t{health_path}\t{host}\t{pub_url}")
+        for surface in comp.get("interaction_surfaces", []):
+            surf_id = surface.get("surface_id", "")
+            lbl = surface.get("label", "")
+            purp = surface.get("purpose", "")
+            s_pub_url = surface.get("public_url", "")
+            ac = surface.get("access_class", "")
+            lines.append(f"SURFACE\t{cid}\t{surf_id}\t{lbl}\t{purp}\t{s_pub_url}\t{ac}")
     return "\n".join(lines) + "\n"
 
 

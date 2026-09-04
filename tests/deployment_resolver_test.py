@@ -290,6 +290,13 @@ def main() -> None:
             "access_class": "authenticated",
             "public_url": "https://alpha-gateway.test:8443/work",
         }]
+        from importlib.machinery import SourceFileLoader
+        reconcile_mod = SourceFileLoader("sister_reconcile", str(ROOT / "bin" / "sister-reconcile")).load_module()
+        rendered_tsv = reconcile_mod.render_ecosystem_projection(resolved)
+        assert (
+            "SURFACE\talpha\talpha-work\tAlpha\tExecutar trabalho Alpha\t"
+            "https://alpha-gateway.test:8443/work\tauthenticated"
+        ) in rendered_tsv
         assert resolved["components"][1]["runtime"]["transport"] == "unix"
         assert "gateway" not in resolved["components"][1]
 
