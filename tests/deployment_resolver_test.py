@@ -300,6 +300,31 @@ def main() -> None:
         assert resolved["components"][1]["runtime"]["transport"] == "unix"
         assert "gateway" not in resolved["components"][1]
 
+        # A second path/binding and a headless participant exercise the same
+        # resolver and renderer without depending on sibling repositories.
+        neutral_candidate = copy.deepcopy(base_candidate)
+        neutral_deployment = copy.deepcopy(base_deployment)
+        gamma = copy.deepcopy(neutral_candidate["components"][0])
+        gamma.update(component_id="gamma", system_id="system_gamma", path="components/gamma")
+        gamma["interaction_surfaces"][0].update(
+            surface_id="gamma-dashboard", label="Gamma", path="/dashboard")
+        neutral_candidate["components"].append(gamma)
+        gamma_binding = copy.deepcopy(neutral_deployment["bindings"][0])
+        gamma_binding.update(system_id="system_gamma", gateway={"host": "gamma-gateway.test"})
+        gamma_binding["runtime"]["port"] = 18003
+        neutral_deployment["bindings"].append(gamma_binding)
+        neutral_resolved = accepted(tmp, neutral_candidate, neutral_deployment)
+        assert neutral_resolved["components"][2]["interaction_surfaces"][0]["public_url"] == (
+            "https://gamma-gateway.test:8443/dashboard")
+        neutral_rows = [line.split("\t") for line in
+                        reconcile_mod.render_ecosystem_projection(neutral_resolved).splitlines()
+                        if line.startswith("SURFACE\t")]
+        assert [(row[1], row[2], row[5]) for row in neutral_rows] == [
+            ("alpha", "alpha-work", "https://alpha-gateway.test:8443/work"),
+            ("gamma", "gamma-dashboard", "https://gamma-gateway.test:8443/dashboard"),
+        ]
+        assert "interaction_surfaces" not in neutral_resolved["components"][1]
+
         # Fabricated canonical candidate without producer / integrity must be rejected
         fabricated_cand = copy.deepcopy(base_candidate)
         fabricated_cand["schema"] = "sister.infra.candidate/1"
