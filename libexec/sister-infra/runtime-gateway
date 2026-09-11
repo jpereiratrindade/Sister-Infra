@@ -75,6 +75,7 @@ load_profile() {
   CA_CERT="${CA_CERT:-$workstation_tls/ecosystem-lab-ca.crt}"
   GATEWAY_CFG="${GATEWAY_CFG:-$GATEWAY_RUN/haproxy-${PROFILE}.cfg}"
   GATEWAY_PID="${GATEWAY_PID:-$GATEWAY_RUN/haproxy-${PROFILE}.pid}"
+  GATEWAY_LOADED="${GATEWAY_LOADED:-${GATEWAY_CFG%.cfg}.loaded.json}"
   GATEWAY_LOG="${GATEWAY_LOG:-$LOG_ROOT/haproxy-${PROFILE}.log}"
 }
 
@@ -82,6 +83,7 @@ runtime_preflight() {
   require_command curl
   require_command jq
   require_command cmp
+  require_command sha256sum
 
   if [[ -z "${SISTER_RESOLVED_DEPLOYMENT_FILE:-}" || ! -f "$SISTER_RESOLVED_DEPLOYMENT_FILE" ]]; then
     local current_link="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME/.local/share/sister}/current"
@@ -304,6 +306,50 @@ verify_public_navigation() {
   pass "navegação pública do gateway verificada factualmente"
 }
 
+write_gateway_loaded_witness() {
+  pid_alive "$GATEWAY_PID" ||     die "não é possível registrar witness: gateway não está ativo"
+
+  [[ -f "$GATEWAY_CFG" ]] ||     die "não é possível registrar witness: configuração ausente em $GATEWAY_CFG"
+
+  local pid cfg_sha tmp
+  pid="$(cat "$GATEWAY_PID")"
+  cfg_sha="$(sha256sum "$GATEWAY_CFG" | awk '{print $1}')"
+  tmp="${GATEWAY_LOADED}.tmp.$$"
+
+  jq -n     --argjson pid "$pid"     --arg config_sha256 "$cfg_sha"     '{
+      schema: "sister.infra.gateway.loaded/1",
+      pid: $pid,
+      config_sha256: $config_sha256
+    }' >"$tmp"
+
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$GATEWAY_LOADED"
+}
+
+verify_gateway_loaded_witness() {
+  [[ -f "$GATEWAY_LOADED" ]] ||     die "witness factual do gateway ausente: $GATEWAY_LOADED"
+
+  jq -e '
+    .schema == "sister.infra.gateway.loaded/1"
+    and (.pid | type == "number")
+    and (.config_sha256 | type == "string" and length == 64)
+  ' "$GATEWAY_LOADED" >/dev/null ||     die "witness factual do gateway inválida: $GATEWAY_LOADED"
+
+  pid_alive "$GATEWAY_PID" ||     die "gateway declarativo não está ativo"
+
+  local factual_pid loaded_pid cfg_sha loaded_sha
+  factual_pid="$(cat "$GATEWAY_PID")"
+  loaded_pid="$(jq -r '.pid' "$GATEWAY_LOADED")"
+  cfg_sha="$(sha256sum "$GATEWAY_CFG" | awk '{print $1}')"
+  loaded_sha="$(jq -r '.config_sha256' "$GATEWAY_LOADED")"
+
+  [[ "$loaded_pid" == "$factual_pid" ]] ||     die "witness factual divergiu do PID ativo ($loaded_pid != $factual_pid)"
+
+  [[ "$loaded_sha" == "$cfg_sha" ]] ||     die "witness factual divergiu da configuração materializada"
+
+  pass "gateway carregado coincide com configuração materializada"
+}
+
 pid_alive() {
   local file="$1"
   [[ -f "$file" ]] || return 1
@@ -328,7 +374,7 @@ stop_gateway() {
       kill -TERM "$pid" 2>/dev/null || true
     fi
   fi
-  rm -f "$GATEWAY_PID"
+  rm -f "$GATEWAY_PID" "$GATEWAY_LOADED"
 }
 
 start_gateway() {
@@ -430,6 +476,7 @@ cmd_up() {
     stop_gateway
     die "verificação após start do gateway declarativo falhou"
   fi
+  write_gateway_loaded_witness
   pass "gateway declarativo ativo"
 }
 
@@ -443,6 +490,7 @@ cmd_status() {
   runtime_preflight
   verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo OFFLINE"
+  verify_gateway_loaded_witness
   pass "gateway declarativo PID $(cat "$GATEWAY_PID")"
 }
 
@@ -453,6 +501,7 @@ cmd_verify() {
       die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
   fi
   verify_gateway_materialization
+  verify_gateway_loaded_witness
   verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"
   verify_gateway_urls

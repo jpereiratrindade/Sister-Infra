@@ -1091,6 +1091,78 @@ def execute_lifecycle_run(
             if r_ver.returncode != 0:
                 raise LifecycleError("LAB_VERIFY_FAILED", f"pós-verificação de workstation falhou: {r_ver.stderr.strip()}", stage_name)
 
+            # Convergência não é inferida do sucesso do apply/verify.
+            # Reobserva CURRENT × DESIRED e exige plano integralmente KEEP.
+            stage_name = "POST_CONVERGENCE_PLAN"
+            r_post_plan = run_cmd([
+                str(LAB_CLI),
+                "plan",
+                "--desired-candidate", str(active_candidate),
+                "--desired-deployment", str(deployment_path),
+                "--json",
+            ])
+            if r_post_plan.returncode != 0:
+                raise LifecycleError(
+                    "LAB_POST_CONVERGENCE_PLAN_FAILED",
+                    f"post-convergence plan falhou: {r_post_plan.stderr.strip() or r_post_plan.stdout.strip()}",
+                    stage_name,
+                )
+
+            if not r_post_plan.stdout.strip():
+                raise LifecycleError(
+                    "LAB_POST_CONVERGENCE_RESULT_INVALID",
+                    "post-convergence plan retornou saída vazia",
+                    stage_name,
+                )
+
+            try:
+                post_plan_doc = json.loads(r_post_plan.stdout)
+            except json.JSONDecodeError as exc:
+                raise LifecycleError(
+                    "LAB_POST_CONVERGENCE_RESULT_INVALID",
+                    f"post-convergence plan retornou JSON malformado: {exc}",
+                    stage_name,
+                ) from exc
+
+            if not isinstance(post_plan_doc, dict) or "schema" not in post_plan_doc:
+                raise LifecycleError(
+                    "LAB_POST_CONVERGENCE_RESULT_INVALID",
+                    "post-convergence plan não retornou documento de plano válido",
+                    stage_name,
+                )
+
+            residual_actions = []
+
+            for item in post_plan_doc.get("changes", []):
+                action = item.get("action")
+                if action != "KEEP":
+                    residual_actions.append(
+                        f"component:{item.get('component_id', '?')}={action}"
+                    )
+
+            gateway_action = post_plan_doc.get("gateway", {}).get("action")
+            if gateway_action != "KEEP":
+                residual_actions.append(f"gateway={gateway_action}")
+
+            projection_action = post_plan_doc.get("projection", {}).get("action")
+            if projection_action != "KEEP":
+                residual_actions.append(f"projection={projection_action}")
+
+            if residual_actions:
+                raise LifecycleError(
+                    "LAB_NOT_CONVERGED",
+                    "LAB permanece divergente após apply/verify: "
+                    + ", ".join(residual_actions),
+                    stage_name,
+                )
+
+            execution_evidence["stages_executed"].append({
+                "stage": "POST_CONVERGENCE_PLAN",
+                "status": "PASS",
+                "gateway_action": gateway_action,
+                "projection_action": projection_action,
+            })
+
             # Emitir evidência persistente de verificação de LAB (vinculada à candidata comprovadamente verificada)
             lab_cand_id = cand_id if "cand_id" in locals() else (
                 json.loads((active_candidate / "manifest.json").read_text(encoding="utf-8")).get("candidate_id", "unknown")

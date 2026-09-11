@@ -26,6 +26,7 @@ Valida:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -719,6 +720,130 @@ def main() -> None:
             assert int(gateway_pid.read_text().strip()) == pid_gw_target
             assert int((run_root / "alpha" / "app.pid").read_text().strip()) == pid_alpha_orig
             print("[PASS] Idempotência — Segunda execução consecutiva resulta em NO_OP")
+
+            # =============================================================
+            # 2B. DRIFT FACTUAL DO GATEWAY → REPAIR VIA LIFECYCLE
+            # =============================================================
+            print("[TEST] Drift factual — lifecycle deve reparar HAProxy carregado com configuração stale...")
+
+            gateway_loaded = gateway_dir / "haproxy-lan.loaded.json"
+            assert gateway_loaded.is_file(), "apply convergente deve produzir witness factual do gateway"
+
+            loaded_before = json.loads(gateway_loaded.read_text(encoding="utf-8"))
+            assert loaded_before["schema"] == "sister.infra.gateway.loaded/1"
+            assert loaded_before["pid"] == pid_gw_target
+            assert loaded_before["config_sha256"] == hashlib.sha256(
+                gateway_cfg.read_bytes()
+            ).hexdigest()
+
+            current_before_repair = (install_root / "current").resolve()
+            release_before_repair = current_before_repair.name
+            authoritative_cfg = gateway_cfg.read_text(encoding="utf-8")
+
+            # Injeta uma materialização factual diferente sem alterar a
+            # configuração autoritativa em gateway_cfg.
+            stale_cfg = gateway_dir / "haproxy-lan.stale-test.cfg"
+            stale_cfg.write_text(
+                authoritative_cfg + "\n# factual-stale-test\n",
+                encoding="utf-8",
+            )
+
+            run_cmd([
+                haproxy_bin,
+                "-D",
+                "-f", str(stale_cfg),
+                "-p", str(gateway_pid),
+                "-sf", str(pid_gw_target),
+            ], check=True)
+
+            pid_gw_stale = lifecycle.track_haproxy_pid_file(gateway_pid)
+            assert pid_gw_stale != pid_gw_target
+
+            stale_sha = hashlib.sha256(stale_cfg.read_bytes()).hexdigest()
+            authoritative_sha = hashlib.sha256(gateway_cfg.read_bytes()).hexdigest()
+            assert stale_sha != authoritative_sha
+
+            gateway_loaded.write_text(
+                json.dumps(
+                    {
+                        "schema": "sister.infra.gateway.loaded/1",
+                        "pid": pid_gw_stale,
+                        "config_sha256": stale_sha,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            # A declaração não mudou; a divergência deve ser classificada
+            # exclusivamente como REPAIR factual.
+            res_repair_plan = run_cmd([
+                str(INFRA_CLI), "lab", "plan",
+                "--current-release", str(install_root / "current"),
+                "--desired-candidate", str(cand_with_delta),
+                "--desired-deployment", str(dep_delta_file),
+                "--json",
+            ], env=env, check=True)
+            repair_plan = json.loads(res_repair_plan.stdout)
+
+            assert repair_plan["gateway"]["action"] == "REPAIR"
+            assert repair_plan["gateway"]["factual"]["status"] == "LOADED_CONFIG_DIVERGED"
+            assert all(
+                item["action"] == "KEEP"
+                for item in repair_plan["changes"]
+            )
+            assert repair_plan["projection"]["action"] == "KEEP"
+
+            # O reconciliador deve reparar a divergência factual sem
+            # fabricar uma nova release.
+            res_repair_apply = run_cmd([
+                str(INFRA_CLI), "lab", "apply",
+                "--current-release", str(install_root / "current"),
+                "--desired-candidate", str(cand_with_delta),
+                "--desired-deployment", str(dep_delta_file),
+                "--json",
+            ], env=env, check=True)
+
+            repair_apply = json.loads(res_repair_apply.stdout)
+            assert repair_apply["status"] == "SUCCESS"
+            assert repair_apply["gateway"]["action"] == "REPAIR"
+
+            # REPAIR factual não pode fabricar uma release semanticamente nova.
+            assert (install_root / "current").resolve() == current_before_repair
+            assert (install_root / "current").resolve().name == release_before_repair
+
+            pid_gw_repaired = lifecycle.track_haproxy_pid_file(gateway_pid)
+            assert pid_gw_repaired != pid_gw_stale
+
+            loaded_after_repair = json.loads(
+                gateway_loaded.read_text(encoding="utf-8")
+            )
+            assert loaded_after_repair["schema"] == "sister.infra.gateway.loaded/1"
+            assert loaded_after_repair["pid"] == pid_gw_repaired
+            assert loaded_after_repair["config_sha256"] == authoritative_sha
+
+            # Segunda execução: NO_OP verdadeiro, sem perturbar o gateway.
+            res_true_noop = run_cmd([
+                str(INFRA_CLI), "lab", "apply",
+                "--current-release", str(install_root / "current"),
+                "--desired-candidate", str(cand_with_delta),
+                "--desired-deployment", str(dep_delta_file),
+                "--json",
+            ], env=env, check=True)
+
+            true_noop = json.loads(res_true_noop.stdout)
+            assert true_noop["status"] == "NO_OP"
+            assert true_noop["gateway"]["action"] == "KEEP"
+            assert int(gateway_pid.read_text().strip()) == pid_gw_repaired
+            assert (install_root / "current").resolve() == current_before_repair
+
+            stale_cfg.unlink(missing_ok=True)
+
+            print(
+                "[PASS] Drift factual — REPAIR restaurou gateway na mesma "
+                "release; execução seguinte foi NO_OP e preservou PID"
+            )
 
             # =============================================================
             # 3. REMOVE (Ordem Segura & Preservação de Dados)

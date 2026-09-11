@@ -502,7 +502,21 @@ esac
         doc_lab = json.loads(res_lab.stdout)
         assert doc_lab["status"] == "COMPLETED"
         assert (sandbox_install / "current").is_symlink()
-        print("[PASS] Gate L9 & L10 — LAB apply e verify operaram com sucesso")
+
+        post_convergence = [
+            stage
+            for stage in doc_lab["stages_executed"]
+            if stage["stage"] == "POST_CONVERGENCE_PLAN"
+        ]
+        assert len(post_convergence) == 1
+        assert post_convergence[0]["status"] == "PASS"
+        assert post_convergence[0]["gateway_action"] == "KEEP"
+        assert post_convergence[0]["projection_action"] == "KEEP"
+
+        print(
+            "[PASS] Gate L9 & L10 — LAB apply, verify e "
+            "post-convergence plan operaram com sucesso"
+        )
 
         # --------------------------------------------------------------------
         # Gate L11 & L12: Lifecycle Maintain (NO_OP & Repair)

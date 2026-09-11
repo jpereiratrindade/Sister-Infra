@@ -54,6 +54,154 @@ GATEWAY_CONTROL_FILES = (
     Path("libexec/sister-infra/runtime-gateway"),
 )
 
+GATEWAY_LOADED_SCHEMA = "sister.infra.gateway.loaded/1"
+
+
+def gateway_loaded_witness_path(cfg_file: Path) -> Path:
+    explicit = os.environ.get("GATEWAY_LOADED", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return cfg_file.with_name(f"{cfg_file.stem}.loaded.json")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def observe_gateway_loaded_materialization() -> dict[str, Any]:
+    """Observa disco, PID factual e witness da configuração carregada.
+
+    Esta observação deliberadamente não infere convergência apenas porque o
+    arquivo de configuração existe. KEEP exige que o processo vivo e a witness
+    concordem com os bytes atualmente materializados no disco.
+    """
+    state_root = Path(
+        os.environ.get(
+            "SISTER_WORKSTATION_STATE_ROOT",
+            "~/.local/state/sister/workstation",
+        )
+    ).expanduser().resolve()
+
+    gateway_dir = state_root / "control-plane" / "gateway"
+
+    cfg_file = Path(
+        os.environ.get("GATEWAY_CFG", str(gateway_dir / "haproxy-lan.cfg"))
+    ).expanduser().resolve()
+
+    pid_file = Path(
+        os.environ.get("GATEWAY_PID", str(gateway_dir / "haproxy-lan.pid"))
+    ).expanduser().resolve()
+
+    loaded_file = gateway_loaded_witness_path(cfg_file)
+
+    observation: dict[str, Any] = {
+        "status": "UNKNOWN",
+        "healthy": False,
+        "pid": None,
+        "config_sha256": None,
+        "loaded_pid": None,
+        "loaded_config_sha256": None,
+    }
+
+    if not cfg_file.is_file():
+        observation["status"] = "CONFIG_MISSING"
+        return observation
+
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        observation["status"] = "PID_MISSING_OR_INVALID"
+        return observation
+
+    observation["pid"] = pid
+
+    if not is_pid_alive(pid):
+        observation["status"] = "PID_NOT_ALIVE"
+        return observation
+
+    cfg_sha = sha256_file(cfg_file)
+    observation["config_sha256"] = cfg_sha
+
+    if not loaded_file.is_file():
+        observation["status"] = "LOADED_WITNESS_MISSING"
+        return observation
+
+    try:
+        loaded = json.loads(loaded_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        observation["status"] = "LOADED_WITNESS_INVALID"
+        return observation
+
+    if (
+        not isinstance(loaded, dict)
+        or loaded.get("schema") != GATEWAY_LOADED_SCHEMA
+        or not isinstance(loaded.get("pid"), int)
+        or not isinstance(loaded.get("config_sha256"), str)
+    ):
+        observation["status"] = "LOADED_WITNESS_INVALID"
+        return observation
+
+    loaded_pid = loaded["pid"]
+    loaded_sha = loaded["config_sha256"]
+
+    observation["loaded_pid"] = loaded_pid
+    observation["loaded_config_sha256"] = loaded_sha
+
+    if loaded_pid != pid:
+        observation["status"] = "LOADED_PID_DIVERGED"
+        return observation
+
+    if loaded_sha != cfg_sha:
+        observation["status"] = "LOADED_CONFIG_DIVERGED"
+        return observation
+
+    observation["status"] = "CONVERGED"
+    observation["healthy"] = True
+    return observation
+
+
+def write_gateway_loaded_witness(
+    loaded_file: Path,
+    pid: int,
+    cfg_file: Path,
+) -> None:
+    if not is_pid_alive(pid):
+        raise ReconcileError(
+            f"não é possível registrar gateway carregado: PID {pid} não está ativo"
+        )
+    if not cfg_file.is_file():
+        raise ReconcileError(
+            f"não é possível registrar gateway carregado: configuração ausente em {cfg_file}"
+        )
+
+    document = {
+        "schema": GATEWAY_LOADED_SCHEMA,
+        "pid": pid,
+        "config_sha256": sha256_file(cfg_file),
+    }
+
+    loaded_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = loaded_file.with_name(
+        f"{loaded_file.name}.tmp.{os.getpid()}_{time.time_ns()}"
+    )
+    try:
+        tmp.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp.chmod(0o600)
+        os.replace(tmp, loaded_file)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
 
 def gateway_control_identity(
     state: dict[str, Any] | None,
@@ -640,6 +788,11 @@ def compute_plan(
         and curr_gateway_control != des_gateway_control
     )
 
+    gateway_factual = {
+        "status": "UNOBSERVED",
+        "healthy": None,
+    }
+
     if not gateway_declaration_same:
         gw_action = "RECONFIGURE"
         gw_reason = (
@@ -651,10 +804,24 @@ def compute_plan(
             "gateway renderer/runtime control identity changed; "
             "derived materialization requires refresh"
         )
+    elif probe_runtime:
+        gateway_factual = observe_gateway_loaded_materialization()
+        if gateway_factual.get("healthy") is True:
+            gw_action = "KEEP"
+            gw_reason = (
+                "gateway declaration, control identity and loaded materialization converge"
+            )
+        else:
+            gw_action = "REPAIR"
+            gw_reason = (
+                "gateway declaration and control identity match, but factual "
+                f"materialization diverges ({gateway_factual.get('status')})"
+            )
     else:
         gw_action = "KEEP"
         gw_reason = (
-            "gateway authority, routes, listeners and control identity unchanged"
+            "gateway declaration and control identity unchanged; "
+            "loaded materialization unobserved (--no-probe-runtime)"
         )
 
     # Ecosystem projection diff (normalizado pelos campos efetivamente projetados)
@@ -688,6 +855,7 @@ def compute_plan(
         "gateway": {
             "action": gw_action,
             "reason": gw_reason,
+            "factual": gateway_factual,
         },
         "projection": {
             "action": proj_action,
@@ -1554,7 +1722,7 @@ def execute_apply(
             has_add
             or has_remove
             or has_update
-            or plan["gateway"]["action"] != "KEEP"
+            or plan["gateway"]["action"] == "RECONFIGURE"
             or plan["projection"]["action"] != "KEEP"
         )
 
@@ -1622,6 +1790,17 @@ def execute_apply(
                 err = verify_target.stderr.strip() or verify_target.stdout.strip()
                 raise ReconcileError(f"TARGET_RELEASE recém-criada falhou na verificação de integridade: {err}")
 
+        # REPAIR factual do gateway reutiliza estritamente a CURRENT_RELEASE.
+        # Não há nova declaração a materializar e, portanto, não há release-create
+        # nem release-switch.
+        if target_release_dir is None and plan["gateway"]["action"] == "REPAIR":
+            if current_dir is None or current_resolved_file is None or current_resolved_doc is None:
+                raise ReconcileError(
+                    "gateway REPAIR requer CURRENT_RELEASE válida e deployment resolvido atual"
+                )
+            target_resolved_file = current_resolved_file
+            target_resolved_doc = current_resolved_doc
+
         # 5. CONTEXTO TRANSACIONAL (em memória, sem backups persistentes implícitos no disco)
         tx = TransactionContext()
         executed_changes = []
@@ -1630,6 +1809,7 @@ def execute_apply(
         gateway_cfg, gateway_pid_file, gw_listen_addr, gw_listen_port = get_gateway_paths(
             state_root, config_root, desired["resolved_deployment"]
         )
+        gateway_loaded_file = gateway_loaded_witness_path(gateway_cfg)
         if target_resolved_doc and "gateway" in target_resolved_doc:
             gw_listen_port = target_resolved_doc["gateway"].get("port", gw_listen_port)
             gw_listen_addr = target_resolved_doc["gateway"].get("listen", gw_listen_addr)
@@ -1895,6 +2075,21 @@ def execute_apply(
                     if not ok:
                         raise ReconcileError(f"VERIFY FINAL falhou para componente '{comp['component_id']}': {detail}")
 
+            # Commit factual da witness somente após toda a transação estar
+            # comprovadamente saudável. Em caso de falha anterior, o rollback
+            # restaura configuração, processo e witness como uma única unidade
+            # factual.
+            if plan["gateway"]["action"] != "KEEP":
+                if tx.pid_target_gateway is None:
+                    raise ReconcileError(
+                        "gateway alterado sem PID factual resultante do reload"
+                    )
+                write_gateway_loaded_witness(
+                    gateway_loaded_file,
+                    tx.pid_target_gateway,
+                    gateway_cfg,
+                )
+
             return {
                 "schema": APPLY_SCHEMA,
                 "status": "SUCCESS",
@@ -1975,14 +2170,36 @@ def execute_apply(
                 except Exception as exc:
                     add_comp("projection", "RESTORE_PROJECTION", "FAILED", str(exc))
 
-            # 4. Restaura Gateway antigo: re-aplica old_gateway_cfg e faz graceful reload sobre pid_target_gateway
+            # 4. Restaura Gateway antigo: re-aplica old_gateway_cfg e faz
+            # graceful reload sobre pid_target_gateway. Como o reload produz
+            # um novo PID factual, a witness também precisa ser reconstruída;
+            # preservar a witness anterior deixaria o rollback materialmente
+            # correto, porém factualmente divergente.
             if tx.old_gateway_cfg is not None and tx.pid_target_gateway is not None and haproxy_bin is not None:
                 try:
                     tmp_gw = gateway_cfg.with_suffix(f".tmp.{os.getpid()}_{time.time_ns()}")
                     tmp_gw.write_text(tx.old_gateway_cfg, encoding="utf-8")
                     os.replace(tmp_gw, gateway_cfg)
-                    reload_haproxy_gracefully(haproxy_bin, gateway_cfg, gateway_pid_file, pid_old=tx.pid_target_gateway)
-                    add_comp("gateway", "RESTORE_GATEWAY", "SUCCESS")
+
+                    restored_gateway_pid = reload_haproxy_gracefully(
+                        haproxy_bin,
+                        gateway_cfg,
+                        gateway_pid_file,
+                        pid_old=tx.pid_target_gateway,
+                    )
+
+                    write_gateway_loaded_witness(
+                        gateway_loaded_file,
+                        restored_gateway_pid,
+                        gateway_cfg,
+                    )
+
+                    add_comp(
+                        "gateway",
+                        "RESTORE_GATEWAY",
+                        "SUCCESS",
+                        f"gateway e witness restaurados no PID {restored_gateway_pid}",
+                    )
                 except Exception as exc:
                     add_comp("gateway", "RESTORE_GATEWAY", "FAILED", str(exc))
 
