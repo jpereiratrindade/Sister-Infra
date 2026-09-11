@@ -61,7 +61,7 @@ def validate_listen(value: str) -> str:
 
 def published_components(
     document: dict[str, Any],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     published = []
     seen_hosts: set[str] = set()
     exposure = (document.get("gateway") or {}).get("exposure", "host")
@@ -128,6 +128,7 @@ def published_components(
 
         published.append(
             {
+                "component_id": component_id,
                 "acl": f"published_{index}",
                 "backend": f"component_{index}_{component_id}",
                 "host": normalized_host,
@@ -137,6 +138,58 @@ def published_components(
             }
         )
     return published
+
+
+def public_navigation_rules(
+    components: list[dict[str, Any]],
+    *,
+    exposure: str,
+    protocol: str,
+    listen: str,
+    listen_port: int | None,
+) -> list[str]:
+    """Render gateway-owned navigation between published components.
+
+    The browser addresses a component by stable component_id only.
+    Deployment topology remains exclusively owned by sister-infra.
+    """
+    rules: list[str] = []
+
+    for index, component in enumerate(components):
+        component_id = component["component_id"]
+        acl = f"open_component_{index}"
+
+        if exposure == "ip-ports":
+            port = component.get("port")
+            if not isinstance(port, int) or isinstance(port, bool) or not (
+                1 <= port <= 65535
+            ):
+                raise GatewayError(
+                    f"porta pública inválida para navegação: {component_id}"
+                )
+            location = f"http://{listen}:{port}/"
+        else:
+            if (
+                not isinstance(listen_port, int)
+                or isinstance(listen_port, bool)
+                or not 1 <= listen_port <= 65535
+            ):
+                raise GatewayError("porta global do gateway inválida")
+            location = (
+                f"{protocol}://{component['host']}:{listen_port}/"
+            )
+
+        rules.extend(
+            [
+                f"    acl {acl} path -i /_sister/open/{component_id}",
+                (
+                    "    http-request redirect code 302 "
+                    f"location {location} if {acl}"
+                ),
+            ]
+        )
+
+    return rules
 
 
 def safe_global(value: str, label: str) -> str:
@@ -210,6 +263,13 @@ def render(
                 f"frontend {component['backend']}_http",
                 f"    bind {listen}:{port}",
                 *forwarded_headers,
+                *public_navigation_rules(
+                    components,
+                    exposure=exposure,
+                    protocol=protocol,
+                    listen=listen,
+                    listen_port=listen_port,
+                ),
                 f"    default_backend {component['backend']}",
             ])
     else:
@@ -236,6 +296,16 @@ def render(
             )
         else:
             lines.append("    http-request deny deny_status 421")
+
+        lines.extend(
+            public_navigation_rules(
+                components,
+                exposure=exposure,
+                protocol=protocol,
+                listen=listen,
+                listen_port=listen_port,
+            )
+        )
 
         for component in components:
             lines.append(
