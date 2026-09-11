@@ -81,6 +81,7 @@ load_profile() {
 runtime_preflight() {
   require_command curl
   require_command jq
+  require_command cmp
 
   if [[ -z "${SISTER_RESOLVED_DEPLOYMENT_FILE:-}" || ! -f "$SISTER_RESOLVED_DEPLOYMENT_FILE" ]]; then
     local current_link="${SISTER_WORKSTATION_INSTALL_ROOT:-$HOME/.local/share/sister}/current"
@@ -127,7 +128,9 @@ runtime_preflight() {
     die "HAProxy não executável: $HAPROXY_BIN"
 }
 
-render_gateway() {
+render_gateway_file() {
+  local output="$1"
+
   if [[ "$GATEWAY_PROTOCOL" == "https" ]]; then
     [[ -f "$TLS_PEM" ]] || die "TLS PEM ausente: $TLS_PEM"
   fi
@@ -141,13 +144,164 @@ render_gateway() {
     "$resolved"
     --listen-address "$GATEWAY_LISTEN_ADDRESS"
   )
-  [[ -n "$GATEWAY_LISTEN_PORT" ]] && render_args+=(--listen-port "$GATEWAY_LISTEN_PORT")
-  [[ "$GATEWAY_PROTOCOL" == "https" ]] && render_args+=(--tls-pem "$TLS_PEM")
-  "${render_args[@]}" > "$GATEWAY_CFG" || die "falha ao renderizar gateway declarativo"
 
-  "$HAPROXY_BIN" -c -f "$GATEWAY_CFG" >/dev/null || \
-    die "configuração HAProxy inválida"
+  [[ -n "$GATEWAY_LISTEN_PORT" ]] && \
+    render_args+=(--listen-port "$GATEWAY_LISTEN_PORT")
+
+  [[ "$GATEWAY_PROTOCOL" == "https" ]] && \
+    render_args+=(--tls-pem "$TLS_PEM")
+
+  "${render_args[@]}" > "$output" || return 1
+
+  "$HAPROXY_BIN" -c -f "$output" >/dev/null || return 1
+}
+
+
+render_gateway() {
+  render_gateway_file "$GATEWAY_CFG" || \
+    die "falha ao renderizar ou validar gateway declarativo"
+
   pass "configuração HAProxy válida"
+}
+
+
+verify_gateway_materialization() {
+  local expected
+  expected="$(mktemp "$GATEWAY_RUN/haproxy-verify.XXXXXX")"
+
+  if ! render_gateway_file "$expected"; then
+    rm -f "$expected"
+    die "não foi possível derivar configuração esperada do gateway"
+  fi
+
+  if [[ ! -f "$GATEWAY_CFG" ]]; then
+    rm -f "$expected"
+    die "configuração HAProxy materializada ausente: $GATEWAY_CFG"
+  fi
+
+  if ! cmp -s "$expected" "$GATEWAY_CFG"; then
+    rm -f "$expected"
+    die "gateway materializado diverge do render esperado; reconciliação necessária"
+  fi
+
+  rm -f "$expected"
+  pass "materialização do gateway corresponde ao render esperado"
+}
+
+
+verify_public_navigation() {
+  local resolved="$SISTER_RESOLVED_DEPLOYMENT_FILE"
+
+  local entry
+  entry="$(
+    jq -r '
+      [
+        .components[]
+        | select(.gateway != null)
+        | [
+            .gateway.host,
+            (.gateway.port // "")
+          ]
+        | @tsv
+      ][0] // empty
+    ' "$resolved"
+  )"
+
+  if [[ -z "$entry" ]]; then
+    pass "nenhuma superfície publicada para verificar navegação"
+    return 0
+  fi
+
+  local entry_host entry_public_port
+  IFS=$'\t' read -r entry_host entry_public_port <<<"$entry"
+
+  local origin_port
+  local origin_url
+  local -a request_args=(
+    --noproxy '*'
+    -sS
+    --max-time 5
+    -o /dev/null
+  )
+
+  if [[ "$GATEWAY_EXPOSURE" == "ip-ports" ]]; then
+    [[ -n "$entry_public_port" ]] || \
+      die "componente de entrada sem porta pública em ip-ports"
+
+    origin_port="$entry_public_port"
+    origin_url="$GATEWAY_PROTOCOL://$GATEWAY_LISTEN_ADDRESS:$origin_port"
+  else
+    [[ -n "$GATEWAY_LISTEN_PORT" ]] || \
+      die "gateway host-routing sem porta pública"
+
+    origin_port="$GATEWAY_LISTEN_PORT"
+    origin_url="$GATEWAY_PROTOCOL://$entry_host:$origin_port"
+
+    request_args+=(
+      --resolve
+      "$entry_host:$origin_port:$GATEWAY_LISTEN_ADDRESS"
+    )
+  fi
+
+  if [[ "$GATEWAY_PROTOCOL" == "https" && -f "$CA_CERT" ]]; then
+    request_args+=(--cacert "$CA_CERT")
+  fi
+
+  local component_id target_host target_public_port
+  while IFS=$'\t' read -r \
+      component_id target_host target_public_port; do
+
+    [[ -n "$component_id" ]] || continue
+
+    local expected_location
+
+    if [[ "$GATEWAY_EXPOSURE" == "ip-ports" ]]; then
+      [[ -n "$target_public_port" ]] || \
+        die "componente '$component_id' sem porta pública"
+
+      expected_location="$GATEWAY_PROTOCOL://$GATEWAY_LISTEN_ADDRESS:$target_public_port/"
+    else
+      expected_location="$GATEWAY_PROTOCOL://$target_host:$GATEWAY_LISTEN_PORT/"
+    fi
+
+    local result
+    if ! result="$(
+      curl \
+        "${request_args[@]}" \
+        -w $'%{http_code}\t%{redirect_url}' \
+        "$origin_url/_sister/open/$component_id"
+    )"; then
+      die "navegação pública factual falhou para '$component_id'"
+    fi
+
+    local status location
+    IFS=$'\t' read -r status location <<<"$result"
+
+    if [[ "$status" != "302" ]]; then
+      die \
+        "navegação pública para '$component_id' retornou HTTP $status; esperado 302"
+    fi
+
+    if [[ "$location" != "$expected_location" ]]; then
+      die \
+        "navegação pública para '$component_id' divergiu: esperado '$expected_location', observado '$location'"
+    fi
+
+    pass "$component_id navegação pública factual"
+  done < <(
+    jq -r '
+      .components[]
+      | select(.gateway != null)
+      | [
+          .component_id,
+          .gateway.host,
+          (.gateway.port // "")
+        ]
+      | @tsv
+    ' "$resolved"
+  )
+
+  pass "navegação pública do gateway verificada factualmente"
 }
 
 pid_alive() {
@@ -298,10 +452,11 @@ cmd_verify() {
     [[ -f "$TLS_PEM" && -r "$TLS_PEM" ]] || \
       die "certificado TLS do gateway ausente ou ilegível: ${TLS_PEM:-<indefinido>}"
   fi
-  render_gateway
+  verify_gateway_materialization
   verify_components
   pid_alive "$GATEWAY_PID" || die "gateway declarativo não está ativo"
   verify_gateway_urls
+  verify_public_navigation
   pass "deployment declarativo verificado"
 }
 

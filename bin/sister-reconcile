@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -46,6 +47,64 @@ PROXYLESS_HTTP_OPENER = urllib.request.build_opener(
 
 class ReconcileError(RuntimeError):
     pass
+
+
+GATEWAY_CONTROL_FILES = (
+    Path("bin/sister-gateway"),
+    Path("libexec/sister-infra/runtime-gateway"),
+)
+
+
+def gateway_control_identity(
+    state: dict[str, Any] | None,
+    *,
+    desired: bool,
+) -> str | None:
+    """Identidade material da autoridade que renderiza/opera o gateway.
+
+    A topologia declarativa pode permanecer idêntica enquanto a semântica
+    do renderer ou do adapter de runtime muda. Nessa situação o recurso
+    derivado não pode ser classificado como KEEP.
+    """
+    if not isinstance(state, dict):
+        return None
+
+    base_raw = (
+        state.get("candidate_dir")
+        if desired
+        else state.get("current_dir")
+    )
+    manifest = (
+        state.get("candidate_manifest")
+        if desired
+        else state.get("manifest")
+    )
+
+    if not isinstance(base_raw, str) or not isinstance(manifest, dict):
+        return None
+
+    control_plane = manifest.get("control_plane")
+    if not isinstance(control_plane, dict):
+        return None
+
+    control_path = control_plane.get("path")
+    if not isinstance(control_path, str) or not control_path:
+        return None
+
+    control_root = Path(base_raw) / control_path
+    digest = hashlib.sha256()
+
+    for relative in GATEWAY_CONTROL_FILES:
+        source = control_root / relative
+        if not source.is_file():
+            return None
+
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source.read_bytes())
+        digest.update(b"\0")
+
+    return digest.hexdigest()
 
 
 def load_json(path: Path, label: str) -> dict[str, Any]:
@@ -561,12 +620,42 @@ def compute_plan(
     )
     des_gw_config = desired["resolved_deployment"].get("gateway", {})
 
-    if curr_gw_routes == des_gw_routes and curr_gw_config == des_gw_config:
-        gw_action = "KEEP"
-        gw_reason = "gateway authority, routes and listeners unchanged"
-    else:
+    gateway_declaration_same = (
+        curr_gw_routes == des_gw_routes
+        and curr_gw_config == des_gw_config
+    )
+
+    curr_gateway_control = gateway_control_identity(
+        current,
+        desired=False,
+    )
+    des_gateway_control = gateway_control_identity(
+        desired,
+        desired=True,
+    )
+
+    gateway_control_changed = (
+        curr_gateway_control is not None
+        and des_gateway_control is not None
+        and curr_gateway_control != des_gateway_control
+    )
+
+    if not gateway_declaration_same:
         gw_action = "RECONFIGURE"
-        gw_reason = "gateway authority, routing, listener or published hosts differ"
+        gw_reason = (
+            "gateway authority, routing, listener or published hosts differ"
+        )
+    elif gateway_control_changed:
+        gw_action = "RECONFIGURE"
+        gw_reason = (
+            "gateway renderer/runtime control identity changed; "
+            "derived materialization requires refresh"
+        )
+    else:
+        gw_action = "KEEP"
+        gw_reason = (
+            "gateway authority, routes, listeners and control identity unchanged"
+        )
 
     # Ecosystem projection diff (normalizado pelos campos efetivamente projetados)
     curr_proj = extract_normalized_projection(curr_components)
