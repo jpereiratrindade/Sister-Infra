@@ -63,6 +63,12 @@ de negócio com a evidência anterior e confira a release/commit efetivamente em
 execução. Rollback de aplicação usa a release anterior; não restaure o banco
 automaticamente sobre gravações realizadas após o backup.
 
+Participantes preservados em `KEEP` podem continuar executando a release de
+origem. O lifecycle resolve o processo que escuta no binding declarado e usa
+seu entrypoint original somente quando identidade, commit, artefatos, bytes do
+processo e binding equivalem à release atual. Essa verificação preserva a
+identidade factual dos processos sem exigir reinício após cada troca de release.
+
 ## Observação pelo portal Synth
 
 O portal `sister-synth-poc` observa o participante `sister-nexo` pelo endpoint

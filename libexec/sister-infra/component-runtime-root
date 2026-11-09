@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Resolve an equivalent running release before invoking a native lifecycle action."""
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+def load(path):
+    return json.loads(path.read_text())
+
+
+def component(manifest, cid):
+    matches = [item for item in manifest["components"] if item["component_id"] == cid]
+    if len(matches) != 1:
+        raise ValueError(f"identidade de componente ausente ou duplicada: {cid}")
+    return matches[0]
+
+
+def owner_root(release, cid, releases_root, executable, running_executable):
+    """An old root is usable only with matching identity, bytes and runtime binding."""
+    expected_manifest = load(release / "manifest.json")
+    expected = component(expected_manifest, cid)
+    current_root = release / expected["path"]
+    if executable.is_relative_to(current_root):
+        return current_root
+    if not executable.is_relative_to(releases_root):
+        raise ValueError(f"runtime ativo fora das releases gerenciadas: {cid}")
+    relative = executable.relative_to(releases_root)
+    origin = releases_root / relative.parts[0]
+    observed_manifest = load(origin / "manifest.json")
+    observed = component(observed_manifest, cid)
+    if expected != observed:
+        raise ValueError(f"runtime ativo não equivale à release desejada: {cid}")
+    old_root = origin / observed["path"]
+    matching = [art for art in expected.get("artifacts", [])
+                if art.get("executable") and old_root / art["path"] == executable]
+    if len(matching) != 1:
+        raise ValueError(f"executável ativo não é um artefato declarado: {cid}")
+    for artifact in expected.get("artifacts", []):
+        file = old_root / artifact["path"]
+        if not file.resolve().is_relative_to(old_root):
+            raise ValueError(f"artefato fora do componente: {cid}")
+        if hashlib.sha256(file.read_bytes()).hexdigest() != artifact["sha256"]:
+            raise ValueError(f"artefato ativo diverge da qualificação: {cid}")
+    if hashlib.sha256(running_executable.read_bytes()).hexdigest() != matching[0]["sha256"]:
+        raise ValueError(f"bytes do processo ativo divergem da qualificação: {cid}")
+    for key in ("runtime", "probe"):
+        expected_binding = component(load(release / expected_manifest["deployment"]["evidence"]), cid)
+        observed_binding = component(load(origin / observed_manifest["deployment"]["evidence"]), cid)
+        if expected_binding.get(key) != observed_binding.get(key):
+            raise ValueError(f"binding do runtime ativo diverge: {cid}")
+    return old_root
+
+
+def main():
+    release, cid, releases_root, resolved = sys.argv[1:]
+    release, releases_root = Path(release).resolve(), Path(releases_root).resolve()
+    expected = component(load(release / "manifest.json"), cid)
+    root = release / expected["path"]
+    binding = component(load(Path(resolved)), cid)["runtime"]
+    if binding.get("transport") != "tcp":
+        print(root)
+        return
+    endpoint = f"{binding['listen']}:{binding['port']}"
+    result = subprocess.run(["ss", "-ltnpH"], text=True, capture_output=True, check=True)
+    pids = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) > 3 and fields[3] == endpoint:
+            pids.update(re.findall(r"pid=(\d+)", line))
+    if len(pids) > 1:
+        raise ValueError(f"múltiplos processos escutam no binding: {cid}")
+    if not pids:
+        print(root)
+        return
+    process_exe = Path("/proc") / pids.pop() / "exe"
+    executable = process_exe.resolve(strict=True)
+    # Script-based runtimes have an interpreter as /proc/exe; native entrypoints
+    # remain responsible for their process identity in that case.
+    if not executable.is_relative_to(releases_root):
+        print(root)
+        return
+    print(owner_root(release, cid, releases_root, executable, process_exe))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        print(f"[FAIL] resolução do runtime: {error}", file=sys.stderr)
+        sys.exit(1)

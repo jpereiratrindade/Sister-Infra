@@ -454,6 +454,8 @@ Esse fluxo preserva os artefatos e qualificações dos participantes fora do
 escopo, mesmo quando uma reconstrução integral produz hashes diferentes. Veja
 [`docs/operations/nexo-update.md`](docs/operations/nexo-update.md) e execute
 `python3 tests/candidate_selection_test.py` para validar esse comportamento.
+O teste `python3 tests/component_runtime_root_test.py` cobre a preservação da
+identidade factual de processos em `KEEP` após a troca de release.
 
 ---
 

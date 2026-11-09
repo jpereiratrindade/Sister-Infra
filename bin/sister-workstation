@@ -908,6 +908,13 @@ invoke_component_action() {
   local root="$release/$component_path"
   local config="$CONFIG_ROOT/${component_id}.env"
 
+  # KEEP participants may still execute identical qualified artifacts from an
+  # older immutable release. Invoke the native action from their factual root.
+  if [[ "$TEST_MODE" != "1" ]]; then
+    root="$("${PYTHON:-python3}" "$INFRA_ROOT/libexec/sister-infra/component-runtime-root" \
+      "$release" "$component_id" "$RELEASES_ROOT" "$resolved")" || return 1
+  fi
+
   mkdir -p \
     "$STATE_ROOT/components/$component_id" \
     "$STATE_ROOT/run/$component_id"
