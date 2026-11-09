@@ -448,6 +448,13 @@ Antes de commit:
 git diff --check
 ```
 
+Atualizações com escopo explícito podem derivar uma candidata com
+`bin/sister-candidate select --base <base> --qualified <nova> --component <id> --out <destino>`.
+Esse fluxo preserva os artefatos e qualificações dos participantes fora do
+escopo, mesmo quando uma reconstrução integral produz hashes diferentes. Veja
+[`docs/operations/nexo-update.md`](docs/operations/nexo-update.md) e execute
+`python3 tests/candidate_selection_test.py` para validar esse comportamento.
+
 ---
 
 ## 8. Repositório público e segredos

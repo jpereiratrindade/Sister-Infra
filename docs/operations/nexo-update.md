@@ -29,6 +29,26 @@ Para reutilizar exatamente a candidata revisada, materialize-a com
 `sister-candidate create <composition.json> --out <candidate-dir>`
 e passe `--desired-candidate <candidate-dir>` a `lab plan` e `lab apply`.
 
+Se reconstruções dos mesmos commits produzirem hashes diferentes nos outros
+componentes, não ignore essa diferença no reconciliador. Derive outra candidata
+com escopo explícito, reutilizando os bytes e as qualificações originais dos
+participantes que devem permanecer em `KEEP`:
+
+```bash
+./bin/sister-candidate select \
+  --base <candidata-da-release-atual> \
+  --qualified <candidate-dir> \
+  --component nexo \
+  --out <candidate-nexo-only>
+./bin/sister-infra lab plan --desired-candidate <candidate-nexo-only> --json
+./bin/sister-infra lab apply --desired-candidate <candidate-nexo-only> --json
+```
+
+`select` verifica ambas as origens, exige a mesma composição e os mesmos
+participantes, recusa sobrescrever diretórios e preserva as evidências de
+qualificação e os digests das origens. A candidata derivada altera somente os
+componentes selecionados; as candidatas originais permanecem intactas.
+
 Uma mudança exclusiva do Nexo deve resultar em `UPDATE` para `nexo` e `KEEP`
 para os demais participantes. Examine mudanças de gateway e projeção conforme
 seus motivos factuais. Não aplique remoções, novos bindings de banco ou mudanças

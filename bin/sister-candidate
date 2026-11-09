@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -326,6 +327,102 @@ def create_candidate(
         shutil.rmtree(tmp_artifacts, ignore_errors=True)
 
 
+def select_candidate(
+    base_dir: Path,
+    qualified_dir: Path,
+    selected: list[str],
+    out_dir: Path,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
+    """Derive a candidate with an explicit update scope and original qualifications."""
+    base_dir, qualified_dir, out_dir = (
+        path.expanduser().resolve() for path in (base_dir, qualified_dir, out_dir)
+    )
+    for source in (base_dir, qualified_dir):
+        if out_dir.is_relative_to(source) or source.is_relative_to(out_dir):
+            raise CandidateError("saída deve ser separada das candidatas de origem")
+    if out_dir.exists():
+        raise CandidateError(f"diretório de saída já existe: {out_dir}")
+    base = verify_candidate_directory(base_dir)
+    qualified = verify_candidate_directory(qualified_dir)
+    if base["composition"] != qualified["composition"]:
+        raise CandidateError("seleção exige a mesma identidade de composição")
+    base_components = {c["component_id"]: c for c in base["components"]}
+    qualified_components = {c["component_id"]: c for c in qualified["components"]}
+    if (len(base_components) != len(base["components"]) or
+            len(qualified_components) != len(qualified["components"]) or
+            base_components.keys() != qualified_components.keys()):
+        raise CandidateError("seleção não permite adicionar, remover ou duplicar participantes")
+    if not selected or not set(selected) <= base_components.keys():
+        raise CandidateError("seleção contém componente ausente nas candidatas")
+    for cid, component in base_components.items():
+        if component["system_id"] != qualified_components[cid]["system_id"]:
+            raise CandidateError(f"identidade de sistema divergente: {cid}")
+
+    reports = {
+        "base": load_json(base_dir / base["qualification"]["evidence"], "qualificação base"),
+        "qualified": load_json(qualified_dir / qualified["qualification"]["evidence"], "qualificação nova"),
+    }
+    qualification = {k: v for k, v in reports["base"].items() if k != "components"}
+    qualification["components"] = []
+    components = []
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".candidate-select-", dir=out_dir.parent) as tmp:
+        staging = Path(tmp) / "candidate"
+        staging.mkdir()
+        for cid in base_components:
+            label = "qualified" if cid in selected else "base"
+            source = qualified_dir if label == "qualified" else base_dir
+            component = (qualified_components if label == "qualified" else base_components)[cid]
+            matches = [c for c in reports[label].get("components", []) if c.get("component_id") == cid]
+            if len(matches) != 1:
+                raise CandidateError(f"qualificação ausente ou duplicada: {cid}")
+            report = matches[0]["qualification"]
+            if (reports[label].get("status") != "PASS" or report.get("status") != "PASS" or
+                    report.get("source", {}).get("commit") != component["commit"] or
+                    report.get("artifacts", []) != component.get("artifacts", [])):
+                raise CandidateError(f"qualificação não corresponde ao componente: {cid}")
+            relative = Path(component["path"])
+            if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
+                raise CandidateError(f"path de componente inseguro: {relative}")
+            if not (source / relative).resolve().is_relative_to(source):
+                raise CandidateError(f"componente fora da candidata: {cid}")
+            shutil.copytree(source / relative, staging / relative, symlinks=True)
+            components.append(component)
+            qualification["components"].append(matches[0])
+        evidence = staging / "evidence/composition/qualification.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(json.dumps(qualification, indent=2, sort_keys=True) + "\n")
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        manifest = {
+            "schema": "sister.infra.candidate/1",
+            "candidate_id": candidate_id or f"cand-select-{timestamp}-{sha256_file(evidence)[:12]}",
+            "created_at_utc": timestamp,
+            "composition": base["composition"],
+            "qualification": {"status": "PASS", "evidence": "evidence/composition/qualification.json",
+                              "sha256": sha256_file(evidence)},
+            "deployment": {"status": "PENDING_BINDINGS"},
+            "components": components,
+        }
+        if "deployment_class" in base:
+            manifest["deployment_class"] = base["deployment_class"]
+        provenance = staging / "evidence/selection"
+        provenance.mkdir()
+        for label, directory in (("base", base_dir), ("qualified", qualified_dir)):
+            shutil.copy2(directory / "manifest.json", provenance / f"{label}-manifest.json")
+            (provenance / f"{label}-qualification.json").write_text(
+                json.dumps(reports[label], indent=2, sort_keys=True) + "\n")
+        (provenance / "selection.json").write_text(json.dumps({
+            "selected_components": sorted(set(selected)),
+            "base_digest": candidate_tree_digest(base_dir),
+            "qualified_digest": candidate_tree_digest(qualified_dir),
+        }, indent=2, sort_keys=True) + "\n")
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        verify_candidate_directory(staging)
+        staging.rename(out_dir)
+    return manifest
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sister-candidate",
@@ -339,6 +436,14 @@ def build_parser() -> argparse.ArgumentParser:
     create_p.add_argument("--candidate-id", help="Identificador opcional da candidata")
     create_p.add_argument("--contracts-root", help="Diretório de contratos normativos")
     create_p.add_argument("--json", action="store_true", help="Emite o manifesto em JSON")
+
+    select_p = sub.add_parser("select", help="Deriva candidata atualizando somente componentes explícitos")
+    select_p.add_argument("--base", required=True, type=Path)
+    select_p.add_argument("--qualified", required=True, type=Path)
+    select_p.add_argument("--component", required=True, action="append")
+    select_p.add_argument("--out", required=True, type=Path)
+    select_p.add_argument("--candidate-id")
+    select_p.add_argument("--json", action="store_true")
 
     verify_p = sub.add_parser("verify", help="Verifica integridade fail-closed de uma candidata")
     verify_p.add_argument("candidate_dir", help="Diretório da candidata a verificar")
@@ -367,6 +472,12 @@ def main() -> int:
                 print(f"[PASS] candidata imutável materializada: {manifest['candidate_id']}")
                 print(f"diretório: {Path(args.out).resolve()}")
                 print(f"participantes: {len(manifest['components'])}")
+        elif args.command == "select":
+            manifest = select_candidate(args.base, args.qualified, args.component, args.out, args.candidate_id)
+            if args.json:
+                print(json.dumps(manifest, indent=2, sort_keys=True))
+            else:
+                print(f"[PASS] candidata com escopo explícito: {manifest['candidate_id']}")
         elif args.command == "verify":
             manifest = verify_candidate_directory(Path(args.candidate_dir).resolve())
             if args.json:
