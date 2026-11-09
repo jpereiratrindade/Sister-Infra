@@ -351,6 +351,7 @@ def main() -> None:
         contracts = make_contracts(tmp)
         test_deployment_verify_contracts(tmp)
 
+        port_gateway = reserve_port()
         port_alpha = reserve_port()
         port_beta = reserve_port()
         port_gamma = reserve_port()
@@ -392,7 +393,7 @@ def main() -> None:
             "schema": "sister.infra.deployment/1.0.0",
             "deployment_id": "dep-base",
             "composition_id": "test_reconcile",
-            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
+            "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": port_gateway},
             "bindings": [
                 {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
                 {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},
@@ -477,7 +478,7 @@ def main() -> None:
                 "schema": "sister.infra.deployment/1.0.0",
                 "deployment_id": "dep-reconfig",
                 "composition_id": "test_reconcile",
-                "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": 8443},
+                "gateway": {"protocol": "https", "listen": "127.0.0.1", "port": port_gateway},
                 "bindings": [
                     {"system_id": "sister_alpha", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_alpha + 100}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "alpha-gateway.test"}},
                     {"system_id": "sister_beta", "runtime": {"transport": "tcp", "listen": "127.0.0.1", "port": port_beta}, "probe": {"health_path": "/api/health"}, "gateway": {"host": "beta-gateway.test"}},
@@ -961,6 +962,16 @@ exec {real_mv} "$@"
             print("[PASS] Gate R8 — compatibilidade regressiva garantida pelos outros testes")
 
         finally:
+            gateway_config = str(state_root / "control-plane/gateway/haproxy-lan.cfg").encode()
+            for process in Path("/proc").iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    args = (process / "cmdline").read_bytes().split(b"\0")
+                    if gateway_config in args and b"haproxy" in args[0]:
+                        os.kill(int(process.name), 15)
+                except (OSError, IndexError):
+                    pass
             for cid in ["alpha", "beta", "gamma", "delta"]:
                 pid = get_process_pid(run_root, cid)
                 if pid:
