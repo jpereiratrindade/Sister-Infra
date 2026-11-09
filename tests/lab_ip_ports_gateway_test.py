@@ -145,7 +145,7 @@ def main() -> None:
         raise AssertionError("produção aceitou indevidamente gateway HTTP/ip-ports")
 
     production.validate_production_gateway_policy(
-        {"gateway": {"protocol": "https", "exposure": "host"}}
+        {"gateway": {"protocol": "https", "exposure": "host", "domain": "example.invalid"}}
     )
 
     print("[PASS] LAB ip-ports sem TLS/DNS; produção permanece HTTPS/host fail-closed")

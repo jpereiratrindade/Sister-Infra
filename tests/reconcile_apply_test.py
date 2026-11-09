@@ -344,6 +344,10 @@ def main() -> None:
         env["SISTER_WORKSTATION_STATE_ROOT"] = str(state_root)
         env["SISTER_CURRENT_RELEASE"] = str(install_root / "current")
 
+        # The HTTPS fixture owns its temporary CA; apply never creates authority.
+        ca_result = run_cmd([str(infra_src / "bin/sister-lab"), "tls", "init-ca", "--json"], env=env)
+        assert ca_result.returncode == 0, ca_result.stderr
+
         contracts = make_contracts(tmp)
         test_deployment_verify_contracts(tmp)
 
