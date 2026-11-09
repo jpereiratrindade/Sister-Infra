@@ -95,6 +95,10 @@ sem alteração de PIDs ou releases.
 
 ## 5. Verificação após apply
 
+Para atualizar o Nexo preservando banco e uploads, consulte
+[`nexo-update.md`](nexo-update.md). O procedimento inclui backup, qualificação
+isolada, revisão do change-set e observação independente pelo portal Synth.
+
 ```bash
 sister-infra workstation current
 sister-infra workstation verify
