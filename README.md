@@ -523,3 +523,9 @@ OPS-08    DONE (Lifecycle Unificado)
 OPS-09    DONE (Fronteira de Autoridade da Instalação)
 OPS-10    IN PROGRESS (Simplificação do Control Plane)
 ```
+
+## Premissas de desenvolvimento
+
+**Simples, leve. Sempre pronto. Sempre incompleto!**
+
+[Significado e símbolos das premissas](docs/sister-principles/README.md).
