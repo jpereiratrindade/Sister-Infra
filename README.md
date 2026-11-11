@@ -500,3 +500,9 @@ OPS-07A2  DONE
 OPS-07A3  DONE
 OPS-07    NEXT (PLANNED)
 ```
+
+## Premissas de desenvolvimento
+
+**Simples, leve. Sempre pronto. Sempre incompleto!**
+
+[Significado e símbolos das premissas](docs/sister-principles/README.md).
